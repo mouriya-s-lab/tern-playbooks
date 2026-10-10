@@ -5,6 +5,7 @@
 - 本文档拥有：问题域、驱动、全部术语的定义、系统级范围图、交互图、契约摘要、结构决定。
 - [references.md](references.md) 拥有：引用语法、解析器、截取表达式、编译规则、文档取回表与预览。
 - [launch-events.md](launch-events.md) 拥有：Launch、基线、块变化事件和启动请求的规则。
+- [runs.md](runs.md) 拥有：模板与 Run、Run 的生命周期、时间线与记录的规则。
 - [checks.md](checks.md) 拥有：块检查的规则，包括确定性检查与 jev 判定。
 - [contracts.md](contracts.md) 拥有：本文档列出的四份契约的完整规格。
 - 非目标：
@@ -16,6 +17,7 @@
   - 由 LLM 计算的截取表达式。
   - 编排块运行期间的热更新。
   - 文档层的约束语言。subagent 输出的 schema、输出检查、条件门控写在编排块的代码中（`agent(…, schema=…)` 等）。
+  - Mattermost 中由 bot 定时发出的提醒、Snooze、欢迎消息、复盘提示与待办汇总。它们在 Mattermost 中由不会推理的 bot 按配置发出；这里的 bot 是 agent，这些消息由协调者在需要时自己写（S8）。
 - 输入：无。本文档是根节点。
 - 读者：实现者与评审者。审批者：项目所有者。
 
@@ -42,6 +44,21 @@
 | 机器 → GitHub | 只读 API 请求 |
 | 文件系统 ↔ 机器 | Playbook 文件的读写；外部修改 |
 
+### 使用场景
+
+下列场景来自需求来源（用户），是本设计的验收路径。每一步都写明人的入口与 agent 的入口。
+
+- U1 修复一个 issue。
+  1. 人在 Playbook 中写块：一个上下文块引用 issue、日志与源码文件，一个计划块，一个评审块，一个编排块。
+  2. 人在块卡片上打开编译预览，确认 subagent 将收到的 prompt，然后点启动。
+  3. 协调者收到启动请求，创建 Launch，执行编排块。编排块中的 `agent()` 并行启动实现与评审 subagent。
+  4. 进度与结果出现在协调者会话中。
+  5. 运行中，人修改计划块并提交。协调者收到写明差异的通知，自己决定是否告诉 subagent。
+  6. agent 修改块或勾选完成时，人在块卡片上看到"协调者正在编辑"；人可以打断。
+- U2 复用。同一份 Playbook 下周用于另一个 issue：人只改上下文块中的引用，再次启动。
+- U3 回看。人离开后回来，在 Playbook 中看出哪些块被启动过、绑定了哪些 agent、哪些块在启动后被改过、检查结果是什么，不需要翻阅协调者会话。
+- U4 事故处理。人启动诊断块；多个 subagent 并行诊断；协调者定期在会话中汇报；人随时调整块并重新启动；结束后对照记录复盘。
+
 ### 需求
 
 - R1 人和协调者编辑同一份 Playbook 文档，每个块同一时刻只有一方能编辑：人点击铅笔进入编辑，协调者对块加锁。协调者加锁时拿到该块最新的已提交内容；人编辑中、尚未提交的文本不进入文档。人可以打断协调者对一个块的编辑；打断等同于在 omp 中按 Esc，并解除该块的锁。
@@ -56,6 +73,8 @@
 - R10（由 D3.2 推出）展开的外部内容必须在 prompt 中标出边界。
 - R11（由 D4 推出）块 id 不得因编辑而改变。
 - R12 块的渲染结果与编译结果在运行时可以被检查：渲染是否出错、内容是否缺失。检查结果显示在块旁。
+- R13（由 U2 推出）同一份 Playbook 可以反复使用；每次使用是一个 Run，Run 有开始与结束，修改一个 Run 不改变模板与其他 Run。
+- R14（由 U3、U4 推出）一个 Run 中发生的事实（块的修改、勾选、启动、绑定的 agent、发给协调者的事件、打断、检查结果、人与协调者写的记录）按时间保存，人在界面中、协调者经 `playbook` 工具都能读取，不需要翻阅协调者会话。
 
 ### 驱动
 
@@ -84,13 +103,13 @@
 
 ### 定义
 
-- **Playbook 文档**是一种结构化文档，它由标题和有序的块组成，块是 prompt 的来源。它在磁盘上是一个 YAML 文件（S2）。
+- **Playbook 文档**是一种结构化文档，它由标题和有序的块组成，块是 prompt 的来源。它在磁盘上是一个 YAML 文件（S2）。Playbook 文件本身是**模板**；**Run** 是从模板复制出来的一次实例，也是一份 Playbook 文档。规则见 [runs.md](runs.md)。
 - **块**是 Playbook 文档中的一个条目，字段为 `id`、`title`、`body`、`done`。`body` 称为**块正文**，是 Markdown 文本；`done` 表示人或协调者把它标为完成。
 - **块 id** 是一种标识符，形如 `b<正整数>`。文档服务在块创建时分配块 id：新 id 的数字等于"服务记录中的最大已分配数字"与"文档中的最大数字"两者的较大值加 1。因此文档服务分配的块 id 不复用；磁盘修改新增的块保留文件中的 id，它可以是先前被删除的 id（S2）。
 - **编排块**是一种块，它的块正文全部内容是一个 `js` 或 `py` 围栏代码块。
 - **引用**是块正文中的一段 `((目标))` 或 `((目标 | 截取表达式))`。规则见 [references.md §1](references.md#1-语法)。
 - **编译**是一个过程，它把一组块的块正文中的每个引用替换为该引用的展开文本，得到一个 prompt 文本和一份来源清单。规则见 [references.md §4](references.md#4-编译)。
-- **Launch** 是一条记录，它表示协调者在某一时刻编译了一组块（1..N 个），并绑定了 0..N 个 agent id。规则见 [launch-events.md §1](launch-events.md#1-launch)。
+- **Launch** 是一条记录，它表示协调者在某一时刻编译了一个 Run 中的一组块（1..N 个），并绑定了 0..N 个 agent id。规则见 [launch-events.md §1](launch-events.md#1-launch)。
 - **基线**是 Launch 的一个 prompt 文本，它是块变化判定的比较参照，由协调者选定。文档服务不记录 agent 实际依据哪份文本。
 - **块变化事件**是文档服务发给协调者的一条通知：一个活跃 Launch 依赖的块被人或磁盘修改后，它的当前编译结果与最新基线不同，或编译失败。规则见 [launch-events.md §3](launch-events.md#3-块变化判定)。
 - **启动请求事件**是文档服务发给协调者的一条通知：人要求启动一组块。
@@ -106,14 +125,16 @@
 - **协调者扩展**是一个 omp 扩展，它注册 `playbook` 工具，连接文档服务，把事件注入协调者会话，并在打断时中止发出该锁请求的 agent 操作。
 - **subagent** 是协调者在 `eval` 中用 `agent()` 启动的 omp 子 agent。
 - **连接**是协调者扩展与文档服务之间的一个 socket 会话，它带有协调者会话 id。
-- **服务记录文件**是 Playbook 文件旁的一个只追加文件 `<文件名>.pb.jsonl`，它保存文档服务创建的事实：Launch 与块 id 分配。规则见 [launch-events.md §1](launch-events.md#1-launch)。
+- **服务记录文件**是模板文件旁的一个只追加文件 `<文件名>.pb.jsonl`，它保存文档服务分配的块 id、Run id 与 Launch id。
+- **时间线**是一个 Run 中按时间追加的事实条目序列，保存在该 Run 的记录文件中，人不编辑它。规则见 [runs.md §3](runs.md#3-时间线)。
+- **记录**是人或协调者写入时间线的一段文本，用来报告进度、结果或失败。规则见 [runs.md §4](runs.md#4-记录)。
 
 ### 不变量
 
-- I1 每份 Playbook 文档只有一个文档服务进程。文档打开期间，文档服务内存中的文档是 Playbook 文档的权威来源；磁盘文件是它的序列化结果。
+- I1 一份模板与它的全部 Run 由同一个文档服务进程持有。文档打开期间，文档服务内存中的文档是这些 Playbook 文档的权威来源；磁盘文件是它们的序列化结果。
 - I2 Launch 的快照在创建后不改变。基线只能由协调者的 `rebase` 操作改变。
-- I3 编译是确定的：对相同的块正文和相同的外部取回结果，编译输出逐字节相同。因为 R3、Q2。
-- I4 agent 状态不写入 Playbook 文档，也不存入文档服务。
+- I3 编译是确定的：对相同的块正文、相同的外部取回结果和相同的块结果，编译输出逐字节相同。因为 R3、Q2。
+- I4 agent 状态不写入 Playbook 文档，也不存入文档服务。时间线中的记录是写入者的陈述，文档服务不把它当作 agent 状态维护。
 - I5 协调者对已有块的修改只在协调者持有该块的块锁时发生；人对字段文本的修改只在人持有该块的块锁时提交；来源为 `disk` 的编辑不受块锁限制（S2）。
 
 ### 结构决定
@@ -170,9 +191,24 @@
 | 新增、编辑、删除任务 | 新建、铅笔编辑、删除 | `insert`；`lock` 后 `set`、`edit`、`delete` | 无 |
 | 任务内容在 run 中被改动 | 提交编辑草稿 | — | 块变化事件（[launch-events.md §4](launch-events.md#4-块变化事件)） |
 | 对任务做检查 | 块卡片的检查按钮 | `inspect`、`report` | 检查请求事件（[checks.md §4](checks.md#4-触发)） |
+| 从 playbook 开始一次 run | 模板视图的"开始 Run" | `start_run` | `run_started` 事件（[runs.md §2](runs.md#2-生命周期)） |
+| 结束 run | Run 视图的"结束 Run" | `finish_run` | `run_finished` 事件 |
+| 人勾选任务完成 | `done` 复选框 | — | `done_changed` 事件 |
+| 发状态更新；把消息加入时间线 | Run 视图中写记录 | `post` | 无；记录写入时间线（[runs.md §4](runs.md#4-记录)） |
+| 查看 run 的时间线 | Run 视图的时间线 | `timeline` | 无 |
 
 - 替代：只在协调者会话中用文字驱动全部操作，不提供表单入口。不选，因为用户决定人与 agent 都有操作入口。
 - 替代：只提供表单，agent 不参与推动。不选，因为 bot 推动流程是参考对象的核心。
+
+**S9 Playbook 文件是模板，每次使用从模板复制出一个 Run；Launch 属于 Run。**
+因为 R13：同一份 Playbook 反复使用时，上一次的块内容、`done` 与 Launch 不得被下一次覆盖或继续触发通知；Mattermost Playbooks 在创建 run 时复制 playbook 的 checklist（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。Run 结束后，它的 Launch 不再活跃，块不再可改。规则见 [runs.md](runs.md)。
+- 替代：只有一份文档，复用时人手工改回。不选，因为预演 U2 时旧 Launch 仍活跃，修改模板会向已结束的工作发通知，旧内容也被覆盖。
+- 替代：Run 引用模板而不复制。不选，因为修改模板会改变进行中的 Run。
+
+**S10 每个 Run 有一条只追加的时间线，保存文档服务创建或接收的事实与人、协调者写的记录；人与协调者都能读取。**
+因为 R14：U3 要求人回来后不翻阅协调者会话也能知道发生了什么；协调者在 `eval` 中等待 subagent 时，注入的消息要到 `eval` 结束后才进入模型（[E2.3](appendix-evidence.md#e23-aside-投递)），编排代码需要一个可以在运行中读取的来源。时间线只记录文档服务自己知道的事实与写入者的陈述，不复制 agent 状态（I4、S5）。规则见 [runs.md §3](runs.md#3-时间线)。
+- 替代：只依赖协调者会话的记录。不选，因为会话结束后无法从 Playbook 回看，并且人需要逐条翻阅。
+- 替代：由文档服务轮询 omp 取得 agent 状态写入时间线。不选，因为 D2.5 说明扩展拿不到 subagent 的完整信息，并且会产生 agent 状态的第二个来源。
 
 ## 范围图
 
@@ -194,7 +230,7 @@ flowchart TB
       end
     end
     Gh["gh 子进程"]
-    File["Playbook 文件与服务记录文件"]
+    File["模板文件、服务记录文件、Run 文件与 Run 记录文件"]
   end
   GitHub["GitHub"]
 ```
@@ -211,6 +247,9 @@ flowchart TB
 
 ```mermaid
 flowchart TB
+  subgraph RunLife["Run（开始到结束）"]
+    LaunchLife["Launch（创建到 close）"]
+  end
   subgraph CoordLife["协调者会话"]
     subgraph Conn["连接"]
       Active["Launch 活跃期"]
@@ -226,7 +265,8 @@ flowchart TB
 - 连接同时在文档服务进程的生命周期之内：任一方结束，连接结束。
 - 协调者持有的块锁在连接之内，也在发出该锁请求的协调者 agent 操作之内：解锁、连接结束、该操作结束或被打断时解除。规则见 [contracts.md §K1](contracts.md#k1-文档服务--协调者扩展) 与 [§K2](contracts.md#k2-协调者扩展--协调者会话)。
 - 人持有的块锁开始于人点击铅笔，结束于提交、该块被磁盘修改删除或文档服务进程结束；编辑草稿与它同时开始和结束。规则见 [contracts.md §K4](contracts.md#k4-文档服务--tern)。
-- Launch 记录在连接结束后保留在服务记录文件中；同一协调者会话 id 重新连接时，该会话的 Launch 再次活跃。规则见 [launch-events.md §1](launch-events.md#1-launch) 与 [§2](launch-events.md#2-活跃期)。
+- Launch 在所属 Run 之内：Run 结束时它不再活跃。Launch 活跃期同时在 Launch 未 `close`、所属 Run 进行中与连接存在这三段时间之内（[launch-events.md §2](launch-events.md#2-活跃期)）。Launch 记录在连接结束后保留在 Run 记录文件中；同一协调者会话 id 重新连接时，满足其他条件的 Launch 再次活跃。
+- Run 的生命周期与协调者会话无关：它由人或协调者开始和结束，跨越多个会话（[runs.md §2](runs.md#2-生命周期)）。
 
 信任包含：
 
@@ -248,24 +288,24 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  Human["人"] -->|"铅笔、按键、edit 事件、提交、勾选、新建与删除块、打断、启动请求、检查请求、重新取回 · K4"| DocSvc["文档服务"]
-  DocSvc -->|"块卡片、编辑中的字段、块锁状态、预览、检查结果 · K4"| Human
-  Ext["协调者扩展"] -->|"lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/ack · K1"| DocSvc
-  DocSvc -->|"块变化事件、启动请求事件、检查请求事件、打断 · K1"| Ext
+  Human["人"] -->|"铅笔、按键、edit 事件、提交、勾选、新建与删除块、打断、开始与结束 Run、写记录、启动请求、检查请求、重新取回 · K4"| DocSvc["文档服务"]
+  DocSvc -->|"模板视图、Run 视图、块卡片、编辑中的字段、块锁状态、时间线、预览、检查结果 · K4"| Human
+  Ext["协调者扩展"] -->|"lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/close/start_run/finish_run/runs/timeline/post/ack · K1"| DocSvc
+  DocSvc -->|"块变化、启动请求、检查请求、Run 开始与结束、done 改变、打断 · K1"| Ext
   Ext -->|"playbook 工具结果、aside 消息、abort() · K2"| Coord["协调者会话"]
   Coord -->|"tool.playbook(...)、agent 操作结束 · K2"| Ext
   Coord -->|"agent()、.send()、.cancel()"| Sub["subagent"]
   Coord -->|"judge_batch"| Jev["jev（omp judge 角色）"]
   DocSvc -->|"gh api 只读请求 · K3"| GitHub["GitHub"]
-  DocSvc <-->|"YAML 读写、修改时间检查"| File["Playbook 文件"]
+  DocSvc <-->|"YAML 读写、修改时间检查、记录文件追加"| File["模板、Run 与记录文件"]
 ```
 
 | 契约 | 摘要 |
 |---|---|
-| K1 文档服务 ⇄ 协调者扩展 | 本地 socket 协议：协调者对块加锁与解锁，读与修改块，重新取回外部目标，编译、检查、报告检查结果、创建 Launch、绑定 agent、改基线、确认事件；文档服务推送事件与打断。 |
+| K1 文档服务 ⇄ 协调者扩展 | 本地 socket 协议：协调者对块加锁与解锁，读与修改模板与 Run 的块，开始与结束 Run，读时间线与写记录，重新取回外部目标，编译、检查、报告检查结果、创建与结束 Launch、绑定 agent、改基线、确认事件；文档服务推送事件与打断。 |
 | K2 协调者扩展 ⇄ 协调者会话 | `playbook` 工具（可在 `eval` 中调用）、`aside` 事件消息、打断时的 `abort()`，以及 agent 操作结束时释放它持有的块锁。 |
 | K3 文档服务 → GitHub | 解析器经 `gh api` 只读取回 issue 与 PR。 |
-| K4 文档服务 ⇄ Tern | TSP 表单界面：块卡片与渲染视图、铅笔编辑与提交、块锁状态与打断、预览、检查结果，以及新建、删除、勾选、启动、检查与重新取回操作。 |
+| K4 文档服务 ⇄ Tern | TSP 表单界面：模板视图与 Run 视图、块卡片与渲染视图、铅笔编辑与提交、块锁状态与打断、时间线与记录、预览、检查结果，以及新建、删除、勾选、开始与结束 Run、启动、检查与重新取回操作。 |
 
 完整规格见 [contracts.md](contracts.md)。subagent 与协调者之间的交互属于 omp（D2.1），本设计不规定。
 
@@ -275,6 +315,7 @@ flowchart LR
 |---|---|
 | [references.md](references.md) | 引用语法、目标种类与解析器、截取表达式、编译与错误、文档取回表与预览 |
 | [launch-events.md](launch-events.md) | Launch 与基线、活跃期、块变化判定、事件内容与投递时机 |
+| [runs.md](runs.md) | 模板与 Run、Run 的生命周期、时间线、记录与读取 |
 | [checks.md](checks.md) | 检查状态、确定性检查、jev 判定的问题与阈值、检查的触发、结果显示 |
 | [contracts.md](contracts.md) | K1–K4 的完整规格 |
 
@@ -282,4 +323,4 @@ flowchart LR
 
 | 附录 | 内容 |
 |---|---|
-| [appendix-evidence.md](appendix-evidence.md) | D1–D3 的证据：Tern 文档摘录与 TSP 实测（编辑输入、表单块的点击与焦点事件、渲染视图与 auto graph 截图、Tern 自带 Markdown block 的能力）、omp 源码位置与扩展探针记录（eval 工具桥、aside 投递、`abort()` 打断与界面打断、subagent 随会话结束）、jev 判定实测、`gh api` 实测 |
+| [appendix-evidence.md](appendix-evidence.md) | D1–D3 的证据：Tern 文档摘录与 TSP 实测（编辑输入、表单块的点击与焦点事件、渲染视图与 auto graph 截图、Tern 自带 Markdown block 的能力）、omp 源码位置与扩展探针记录（eval 工具桥、aside 投递、`abort()` 打断与界面打断、subagent 随会话结束）、jev 判定实测、`gh api` 实测；S8 与 S9 所参照的 Mattermost Playbooks 的界面观察与源码摘录 |

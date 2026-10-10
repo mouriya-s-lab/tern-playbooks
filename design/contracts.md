@@ -8,9 +8,9 @@
 |---|---|
 | 参与方 | 提供方：文档服务。使用方：协调者扩展。两者都由根节点设计 |
 | 交换 | Unix domain socket 上的换行分隔 JSON。socket 路径为 `${TMPDIR}/tern-playbooks/<Playbook 文件绝对路径的 SHA-256>.sock`。请求 `{id, op, args}`，响应 `{id, ok, result}` 或 `{id, ok: false, error}`；事件 `{event, data}` 由提供方主动发送 |
-| 前置条件 | 第一条请求必须是 `hello {session}`。同一时刻只能有一个连接；第二个 `hello` 得到 `Busy`。`set`、`edit`、`delete` 要求本连接持有该块的块锁 |
+| 前置条件 | 第一条请求必须是 `hello {session}`。同一时刻只能有一个连接；第二个 `hello` 得到 `Busy`。`set`、`edit`、`delete` 要求本连接持有该块的块锁。作用于块的操作带可选参数 `run`：有 `run` 时作用于该 Run 的块，没有时作用于模板（[runs.md §1](runs.md#1-模板与-run)） |
 | 保证 | 见下方操作表。文档服务按到达顺序逐个处理协调者的请求与人的界面操作，因此一个块的块锁任一时刻只有一个持有者。`lock` 返回该块最新的已提交内容，不含人的编辑草稿（R1）。修改操作各作为一次来源为 `coordinator` 的编辑应用。块锁以任何方式解除时，文档服务重绘该块。`compile` 与 `inspect` 把编译失败放在结果的 `CompileResult.Err` 中，不作为错误返回；`launch` 与 `rebase` 在编译失败时返回错误 `CompileError` |
-| 错误 | 闭合列举：`Busy`、`NotHello`、`Locked`（`lock` 时人持有该块的块锁）、`NotLocked`（`set`、`edit`、`delete` 时本连接不持有该块的块锁，包括已被打断）、`UnknownBlock`、`BadValue`（`set` 的 `field` 不是 `title` 或 `done`，或 `value` 的类型不符）、`NotFound`（`find` 文本在块正文中不存在）、`Ambiguous`（`find` 文本出现多次）、`BadLaunch`（`launch` 的 `blocks` 为空，或编排块与其他块同在其中，见 [launch-events.md §1](launch-events.md#1-launch)）、`CompileError`（附 [references.md §4](references.md#4-编译) 的错误）、`UnknownTarget`（`refetch` 的目标不是 [references.md §2](references.md#2-目标种类与解析器) 中的外部目标）、`BadReport`（`report` 的 `result` 不完整或越界，见 [checks.md §5](checks.md#5-结果显示)）、`UnknownLaunch`、`NotOwner`（Launch 属于其他会话）、`UnknownEvent`（`ack` 的事件 id 不是当前连接上待确认的事件） |
+| 错误 | 闭合列举：`Busy`、`NotHello`、`Locked`（`lock` 时人持有该块的块锁）、`NotLocked`（`set`、`edit`、`delete` 时本连接不持有该块的块锁，包括已被打断）、`UnknownBlock`、`UnknownRun`、`RunFinished`（修改操作、`lock`、`launch` 或 `post` 作用于已结束的 Run，见 [runs.md §2](runs.md#2-生命周期)）、`BadValue`（`set` 的 `field` 不是 `title` 或 `done`，`value` 的类型不符，或 `post` 的 `kind` 不在闭合列举中）、`NotFound`（`find` 文本在块正文中不存在）、`Ambiguous`（`find` 文本出现多次）、`BadLaunch`（`launch` 没有 `run`、`blocks` 为空，或编排块与其他块同在其中，见 [launch-events.md §1](launch-events.md#1-launch)）、`CompileError`（附 [references.md §4](references.md#4-编译) 的错误）、`UnknownTarget`（`refetch` 的目标不是 [references.md §2](references.md#2-目标种类与解析器) 中的外部目标）、`BadReport`（`report` 的 `result` 不完整或越界，见 [checks.md §5](checks.md#5-结果显示)）、`UnknownLaunch`、`NotOwner`（Launch 属于其他会话）、`UnknownEvent`（`ack` 的事件 id 不是当前连接上待确认的事件） |
 | 失败语义 | socket 断开：连接结束，本连接持有的全部块锁解除，该会话的 Launch 不再活跃。未完成的请求没有结果；修改操作要么完整应用，要么不应用。协调者扩展每 2 s 重连一次，直到协调者会话结束；重连后按 [launch-events.md §2](launch-events.md#2-活跃期) 恢复，块锁不恢复 |
 | 生命周期 | 连接：开始于 `hello` 成功（文档服务确认），结束于 socket 关闭（任一方）。协调者持有的块锁：开始于 `lock` 返回（文档服务确认）；结束于该块的 `unlock`、`delete`、打断、该块被磁盘修改删除或连接结束，以先发生者为准（文档服务确认） |
 | 质量 | Q1、Q3、Q4 |
@@ -20,10 +20,10 @@
 
 | op | args | result |
 |---|---|---|
-| `hello` | `{session}` | `{blocks: [块 id]}` |
+| `hello` | `{session}` | `{blocks: [块 id], runs: [Run 摘要]}`：模板的块 id 与 [runs.md §5](runs.md#5-读取) 的 Run 摘要 |
 | `lock` | `{block}` | `{block}`：该块的 `{id, title, body, done}`。人持有该块的块锁时返回 `Locked`。本连接已持有时返回当前内容，并把该块锁记为由这次请求取得 |
 | `unlock` | `{block, request}` | 无。只有该块的块锁由本连接持有、并且记为由 `request` 这条 `lock` 请求取得时才解除；否则不做任何事 |
-| `read` | `{block?}` | 无 `block`：`{title, blocks}`，全部块的已提交内容。有 `block`：该块。不需要块锁 |
+| `read` | `{run?, block?}` | 无 `block`：`{title, blocks}`，全部块的已提交内容；有 `run` 时另含 `run` 映射。有 `block`：该块。不需要块锁 |
 | `set` | `{block, field, value}` | 无。`field` 为 `title` 时 `value` 是字符串，为 `done` 时是布尔值 |
 | `edit` | `{block, find, replace}` | 无。`find` 必须在块正文中恰好出现一次，否则返回 `NotFound` 或 `Ambiguous`，不修改块正文 |
 | `insert` | `{after?, title, body}` | `{block}`：新块 id。无 `after` 时插入到文档末尾。新块的 `done` 为假，块锁为无 |
@@ -32,21 +32,27 @@
 | `compile` | `{blocks}` | `CompileResult`，不创建 Launch |
 | `inspect` | `{blocks}` | 检查状态（[checks.md §1](checks.md#1-检查状态)），不创建 Launch |
 | `report` | `{blocks, version, result}` | 无。`version` 为 `inspect` 返回的检查状态版本；显示规则见 [checks.md §5](checks.md#5-结果显示) |
-| `launch` | `{blocks}` | `{launch, text}`：Launch id 与快照文本 |
+| `launch` | `{run, blocks}` | `{launch, text}`：Launch id 与快照文本 |
 | `bind` | `{launch, agent}` | 无 |
 | `rebase` | `{launch}` | `{baseline}`：新基线文本 |
+| `close` | `{launch}` | 无。结束该 Launch（[launch-events.md §1](launch-events.md#1-launch)） |
+| `start_run` | `{name}` | `{run}`：新 Run 的 id（[runs.md §2](runs.md#2-生命周期)） |
+| `finish_run` | `{run}` | 无 |
+| `runs` | 无 | `{runs: [Run 摘要]}` |
+| `timeline` | `{run, after?}` | `{entries}`：序号大于 `after` 的时间线条目（[runs.md §3](runs.md#3-时间线)） |
+| `post` | `{run, kind, text, block?}` | `{seq}`：写入的时间线条目序号（[runs.md §4](runs.md#4-记录)） |
 | `ack` | `{event}` | 无。确认收到块变化事件（[launch-events.md §6](launch-events.md#6-投递)） |
 
-事件：`block_changed`（[launch-events.md §4](launch-events.md#4-块变化事件)）、`launch_requested`（[launch-events.md §5](launch-events.md#5-启动请求)）、`check_requested`（[checks.md §4](checks.md#4-触发)）、`interrupted`（人打断了协调者持有的一个块锁，该块锁已解除；`data` 为 `{block, request}`，`request` 是取得该块锁的 `lock` 请求的 `id`；见 K4）。
+事件：`block_changed`（[launch-events.md §4](launch-events.md#4-块变化事件)）、`launch_requested`（[launch-events.md §5](launch-events.md#5-启动请求)）、`check_requested`（[checks.md §4](checks.md#4-触发)）、`run_started`、`run_finished` 与 `done_changed`（[runs.md §2](runs.md#2-生命周期)）、`interrupted`（人打断了协调者持有的一个块锁，该块锁已解除；`data` 为 `{run?, block, request}`，`request` 是取得该块锁的 `lock` 请求的 `id`；见 K4）。
 
 ## K2 协调者扩展 ⇄ 协调者会话
 
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：协调者扩展（根节点设计）。使用方：协调者会话中的模型与 `eval` 代码（omp） |
-| 交换 | 工具 `playbook`，参数 `{doc, op, args}`，`doc` 为 Playbook 文件路径，`op` 与 `args` 同 K1，以下除外：`hello` 与 `ack` 由协调者扩展自己发送；`unlock` 的 `args` 为 `{block}`，扩展填入当前 agent 操作中为该块最近一次记录的 `lock` 请求 id，没有记录时不发送。结果为 K1 的 `result` 或错误。事件消息：`customType: "playbook-event"`，正文按 [launch-events.md §6](launch-events.md#6-投递)。扩展对会话调用 `abort()`（D2.8），并订阅会话的 `agent_end` 事件 |
+| 交换 | 工具 `playbook`，参数 `{doc, op, args}`，`doc` 为 Playbook 文件路径，`op` 与 `args` 同 K1，以下除外：`hello` 与 `ack` 由协调者扩展自己发送；`unlock` 的 `args` 为 `{run?, block}`，扩展填入当前 agent 操作中为该块最近一次记录的 `lock` 请求 id，没有记录时不发送。结果为 K1 的 `result` 或错误。事件消息：`customType: "playbook-event"`，正文按 [launch-events.md §6](launch-events.md#6-投递)。扩展对会话调用 `abort()`（D2.8），并订阅会话的 `agent_end` 事件 |
 | 前置条件 | `doc` 指向的文档有一个正在运行的文档服务 |
-| 保证 | 工具可在 `eval` 中以 `tool.playbook(...)` 调用。协调者扩展在第一次使用某个 `doc` 时建立连接。块变化、启动请求与检查请求事件按 [launch-events.md §6](launch-events.md#6-投递) 注入。协调者扩展记录当前 agent 操作中成功的 `lock` 请求的 id 与块 id；收到 `interrupted` 时，它的 `request` 在记录中，扩展才调用 `abort()` 中止该操作（D2.8），否则不做任何事。收到 `agent_end` 时，扩展对记录中的每一项发送 `unlock {block, request}`，然后清空记录。因为 `unlock` 只解除由该请求取得的块锁，一个已结束操作的清理不会解除后来的操作取得的块锁 |
+| 保证 | 工具可在 `eval` 中以 `tool.playbook(...)` 调用。协调者扩展在第一次使用某个 `doc` 时建立连接。事件按 [launch-events.md §6](launch-events.md#6-投递) 注入。协调者扩展记录当前 agent 操作中成功的 `lock` 请求的 id、Run id 与块 id；收到 `interrupted` 时，它的 `request` 在记录中，扩展才调用 `abort()` 中止该操作（D2.8），否则不做任何事。收到 `agent_end` 时，扩展对记录中的每一项发送 `unlock {run, block, request}`，然后清空记录。因为 `unlock` 只解除由该请求取得的块锁，一个已结束操作的清理不会解除后来的操作取得的块锁 |
 | 错误 | K1 的全部错误，加上 `NoService`（socket 不存在或拒绝连接），以及 `Disconnected`（请求已发出，连接在响应之前断开；修改操作是否已应用未知） |
 | 失败语义 | 协调者会话结束（`session_shutdown`）：协调者扩展关闭全部连接，块锁随连接解除。连接在响应之前断开时，工具调用返回 `Disconnected`；不自动重试修改操作 |
 | 生命周期 | 开始：会话加载扩展。结束：`session_shutdown` |
@@ -72,9 +78,9 @@
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：Tern（外部）。使用方：文档服务（根节点设计） |
-| 交换 | TSP：`hello` 声明 `edit` 与 `undo` 特性；每个块一个 `card` 节点；字段的渲染视图为 `md` 与 `image` 节点，编辑中的字段为 `input`（标题）或 `editor`（块正文）节点，属性 `text`、`cursor`、`anchor`；铅笔、完成、打断、新建、删除、启动、检查、预览与重新取回为带 `actions.click` 的按钮；`done` 与选择为复选框；`b` 动词发送的 SVG blob；`edit`、`undo`、`focus`、`action`、`change`、`theme`、`ack`、`error` 事件与按键；`hello` 回复的 `dark` |
+| 交换 | TSP：`hello` 声明 `edit` 与 `undo` 特性；模板视图与 Run 视图之间以 `tabs` 切换；每个块一个 `card` 节点；字段的渲染视图为 `md` 与 `image` 节点，编辑中的字段为 `input`（标题）或 `editor`（块正文）节点，属性 `text`、`cursor`、`anchor`；铅笔、完成、打断、新建、删除、启动、检查、预览、重新取回、开始 Run、结束 Run 与写记录为带 `actions.click` 的按钮；`done` 与选择为复选框；`b` 动词发送的 SVG blob；`edit`、`undo`、`focus`、`action`、`change`、`theme`、`ack`、`error` 事件与按键；`hello` 回复的 `dark` |
 | 前置条件 | 文档服务运行在 Tern pane 中 |
-| 保证 | 块卡片：每个块一张卡片，显示块 id、选择复选框、块锁状态、`done` 复选框、标题与块正文的渲染视图，以及操作按钮。编辑中字段的祖先节点不设置 `click` 动作，因为编辑字段内的点击会触发祖先的动作（D1.5）。铅笔：块锁为无并且人没有其他编辑草稿时，人点击一个字段的铅笔，文档服务把该块的块锁设为人持有，以该字段的已提交内容建立编辑草稿，把该字段换成 `input` 或 `editor` 并聚焦它；人已有编辑草稿时，其他铅笔不可用。块锁为协调者持有时，该块的铅笔、`done` 复选框与删除按钮不可用，卡片显示"协调者正在编辑"与打断按钮。编辑：编辑中的字段接受两种输入，因为 D1.4 说明原生编辑开启时两者都会到达；每个 `edit` 事件，以及每个插入或删除文本的按键与粘贴，改变编辑草稿；不改变文本的按键不改变编辑草稿；`undo` 事件撤销编辑草稿中最近一次改变。提交：Esc 或该字段的完成按钮提交编辑草稿；编辑草稿与已提交内容不同时，它作为一次来源为 `human` 的编辑应用；然后块锁解除，字段换回渲染视图。点击其他位置不提交（D1.5、约束）。打断：块锁为协调者持有时，人点击打断按钮，文档服务解除该块锁，重绘该块，并向协调者扩展发送 `interrupted`（K1）。勾选、新建与删除：块锁为无时，人勾选 `done`、新建块或删除块，各作为一次来源为 `human` 的编辑应用；新建块分配新块 id，标题与块正文为空。选择：选择复选框只改变界面状态，不改变文档；启动、检查与预览按钮作用于按文档顺序排列的已选中块，没有已选中块时作用于按钮所在卡片的块。渲染视图（S6）：块正文经 `splitTableCharts`（`always` 模式）切成 Markdown 段与图段；Markdown 段为 `md` 节点，图段为 `describeTableChart` 给出的 `image` 节点，其 blob 在引用它的帧之前以 `b` 发送。文档服务按 `hello` 回复的 `dark` 选择 omp 的亮色或暗色主题，收到 `theme` 事件时切换主题并重新生成图。块检查的输入（[checks.md §2](checks.md#2-确定性检查)）：一个块的渲染节点 id 都以 `<块 id>.` 开头；文档服务记录每个帧序号 `s` 包含哪些块的节点；`ack` 的 `s` 覆盖不大于它的全部帧；带 `s` 与 `op` 的 `error` 事件对应到该帧该位置的操作所属的块；不带 `s` 的 `error` 事件（例如被拒绝的 blob）不能对应到块，文档服务在文档级显示它。引用的展开视图、重新取回、编译预览、检查结果、启动操作与检查操作在卡片中以按钮与 `section` 节点提供 |
+| 保证 | 视图：文档服务提供一个模板视图与每个 Run 一个 Run 视图。两种视图的头部都显示当前连接的协调者会话 id，或"没有协调者连接"以及启动协调者所需的命令。模板视图显示模板的块卡片、"开始 Run"按钮与全部 Run 的列表（[runs.md §5](runs.md#5-读取)）；点列表中的一项打开该 Run 视图。Run 视图显示 Run 的头部（[runs.md §5](runs.md#5-读取)）、"结束 Run"按钮、该 Run 的块卡片、写记录的输入框与 `kind` 选择，以及可按 `type` 筛选的时间线；已结束的 Run 视图中，修改块的控件不可用。块卡片：每个块一张卡片，显示块 id、选择复选框、块锁状态、`done` 复选框、标题与块正文的渲染视图，以及操作按钮；在 Run 视图中，卡片还显示依赖该块的活跃 Launch 的 id 与它们绑定的 agent id，以及关于该块的最近一条记录（[runs.md §4](runs.md#4-记录)）。编辑中字段的祖先节点不设置 `click` 动作，因为编辑字段内的点击会触发祖先的动作（D1.5）。铅笔：块锁为无并且人没有其他编辑草稿时，人点击一个字段的铅笔，文档服务把该块的块锁设为人持有，以该字段的已提交内容建立编辑草稿，把该字段换成 `input` 或 `editor` 并聚焦它；人已有编辑草稿时，其他铅笔不可用。块锁为协调者持有时，该块的铅笔、`done` 复选框与删除按钮不可用，卡片显示"协调者正在编辑"与打断按钮。编辑：编辑中的字段接受两种输入，因为 D1.4 说明原生编辑开启时两者都会到达；每个 `edit` 事件，以及每个插入或删除文本的按键与粘贴，改变编辑草稿；不改变文本的按键不改变编辑草稿；`undo` 事件撤销编辑草稿中最近一次改变。提交：Esc 或该字段的完成按钮提交编辑草稿；编辑草稿与已提交内容不同时，它作为一次来源为 `human` 的编辑应用；然后块锁解除，字段换回渲染视图。点击其他位置不提交（D1.5、约束）。打断：块锁为协调者持有时，人点击打断按钮，文档服务解除该块锁，重绘该块，并向协调者扩展发送 `interrupted`（K1）。勾选、新建与删除：块锁为无时，人勾选 `done`、新建块或删除块，各作为一次来源为 `human` 的编辑应用；新建块分配新块 id，标题与块正文为空。选择：选择复选框只改变界面状态，不改变文档；启动、检查与预览按钮作用于按文档顺序排列的已选中块，没有已选中块时作用于按钮所在卡片的块。启动按钮只在 Run 视图中出现；已选中块中同时有编排块与其他块时，启动按钮不可用，并显示"编排块只能单独启动"。渲染视图（S6）：块正文经 `splitTableCharts`（`always` 模式）切成 Markdown 段与图段；Markdown 段为 `md` 节点，图段为 `describeTableChart` 给出的 `image` 节点，其 blob 在引用它的帧之前以 `b` 发送。文档服务按 `hello` 回复的 `dark` 选择 omp 的亮色或暗色主题，收到 `theme` 事件时切换主题并重新生成图。块检查的输入（[checks.md §2](checks.md#2-确定性检查)）：一个块的渲染节点 id 都以 `<块 id>.` 开头；文档服务记录每个帧序号 `s` 包含哪些块的节点；`ack` 的 `s` 覆盖不大于它的全部帧；带 `s` 与 `op` 的 `error` 事件对应到该帧该位置的操作所属的块；不带 `s` 的 `error` 事件（例如被拒绝的 blob）不能对应到块，文档服务在文档级显示它。引用的展开视图、重新取回、编译预览、检查结果、启动操作与检查操作在卡片中以按钮与 `section` 节点提供 |
 | 错误 | `edit` 事件针对过期的编辑草稿：它的 `len` 与编辑草稿的长度不同（TSP 文档所说的 keys in flight）。文档服务丢弃它，并在字段旁显示"一次输入因文本已变化未应用"。`len` 规则来自 TSP 文档（[E1](appendix-evidence.md#e1-tern) D1.4） |
 | 失败语义 | pane 关闭或 daemon 重启：文档服务进程结束，连接与全部块锁随之结束，未提交的编辑草稿丢失。已写回的文件是最后状态，最多丢失 1 s 内已提交的编辑（S2） |
 | 生命周期 | 开始：pane 启动文档服务。结束：进程退出。人持有的块锁与编辑草稿：开始于人点击铅笔；结束于提交、该块被磁盘修改删除（S2）或进程退出 |

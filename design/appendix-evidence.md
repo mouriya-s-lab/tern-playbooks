@@ -232,3 +232,9 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
 | 12:28–12:42 | 定时器到期 | bot 在频道中发出 "@DemoUser, please provide a status update."，消息带 Post update 与 Snooze 按钮；Post update 按钮变红 |
 | 12:58–13:03 | 点 Finish run 并确认 | 频道中出现 "marked this run as finished"，bot 发出 "Would you like to fill out the retrospective report?"，带 Yes 与 No 按钮 |
 | 8:52–9:40 | — | bot 私信汇总超期的状态更新、未完成的任务与进行中的 run；`/playbook todo` 随时给出同一汇总 |
+
+源码摘录（`mattermost-plugin-playbooks` 本地检出 `/tmp/mm-playbooks`，提交 `61d434666dcac20704744750698f2f6bce035bee`）：
+
+- `server/app/playbook.go:20-21`："Playbook represents a desired business outcome, from which playbook runs are started to solve a specific instance."
+- `server/app/playbook_run.go:948-950`：`SetChecklistFromPlaybook` "overwrites this run's checklists with the ones in the provided playbook"，`r.Checklists = playbook.Checklists`；`:964-965`：`SetConfigurationFromPlaybook` "effectively snapshoting the playbook's configuration in this moment of time."
+- `webapp/src/components/rhs/rhs_run_details.tsx:231-232`：run 详情侧栏的引导文字 "View run details in a side panel"、"See who is involved and what needs to be done without leaving the conversation."
