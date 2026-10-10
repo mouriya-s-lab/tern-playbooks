@@ -1,0 +1,20 @@
+{
+	"name": "tern-playbooks",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"tern-playbook": "./src/service/main.ts"
+	},
+	"scripts": {
+		"check": "tsc --noEmit -p tsconfig.json",
+		"test": "bun test"
+	},
+	"dependencies": {
+		"@oh-my-pi/pi-tui": "latest"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "latest",
+		"@types/bun": "latest",
+		"typescript": "latest"
+	}
+}

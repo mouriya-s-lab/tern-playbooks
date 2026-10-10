@@ -1,0 +1,130 @@
+// K1 document service ⇄ coordinator extension (contracts.md §K1).
+import type { BlockId, CompileResult, EventName, JudgeReport, LaunchId, LaunchKind, RecordKind, RunId, RunStatus } from "./model";
+
+/** Requests, closed. `run` absent = template. */
+export type Request =
+	| { readonly op: "hello"; readonly args: { readonly session: string; readonly pane?: string } }
+	| { readonly op: "lock"; readonly args: { readonly run?: RunId; readonly block: BlockId } }
+	| { readonly op: "unlock"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly request: string } }
+	| { readonly op: "read"; readonly args: { readonly run?: RunId; readonly block?: BlockId } }
+	| { readonly op: "set"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly field: "title"; readonly value: string } | { readonly run?: RunId; readonly block: BlockId; readonly field: "done"; readonly value: boolean } }
+	| { readonly op: "edit"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly find: string; readonly replace: string } }
+	| { readonly op: "insert"; readonly args: { readonly run?: RunId; readonly after?: BlockId; readonly title: string; readonly body: string } }
+	| { readonly op: "delete"; readonly args: { readonly run?: RunId; readonly block: BlockId } }
+	| { readonly op: "refetch"; readonly args: { readonly run?: RunId; readonly targets: readonly string[] } }
+	| { readonly op: "compile"; readonly args: { readonly run?: RunId; readonly blocks: readonly BlockId[] } }
+	| { readonly op: "inspect"; readonly args: { readonly run?: RunId; readonly blocks: readonly BlockId[] } }
+	| { readonly op: "report"; readonly args: { readonly run?: RunId; readonly blocks: readonly BlockId[]; readonly version: string; readonly result: JudgeReport } }
+	| { readonly op: "launch"; readonly args: { readonly run: RunId; readonly blocks: readonly BlockId[] } }
+	| { readonly op: "bind"; readonly args: { readonly launch: LaunchId; readonly agent: string } }
+	| { readonly op: "rebase"; readonly args: { readonly launch: LaunchId } }
+	| { readonly op: "close"; readonly args: { readonly launch: LaunchId } }
+	| { readonly op: "launch_info"; readonly args: { readonly launch: LaunchId } }
+	| { readonly op: "start_run"; readonly args: { readonly name: string; readonly update_every?: number } }
+	| { readonly op: "finish_run"; readonly args: { readonly run: RunId } }
+	| { readonly op: "runs"; readonly args: Record<string, never> }
+	| { readonly op: "timeline"; readonly args: { readonly run: RunId; readonly after?: number } }
+	| {
+			readonly op: "post";
+			readonly args: {
+				readonly run: RunId;
+				readonly kind: RecordKind;
+				readonly text: string;
+				readonly block?: BlockId;
+				readonly launch?: LaunchId;
+				readonly next?: number;
+				readonly quote?: string;
+				readonly origin?: "human";
+			};
+	  }
+	| { readonly op: "snooze"; readonly args: { readonly run: RunId; readonly after: number } }
+	| { readonly op: "ack"; readonly args: { readonly event: string } };
+
+export type Op = Request["op"];
+export type ArgsOf<O extends Op> = Extract<Request, { op: O }>["args"];
+
+/** K1 errors, closed (contracts.md K1 错误). */
+export type ErrorCode =
+	| "Busy"
+	| "NotHello"
+	| "Locked"
+	| "NotLocked"
+	| "UnknownBlock"
+	| "UnknownRun"
+	| "RunFinished"
+	| "BadValue"
+	| "NotFound"
+	| "Ambiguous"
+	| "BadLaunch"
+	| "CompileError"
+	| "UnknownTarget"
+	| "BadReport"
+	| "UnknownLaunch"
+	| "NotOwner"
+	| "UnknownEvent";
+
+export interface ProtocolError {
+	readonly code: ErrorCode;
+	readonly message: string;
+	readonly detail?: unknown;
+}
+
+export type Outcome<T> = { readonly ok: true; readonly result: T } | { readonly ok: false; readonly error: ProtocolError };
+
+export function ok<T>(result: T): Outcome<T> {
+	return { ok: true, result };
+}
+export function fail(code: ErrorCode, message: string, detail?: unknown): Outcome<never> {
+	return { ok: false, error: detail === undefined ? { code, message } : { code, message, detail } };
+}
+
+/** Run summary (runs.md §5). */
+export interface RunSummary {
+	readonly id: RunId;
+	readonly name: string;
+	readonly status: RunStatus;
+	readonly started_at: number;
+	readonly finished_at: number | null;
+	readonly done: number;
+	readonly total: number;
+	readonly update_due: number | null;
+	readonly update_overdue: boolean;
+	/** Only meaningful for finished Runs. */
+	readonly retrospective: boolean;
+}
+
+/** Event payloads pushed to the coordinator (launch-events.md §4–§6, runs.md §2, §6, checks.md §4). */
+export type EventPayload =
+	| {
+			readonly event: "block_changed";
+			readonly data: {
+				readonly id: string;
+				readonly launch: { readonly id: LaunchId; readonly kind: LaunchKind; readonly run: RunId };
+				readonly agents: readonly string[];
+				readonly changed: readonly BlockId[];
+				readonly diff: string;
+				readonly current: CompileResult;
+			};
+	  }
+	| { readonly event: "launch_requested"; readonly data: { readonly run: RunId; readonly blocks: readonly BlockId[] } }
+	| { readonly event: "check_requested"; readonly data: { readonly run: RunId | null; readonly blocks: readonly BlockId[] } }
+	| { readonly event: "run_started"; readonly data: { readonly run: RunId; readonly name: string } }
+	| { readonly event: "run_finished"; readonly data: { readonly run: RunId } }
+	| { readonly event: "done_changed"; readonly data: { readonly run: RunId; readonly block: BlockId; readonly done: boolean } }
+	| { readonly event: "update_due"; readonly data: { readonly run: RunId; readonly due: number; readonly last_update: number | null } }
+	| { readonly event: "interrupted"; readonly data: { readonly run?: RunId; readonly block: BlockId; readonly request: string } };
+
+// Compile-time check that EventPayload covers exactly EventName.
+type _EventsCovered = [EventName] extends [EventPayload["event"]] ? ([EventPayload["event"]] extends [EventName] ? true : never) : never;
+const _eventsCovered: _EventsCovered = true;
+void _eventsCovered;
+
+/** Wire frames. */
+export type ClientFrame = { readonly id: string; readonly op: string; readonly args: unknown };
+export type ServerFrame = { readonly id: string; readonly ok: true; readonly result: unknown } | { readonly id: string; readonly ok: false; readonly error: ProtocolError } | EventPayload;
+
+/** Socket path (contracts.md K1 交换). */
+export function socketPath(tmpdir: string, playbookAbsPath: string): string {
+	const hash = new Bun.CryptoHasher("sha256").update(playbookAbsPath).digest("hex");
+	return `${tmpdir.replace(/\/$/, "")}/tern-playbooks/${hash}.sock`;
+}
