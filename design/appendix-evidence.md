@@ -183,6 +183,7 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
   | good | 0.21 | 0.08 |
   | missing | 0.97 | 0.07 |
   | empty_ref | 0.91 | 0.91 |
+- 产品启动路径（omp 18.8.9，K5 的启动命令 `env PLAYBOOK_DOC=<模板> omp -e <扩展入口>`，记录在 `/tmp/jev-routing/product-fresh.rpc.log`）：协调者在 `eval` 中调用 `judge` 与 `judge_batch`，`status()` 报告 `commandcode/typesafe/jev`，用量记录为 `api typesafe`。`judge` 角色的 jev 由用户安装的 commandcode provider 插件注册；以 `--no-extensions` 启动 omp 时该插件不加载，`judge` 退回内置的候选模型（实测为 `openai-codex/gpt-6-astra`）。
 
 ### E2.7 扩展中止协调者的 agent 操作
 
