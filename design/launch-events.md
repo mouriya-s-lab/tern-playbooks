@@ -24,7 +24,7 @@
 
 - 协调者以 `launch {run, blocks}` 操作创建 Launch（K1）。`blocks` 必须属于一个进行中的 Run；模板中的块不能启动（[runs.md §1](runs.md#1-模板与-run)）。`blocks` 只含一个编排块时，`kind` 为 `orchestration`。`blocks` 为空，或编排块与其他块同在其中时，`launch` 返回错误 `BadLaunch`，不创建 Launch。
 - 一个 Launch 可以绑定多个 agent：协调者用同一份快照启动多个 subagent 时，以 `bind` 逐个绑定。
-- Launch 结束于下列之一，文档服务记录 `closed`：协调者调用 `close {launch}`，表示依据它的工作已经结束；人在块卡片的 Launch 列表中点"关闭"（[contracts.md §K4](contracts.md#k4-文档服务--tern)）；所属 Run 结束（[runs.md §2](runs.md#2-生命周期)）。人关闭 Launch 不中止已经启动的 subagent，只停止该 Launch 的块变化事件，因为 subagent 的生命周期属于协调者会话（D2.4）。
+- Launch 结束于下列之一，文档服务记录 `closed`：协调者调用 `close {launch}`，表示依据它的工作已经结束；人在块卡片的 Launch 列表中点"关闭"（[contracts.md §K4](contracts.md#k4-文档服务--tern)）；所属 Run 结束（[runs.md §2](runs.md#2-生命周期)）。人关闭 Launch 不中止已经启动的 subagent，只停止该 Launch 的块变化事件，因为 subagent 的生命周期属于协调者会话（D2.4）。Launch 关闭时，文档服务丢弃它的 `pending` 与进行中的判定；之后对被丢弃事件的 `ack` 不改变任何状态。
 - 文档服务把 Launch 写入所属 Run 的记录文件 `<Run id>.jsonl`：每次变化（包括 `agents`、`baselines`、`dirty`、`notified`、`fetches` 与 `closed` 的变化）追加一行 `{"launch": 完整记录}`，一个 Launch 的当前状态是它最后一行（[runs.md §3](runs.md#3-时间线)）。`pending` 不写入，因为它只在一次连接内有意义（§2）。因为 Launch 是文档服务创建的事实，不是共同编辑的文本。
 - `snapshot` 在创建后不改变（I2）。
 - `rebase` 追加一个基线。基线是块变化判定的比较参照；它由协调者选定，文档服务不记录 agent 实际依据哪份文本。基线内容为用当前块正文和该 Launch 的 `fetches` 得到的编译结果的文本；`fetches` 中缺少的目标按 §3 的规则加入 `fetches`。因此基线与最近一次块变化事件所报告的文本使用同一份外部内容。当前编译结果为 `Err` 时，`rebase` 不追加基线，返回错误 `CompileError`（K1）。

@@ -75,7 +75,7 @@
 - R11（由 D4 推出）块 id 不得因编辑而改变。
 - R12 块的渲染结果与编译结果在运行时可以被检查：渲染是否出错、内容是否缺失。检查结果显示在块旁。
 - R13（由 U2 推出）同一份 Playbook 可以反复使用；每次使用是一个 Run，Run 有开始与结束，修改一个 Run 不改变模板与其他 Run。
-- R14（由 U3、U4 推出）一个 Run 中发生的事实（块的修改、勾选、启动、绑定的 agent、发给协调者的事件、打断、检查结果、人与协调者写的记录）按时间保存，人在界面中、协调者经 `playbook` 工具都能读取，不需要翻阅协调者会话。
+- R14（由 U3、U4 推出）一个 Run 中发生的事实（块的修改、勾选、启动、绑定的 agent、发给协调者的事件、打断、被接受的检查报告、人与协调者写的记录）按时间保存，人在界面中、协调者经 `playbook` 工具都能读取，不需要翻阅协调者会话。确定性检查的结果不单独保存，因为它由块正文、取回结果与渲染确认按 [checks.md §4](checks.md#4-触发) 重新计算，块正文的每次修改已在时间线中。
 
 ### 驱动
 
@@ -187,7 +187,7 @@
 
 | Mattermost 中的交互 | 人的入口（K4） | agent 的入口（K1、K2） | 在协调者会话中出现的内容 |
 |---|---|---|---|
-| 点任务的 Run，执行任务 | 块卡片的启动按钮 | `launch`，然后在 `eval` 中用 `agent()` 启动 subagent | 启动请求事件（[launch-events.md §5](launch-events.md#5-启动请求)） |
+| 点任务的 Run，执行任务 | 块卡片的启动按钮 | `launch`，然后在 `eval` 中用 `agent()` 启动 subagent，并以 `bind` 把 agent id 绑定到 Launch | 启动请求事件（[launch-events.md §5](launch-events.md#5-启动请求)） |
 | 勾选任务完成；完成与执行是两个操作 | `done` 复选框 | `set {field: "done"}` | 人勾选时为 `done_changed` 事件（[runs.md §2](runs.md#2-生命周期)）；协调者 `set` 时无 |
 | 新增、编辑、删除任务 | 新建、铅笔编辑、删除 | `insert`；`lock` 后 `set`、`edit`、`delete` | 无 |
 | 任务内容在 run 中被改动 | 提交编辑草稿 | — | 块变化事件（[launch-events.md §4](launch-events.md#4-块变化事件)） |
@@ -198,6 +198,8 @@
 | 查看 run 的时间线 | Run 视图的时间线 | `timeline` | 无 |
 | 无对应（Mattermost 的任务执行没有持续的依赖通知） | 块卡片 Launch 列表的"关闭" | `close` | 无；`launch_closed` 写入时间线（[launch-events.md §1](launch-events.md#1-launch)） |
 | 无对应 | 点时间线中的 `launch_created` 条目 | `launch_info` | 无 |
+| 无对应（Mattermost 的任务不引用外部内容） | 块卡片中引用的"重新取回" | `refetch` | 无；依赖它的活跃 Launch 不因此改变（[references.md §5](references.md#5-文档取回表与预览)） |
+| 无对应（Mattermost 的 bot 不持有任务的编辑） | 块卡片的打断按钮 | — | 无消息；协调者扩展中止持有该块锁的 agent 操作（[contracts.md §K2](contracts.md#k2-协调者扩展--协调者会话)） |
 
 - 替代：只在协调者会话中用文字驱动全部操作，不提供表单入口。不选，因为用户决定人与 agent 都有操作入口。
 - 替代：只提供表单，agent 不参与推动。不选，因为 bot 推动流程是参考对象的核心。
@@ -250,7 +252,7 @@ flowchart TB
 ```mermaid
 flowchart TB
   subgraph RunLife["Run（开始到结束）"]
-    LaunchLife["Launch 活跃（创建到 close 或 Run 结束）"]
+    LaunchLife["Launch 未关闭（创建到关闭或 Run 结束）"]
   end
   subgraph CoordLife["协调者会话"]
     subgraph Conn["连接"]
@@ -290,9 +292,9 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  Human["人"] -->|"铅笔、按键、edit 事件、提交、勾选、新建与删除块、打断、开始与结束 Run、写记录、关闭 Launch、启动请求、检查请求、重新取回 · K4"| DocSvc["文档服务"]
+  Human["人"] -->|"铅笔、按键、粘贴、edit 事件、提交、勾选、新建与删除块、打断、开始与结束 Run、写记录、关闭 Launch、启动请求、检查请求、重新取回 · K4"| DocSvc["文档服务"]
   DocSvc -->|"模板视图、Run 视图、块卡片、编辑中的字段、块锁状态、时间线、Launch 记录、预览、检查结果 · K4"| Human
-  Ext["协调者扩展"] -->|"lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/close/launch_info/start_run/finish_run/runs/timeline/post/ack · K1"| DocSvc
+  Ext["协调者扩展"] -->|"hello/lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/close/launch_info/start_run/finish_run/runs/timeline/post/ack · K1"| DocSvc
   DocSvc -->|"块变化、启动请求、检查请求、Run 开始与结束、done 改变、打断 · K1"| Ext
   Ext -->|"playbook 工具结果、aside 消息、abort() · K2"| Coord["协调者会话"]
   Coord -->|"tool.playbook(...)、agent 操作结束 · K2"| Ext
