@@ -1,6 +1,6 @@
 # 附录：证据
 
-本附录挂在根节点上，记录 [README.md §域](README.md#域) 中 D1–D3 的证据，以及 S8 所参照的 Mattermost Playbooks 的观察。它不设立规则。
+本附录挂在根节点上，记录 [README.md §域](README.md#域) 中 D1–D3 的证据，以及 S8、S9、S11 所参照的 Mattermost Playbooks 的观察。它不设立规则。
 
 ## E1 Tern
 
@@ -82,6 +82,27 @@ Native composer editing 关闭（在设置页点击开关，截图确认已关�
 - `cx.docs:edit(path, {find, replace})` 返回 `{from:7,to:7}`，渲染视图立即更新；`cx.docs:read` 返回未保存的缓冲区文本。
 - 缓冲区未修改时，外部写入自动重新加载；缓冲区已修改时显示"Changed on disk since you edited it."与 Compare、Keep mine、Use disk version（`serve/external-conflict.png`）。
 - 从 Tern 二进制生成的 `DocsCx` 声明只有 `open`、`read`、`outline`、`write`、`edit`、`append`、`save`、`new_note`、`search`。
+
+### E1.5 可折叠的 `section` 节点
+
+来源：[Elements — common props](https://docs.stencil.so/tern/elements/index.md#props-every-node-takes)："`collapsed` | boolean | `false` | Starting fold state (needs `collapsible`)"，"**Events:** `toggle`"；[Documents and Frames](https://docs.stencil.so/tern/protocol/documents.md#the-document)："once the user flips it, the local state wins until your view sends a *different* `collapsed` value, which resets it (sending the same value again changes nothing). The program hears a `toggle` event."
+
+条件：无头 `tern serve`（`tern 0.7.2 (5d1cc64)`）；探针 `/tmp/tsp-collapsible/probe.ts`（Bun 直接写 TSP），一张 `card` 中一个 `section`（`head`、`key`、`collapsible: true`、`collapsed: true`），其内容为一个 `md` 节点。用 `tern ctl click '.sf-section-head'` 展开。
+
+- 点击标题后 `section` 立即展开，`md` 内容可见（截图 `/tmp/tsp-collapsible/shots/serve/expanded-markdown.png`）；程序收到 `{"ev":"toggle","id":"details","collapsed":false,"key":"prompt-details","sf":"fold-probe"}`，此前没有发出新帧。
+- 程序删除并重新添加整个视图、`collapsed` 仍为 `true` 时，`section` 保持展开（`full-render-retains-open.png`）；同一父节点下以新 id、同一 `key` 替换时同样保持。
+- 程序把 `collapsed` 改为不同的值时，本地折叠状态被重置。
+
+### E1.6 pane 中的程序控制 pane
+
+来源：`tern split --help`："`tern split BLOCK right|down [LAUNCH]` a block beside BLOCK"，"LAUNCH is [--cwd DIR] [--keep-open] [-- COMMAND...]; as in a window, a block whose program succeeds closes unless kept open."；`tern focus --help`："`tern focus BLOCK` every window shows it"，"--json prints what a command found or did as JSON"；[Transport](https://docs.stencil.so/tern/protocol/transport.md) 的动词只有 `q`、`o`、`f`、`b`、`t`、`s`、`x`，TSP 本身没有建立或聚焦 pane 的动词；[Layout §Ids](https://docs.stencil.so/tern/guides/layout.md#ids)："don't compare ids between windows or with ids from the host half or `tern` scripts"。
+
+条件：`tern 0.7.2 (5d1cc64)`；由 loopback 主机托管 session daemon 的无头 `tern serve`；一个 TSP 程序在 pane 中运行，并以子进程调用 `tern`。记录在 `/tmp/pb-pane-control/`。
+
+- daemon 托管的 pane 中，程序环境有 `TERN_PANE=2` 与 `TERN_PANE_SOCKET`；`tern ls --json` 只列出这个 daemon 的会话。
+- `tern split 2 right --cwd /tmp/pb-pane-control --keep-open --json -- python3 /tmp/pb-pane-control/child.py` 退出码 0，在 pane 2 右侧建立新 pane，并在其中运行该命令。
+- `tern focus PaneControlChild --json` 返回 `{"block":17179869185}`，窗口焦点移到新 pane；`tern focus 2 --json` 返回 `{"block":2}`，焦点回到原 pane。
+- 没有 session daemon 的无头窗口中，pane 环境没有 `TERN_PANE`，`tern whoami --json` 以退出码 1 报告 "not inside a Tern pane (TERN_PANE_SOCKET and TERN_PANE are unset)"。
 
 ## E2 omp
 
@@ -205,6 +226,18 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
 - `task/executor.ts:1487-1494`：任务的 `signal` 中止时，subagent 以 `shutdown` 原因中止；`:3385-3393` 中止后释放并销毁子会话。
 - `modes/interactive-mode.ts:2036-2063`：SIGINT、SIGTERM、SIGHUP 与未捕获异常经同一 teardown 调用 `session.dispose()`。SIGKILL 不执行这条路径。
 
+### E2.9 扩展命令读取会话消息
+
+- 源码（`@oh-my-pi/pi-coding-agent` 18.8.7）：`src/extensibility/extensions/types.ts:1519-1527` `registerCommand(name, {description?, handler(args, ctx)})`，`args` 为命令后的原始字符串；`:500-501` 上下文提供只读的 `sessionManager`；`src/session/session-manager.ts:3665-3670` `getBranch(fromId?)` 返回当前分支从根到叶的全部条目，条目带稳定的 `id`；`types.ts:269-289` `ui.select(title, options)` 返回所选项的标签，取消时返回 `undefined`，`ui.notify(message, type?)` 显示提示。
+- 探针（omp 18.8.8，`omp -e /tmp/omp-command-entry-probe/pick-message.ts --mode rpc`，驱动 `/tmp/omp-command-entry-probe/run-probe.py`）：会话中已有两条助手消息；命令 `/pick-message 2` 收到 `args` 为 `"2"`，经 `getBranch()` 列出两条消息（选项以 id 开头），人选择第二条后，扩展把该消息的全部文本（含换行）与 id 发到一个 Unix socket，收到回复后 `notify`：
+
+  ```text
+  {"type":"extension_ui_request","method":"select","title":"Pick recent assistant message","options":["asst0002: ASSISTANT_B_OMP_PROBE: chosen existing message. Second text line.","asst0001: ASSISTANT_A_OMP_PROBE: first existing message."]}
+  {"type":"extension_ui_request","method":"notify","message":"RECEIVED=\"ASSISTANT_B_OMP_PROBE: chosen existing message.\\nSecond text line.\"; ENTRY_ID=asst0002; NOTE=\"HUMAN_NOTE_OMP_PROBE\"; SOCKET_REPLY=ACK_OMP_PROBE_1888","notifyType":"info"}
+  ```
+
+- 命令执行期间没有 `agent_start`：命令不经过模型。记录在 `/tmp/omp-command-entry-probe/evidence.jsonl`。
+
 ## E3 GitHub
 
 - D3.2：GitHub 公开仓库中，任何登录账号都可以评论 issue 与 PR。
@@ -238,3 +271,5 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
 - `server/app/playbook.go:20-21`："Playbook represents a desired business outcome, from which playbook runs are started to solve a specific instance."
 - `server/app/playbook_run.go:948-950`：`SetChecklistFromPlaybook` "overwrites this run's checklists with the ones in the provided playbook"，`r.Checklists = playbook.Checklists`；`:964-965`：`SetConfigurationFromPlaybook` "effectively snapshoting the playbook's configuration in this moment of time."
 - `webapp/src/components/rhs/rhs_run_details.tsx:231-232`：run 详情侧栏的引导文字 "View run details in a side panel"、"See who is involved and what needs to be done without leaving the conversation."
+- `server/app/reminder.go:208-244`：`SetNewReminder` "sets a new reminder for playbookRunID, removes any pending reminder … and resets the PreviousReminder and LastStatusUpdateAt"；`server/app/playbook_run_service.go` 的 `UpdateStatus` 在写入状态更新后调用 `s.SetNewReminder(playbookRunID, options.Reminder)`；`server/app/reminder.go:185-205`：`ResetReminder`（Snooze）写入 `StatusUpdateSnoozed` 时间线事件后调用 `SetNewReminder`。
+- `server/app/playbook_run_service.go:1472-1487`：结束 run 时 "Remove pending reminder (if any)"，并在 `RetrospectiveEnabled && RetrospectivePublishedAt == 0` 时发出填写复盘的提醒。

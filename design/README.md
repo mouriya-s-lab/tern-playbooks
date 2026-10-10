@@ -1,13 +1,13 @@
 # Tern Playbooks 设计
 
-本文档定义 Tern Playbooks。Tern Playbooks 是一种 agent 工作流系统：人和协调者在 Tern 中编辑同一份 Playbook 文档，文档以表单块显示，块被编译成 prompt，协调者用 omp `eval` 编排 subagent，块被修改后协调者收到通知。人和协调者对同一组操作都有入口：人经表单界面，协调者经 `playbook` 工具。
+本文档定义 Tern Playbooks。Tern Playbooks 是一种 agent 工作流系统：人和协调者在 Tern 中编辑同一份 Playbook 文档，文档以表单块显示，块被编译成 prompt，协调者用 omp `eval` 编排 subagent，块被修改后协调者收到通知。Playbook 与协调者会话在两个并排的 pane 中，两边的操作互相可见。人和协调者对同一组操作都有入口：人经表单界面与协调者会话中的命令，协调者经 `playbook` 工具。
 
 - 本文档拥有：问题域、驱动、全部术语的定义、系统级范围图、交互图、契约摘要、结构决定。
 - [references.md](references.md) 拥有：引用语法、解析器、截取表达式、编译规则、文档取回表与预览。
 - [launch-events.md](launch-events.md) 拥有：Launch、基线、块变化事件和启动请求的规则。
-- [runs.md](runs.md) 拥有：模板与 Run、Run 的生命周期、时间线与记录的规则。
+- [runs.md](runs.md) 拥有：模板与 Run、Run 的生命周期、时间线与记录、状态更新提醒与复盘、把会话消息加入时间线的规则。
 - [checks.md](checks.md) 拥有：块检查的规则，包括确定性检查与 jev 判定。
-- [contracts.md](contracts.md) 拥有：本文档列出的四份契约的完整规格。
+- [contracts.md](contracts.md) 拥有：本文档列出的五份契约的完整规格。
 - 非目标：
   - 多人协作。参与编辑的只有一个人和一个协调者。
   - 同一块的并发编辑。每个块同一时刻只有一方编辑（S1）。
@@ -17,7 +17,6 @@
   - 由 LLM 计算的截取表达式。
   - 编排块运行期间的热更新。
   - 文档层的约束语言。subagent 输出的 schema、输出检查、条件门控写在编排块的代码中（`agent(…, schema=…)` 等）。
-  - Mattermost 中由 bot 定时发出的提醒、Snooze、欢迎消息、复盘提示与待办汇总。它们在 Mattermost 中由不会推理的 bot 按配置发出；这里的 bot 是 agent，这些消息由协调者在需要时自己写（S8）。
 - 输入：无。本文档是根节点。
 - 读者：实现者与评审者。审批者：项目所有者。
 
@@ -27,8 +26,8 @@
 
 | 域 | 固有性质 | 证据 |
 |---|---|---|
-| D1 Tern | 1. Tern daemon 托管 pane；窗口关闭后 pane 中的程序继续运行。<br>2. 一个非插件程序可以在自己的 pane 中通过 Tern Surface Protocol（TSP）绘制原生界面。<br>3. `editor` 与 `input` 节点的文本由程序拥有：Tern 只绘制文本、光标和 `decor` 装饰，不修改文本。<br>4. 程序在 `hello` 中声明 `edit` 与 `undo` 特性，并且 Settings › Terminal › Native composer editing 开启（默认开启）时，程序同时收到两种输入：作用于 Tern 选区的编辑和光标移动以 `edit` 事件 `{from, to, text, cursor, len}` 到达，⌘Z 以 `undo` 事件到达；没有选区时的普通输入以按键到达。该设置关闭时，全部输入以按键到达，⌘Z 不到达程序。`edit` 事件不携带帧序号，TSP 不规定输入事件与 `ack` 的先后。插件 block 不声明特性，不收到 `edit` 事件。<br>5. 点击未聚焦的 `input` 或 `editor` 产生 `focus` 事件；带 `actions.click` 的节点被点击时产生 `action` 事件；复选框被点击时产生 `change` 事件。TSP 没有失去焦点事件，点击空白处不产生任何事件。一个节点的 `click` 动作在其后代 `editor` 内被点击时同样触发。<br>6. 插件 API 没有文件变化事件。<br>7. Tern 闭源；只有公开文档和实测行为是可依赖的。<br>8. `md` 节点原生绘制 Markdown，其中的 ` ```mermaid ` 围栏绘制成图；`image` 节点显示经 `b` 动词发送的 blob，SVG 直接绘制，不经栅格化。`hello` 回复的 `dark` 和 `theme` 事件给出当前外观。 | [E1](appendix-evidence.md#e1-tern) |
-| D2 omp 协调者会话 | 1. `eval` 提供 `agent()`、`wait()`、`workpool()`，参数包括 `schema=`、`isolated=`；handle 提供 `.send()`、`.cancel()`。<br>2. 扩展注册的工具可以在 `eval` 中以 `tool.<name>(args)` 调用。<br>3. 扩展调用 `sendMessage(…, {deliverAs: "aside", triggerTurn: true})`：会话忙时，消息在下一个步边界注入；会话空闲时，消息开始一个新 turn。<br>4. 协调者会话被销毁时（正常结束，或进程收到 SIGINT、SIGTERM、SIGHUP），它在 `eval` 中用 `agent()` 启动、仍在运行的 subagent 被中止。<br>5. 扩展事件 `before_subagent_spawn` 不含 prompt 或 subagent id。<br>6. omp 的 auto graph（设置 `tui.autoGraph`）在 npm 包 `@oh-my-pi/pi-tui` 中实现，可在 omp 之外导入：`splitTableCharts` 把 Markdown 在数值表格之后切开，`lookupTableChart` 为表格生成按主题着色的 SVG 图，`describeTableChart` 把图转成 TSP `image` 节点。`always` 模式只用本地规则选图；`smart` 模式需要 omp 的判定模型。<br>7. omp 的 `judge` 模型角色在有 TypeSafe 凭据时解析到 jev。`eval` 中的 `judge(state, questions)` 与 `judge_batch(states, questions)` 经这个角色回答类型化问题（bool 给出 P(yes)）。扩展 API 不提供判定接口。<br>8. 扩展的上下文提供 `abort()`，它中止会话当前的 agent 操作，omp 输出 `Interrupted by user`；扩展可以在自己的定时器或 socket 回调中调用它。 | [E2](appendix-evidence.md#e2-omp) |
+| D1 Tern | 1. Tern daemon 托管 pane；窗口关闭后 pane 中的程序继续运行。<br>2. 一个非插件程序可以在自己的 pane 中通过 Tern Surface Protocol（TSP）绘制原生界面。<br>3. `editor` 与 `input` 节点的文本由程序拥有：Tern 只绘制文本、光标和 `decor` 装饰，不修改文本。<br>4. 程序在 `hello` 中声明 `edit` 与 `undo` 特性，并且 Settings › Terminal › Native composer editing 开启（默认开启）时，程序同时收到两种输入：作用于 Tern 选区的编辑和光标移动以 `edit` 事件 `{from, to, text, cursor, len}` 到达，⌘Z 以 `undo` 事件到达；没有选区时的普通输入以按键到达。该设置关闭时，全部输入以按键到达，⌘Z 不到达程序。`edit` 事件不携带帧序号，TSP 不规定输入事件与 `ack` 的先后。插件 block 不声明特性，不收到 `edit` 事件。<br>5. 点击未聚焦的 `input` 或 `editor` 产生 `focus` 事件；带 `actions.click` 的节点被点击时产生 `action` 事件；复选框被点击时产生 `change` 事件。TSP 没有失去焦点事件，点击空白处不产生任何事件。一个节点的 `click` 动作在其后代 `editor` 内被点击时同样触发。<br>6. 插件 API 没有文件变化事件。<br>7. Tern 闭源；只有公开文档和实测行为是可依赖的。<br>8. `md` 节点原生绘制 Markdown，其中的 ` ```mermaid ` 围栏绘制成图；`image` 节点显示经 `b` 动词发送的 blob，SVG 直接绘制，不经栅格化。`hello` 回复的 `dark` 和 `theme` 事件给出当前外观。<br>9. `collapsible` 为真的 `section` 节点由人点击标题折叠或展开；折叠状态由 Tern 保持，程序再次发送相同的 `collapsed` 值不改变它；程序收到 `toggle` 事件。<br>10. session daemon 托管的 pane 中，程序的环境有 `TERN_PANE`（本 pane 的 id）；程序可以以子进程调用 `tern split <pane> right -- <命令>` 在该 pane 旁建立运行该命令的 pane，调用 `tern focus <pane>` 让窗口显示并聚焦一个 pane。TSP 本身没有这些操作。没有 session daemon 的窗口中，pane 环境没有 `TERN_PANE`。 | [E1](appendix-evidence.md#e1-tern) |
+| D2 omp 协调者会话 | 1. `eval` 提供 `agent()`、`wait()`、`workpool()`，参数包括 `schema=`、`isolated=`；handle 提供 `.send()`、`.cancel()`。<br>2. 扩展注册的工具可以在 `eval` 中以 `tool.<name>(args)` 调用。<br>3. 扩展调用 `sendMessage(…, {deliverAs: "aside", triggerTurn: true})`：会话忙时，消息在下一个步边界注入；会话空闲时，消息开始一个新 turn。<br>4. 协调者会话被销毁时（正常结束，或进程收到 SIGINT、SIGTERM、SIGHUP），它在 `eval` 中用 `agent()` 启动、仍在运行的 subagent 被中止。<br>5. 扩展事件 `before_subagent_spawn` 不含 prompt 或 subagent id。<br>6. omp 的 auto graph（设置 `tui.autoGraph`）在 npm 包 `@oh-my-pi/pi-tui` 中实现，可在 omp 之外导入：`splitTableCharts` 把 Markdown 在数值表格之后切开，`lookupTableChart` 为表格生成按主题着色的 SVG 图，`describeTableChart` 把图转成 TSP `image` 节点。`always` 模式只用本地规则选图；`smart` 模式需要 omp 的判定模型。<br>7. omp 的 `judge` 模型角色在有 TypeSafe 凭据时解析到 jev。`eval` 中的 `judge(state, questions)` 与 `judge_batch(states, questions)` 经这个角色回答类型化问题（bool 给出 P(yes)）。扩展 API 不提供判定接口。<br>8. 扩展的上下文提供 `abort()`，它中止会话当前的 agent 操作，omp 输出 `Interrupted by user`；扩展可以在自己的定时器或 socket 回调中调用它。<br>9. 扩展可以注册人在会话中输入的命令（`registerCommand`）；命令处理函数可以读取会话当前分支上的消息及其 id（`sessionManager.getBranch()`），以选择框询问人（`ui.select`），并显示提示（`ui.notify`）。命令不经过模型。 | [E2](appendix-evidence.md#e2-omp) |
 | D3 GitHub | 1. issue 与 PR 的权威来源是 GitHub。<br>2. 任何能评论的账号都能写入 issue 与 PR 的内容，内容不可信。<br>3. GitHub 不向本机进程推送变化；得知变化只能轮询或接收 webhook。<br>4. `gh` CLI 持有已有的认证。 | [E3](appendix-evidence.md#e3-github) |
 | D4 人 | 人修改块的字段，新增、删除块，也会在编辑一个字段的中途离开。 | 需求来源 |
 | D5 文件系统 | git checkout 和其他编辑器可以在本系统之外修改 Playbook 文件。 | 需求来源 |
@@ -37,16 +36,17 @@
 
 | 方向 | 现象 |
 |---|---|
-| 人 → 机器 | 铅笔、按键、粘贴、`edit` 事件、提交（Esc 或完成按钮）、勾选完成、新建与删除块、打断、开始与结束 Run、写记录、关闭 Launch、启动请求、检查请求、重新取回 |
-| 机器 → 人 | 模板视图与 Run 视图、块卡片（渲染视图：Markdown、mermaid 图、数值表格的图）、编辑中的字段、块锁状态、依赖块的 Launch 与 agent、时间线与 Launch 记录、引用展开视图、编译预览、检查结果、错误 |
-| 协调者 → 机器 | `playbook` 工具调用：加锁、解锁、读、设置字段、编辑正文、新建块、删除块、开始与结束 Run、列出 Run、读时间线、写记录、读 Launch 记录、重新取回、编译、检查、报告检查结果、启动、绑定、改基线、关闭 Launch |
-| 机器 → 协调者 | 块变化事件、启动请求事件、检查请求事件、Run 开始与结束事件、`done` 改变事件、打断 |
+| 人 → 机器 | 铅笔、按键、粘贴、`edit` 事件、提交（Esc 或完成按钮）、勾选完成、新建与删除块、打断、开始与结束 Run、写记录（含状态更新与复盘）、推迟状态更新、关闭 Launch、启动请求、检查请求、重新取回、启动协调者、转到协调者；在协调者会话中输入 `/playbook-add` 与 `/playbook-show` |
+| 机器 → 人 | 模板视图与 Run 视图、块卡片（渲染视图：Markdown、mermaid 图、数值表格的图）、编辑中的字段、块锁状态、依赖块的 Launch 与 agent、时间线与 Launch 记录、状态更新到期与未复盘的标记、引用展开视图、编译预览、检查结果、错误 |
+| 协调者 → 机器 | `playbook` 工具调用：加锁、解锁、读、设置字段、编辑正文、新建块、删除块、开始与结束 Run、列出 Run、读时间线、写记录、推迟状态更新、读 Launch 记录、重新取回、编译、检查、报告检查结果、启动、绑定、改基线、关闭 Launch |
+| 机器 → 协调者 | 块变化事件、启动请求事件、检查请求事件、Run 开始与结束事件、`done` 改变事件、状态更新到期事件、打断 |
 | 机器 → GitHub | 只读 API 请求 |
 | 文件系统 ↔ 机器 | 模板文件、Run 文件与记录文件的读写；外部修改 |
+| 机器 → Tern | 在文档服务的 pane 旁建立协调者 pane；聚焦文档服务或协调者的 pane |
 
 ### 使用场景
 
-下列场景来自需求来源（用户），是本设计的验收路径。每一步都写明人的入口与 agent 的入口。
+下列场景是从需求来源给出的使用目标（人与 agent 共同编辑、可编排、不是黑箱的 Playbook；Playbook 与会话来回交互）推演出的典型使用，是本设计的验收路径。每一步都写明人的入口与 agent 的入口。
 
 - U1 修复一个 issue。
   1. 人在模板中写块：一个上下文块引用 issue、日志与源码文件，一个计划块，一个实现块与一个评审块（评审块以 `((实现块.result))` 引用实现的结果），一个编排块。
@@ -58,7 +58,7 @@
   7. agent 修改块或勾选完成时，人在块卡片上看到"协调者正在编辑"；人可以打断。
 - U2 复用。上周的 Run 已结束。下周用于另一个 issue：人从模板开始一个新 Run，在新 Run 中只改上下文块中的引用，然后启动；上周的 Run 与它的时间线保持不变。
 - U3 回看。人离开后回来，在 Playbook 中看出哪些块被启动过、绑定了哪些 agent、哪些块在启动后被改过、检查结果是什么，不需要翻阅协调者会话。
-- U4 事故处理。人启动诊断块；多个 subagent 并行诊断；协调者定期在会话中汇报；人随时调整块并重新启动；结束后对照记录复盘。
+- U4 事故处理。人开始 Run 时设定状态更新间隔，启动诊断块；多个 subagent 并行诊断；状态更新到期时协调者收到通知并写状态更新，人也可以写或推迟；人随时调整块并重新启动；结束后人或协调者对照时间线写复盘。
 
 ### 需求
 
@@ -70,12 +70,14 @@
 - R6 协调者自己的编辑不得产生通知。
 - R7 外部来源的变化不得产生通知。
 - R8 编排写在文档的编排块中。Launch 的快照保存启动时的编排代码，之后块正文的修改不改变它。
-- R9 Playbook 文档在磁盘上是一个 YAML 文件，git 和其他编辑器可以读写。
+- R9 Playbook 文档在磁盘上是一个结构化文件，git 和其他编辑器可以读写。
 - R10（由 D3.2 推出）展开的外部内容必须在 prompt 中标出边界。
 - R11（由 D4 推出）块 id 不得因编辑而改变。
 - R12 块的渲染结果与编译结果在运行时可以被检查：渲染是否出错、内容是否缺失。检查结果显示在块旁。
 - R13（由 U2 推出）同一份 Playbook 可以反复使用；每次使用是一个 Run，Run 有开始与结束，修改一个 Run 不改变模板与其他 Run。
-- R14（由 U3、U4 推出）一个 Run 中发生的事实（块的修改、勾选、启动、绑定的 agent、发给协调者的事件、打断、被接受的检查报告、人与协调者写的记录）按时间保存，人在界面中、协调者经 `playbook` 工具都能读取，不需要翻阅协调者会话。确定性检查的结果不单独保存，因为它由块正文、取回结果与渲染确认按 [checks.md §4](checks.md#4-触发) 重新计算，块正文的每次修改已在时间线中。
+- R14（由 U3、U4 推出）一个 Run 中发生的事实（块的修改、勾选、启动、绑定的 agent、发给协调者的事件、打断、被接受的检查报告、人与协调者写的记录、状态更新的到期与推迟）按时间保存，人在界面中、协调者经 `playbook` 工具都能读取，不需要翻阅协调者会话。确定性检查的结果不单独保存，因为它由块正文、取回结果与渲染确认按 [checks.md §4](checks.md#4-触发) 重新计算，块正文的每次修改已在时间线中。
+- R15（由 U4 与 S8 推出）Run 可以设定状态更新间隔。到期时，人在界面中看到到期，协调者收到通知。人和协调者都能写状态更新、推迟到期与写复盘。
+- R16（由 S8 推出）Playbook 与协调者会话在两个并排的 pane 中显示。人可以从 Playbook 启动协调者，可以从任一方转到另一方，可以在协调者会话中把一条消息加入 Run 的时间线。
 
 ### 驱动
 
@@ -97,7 +99,7 @@
 | 只使用 Tern 公开文档中的 API | D1.7 | 依赖 Tern 内部行为 |
 | GitHub 只经 `gh` 已有的认证访问 | 凭据规则 | 在本系统中保存 token |
 | 参与编辑者为一个人和一个协调者，每个块同一时刻只有一方编辑 | 用户决定 | 网络同步、身份系统、同一块的并发编辑 |
-| Playbook 以表单块编辑，持久化为 YAML 文件；文档服务是外部 TSP 程序 | 用户决定 | Markdown 文件加 Tern 自带的 Markdown block；Tern 插件 block |
+| Playbook 以表单块编辑；文档服务是外部 TSP 程序；持久化为结构化文件 | 用户决定 | Markdown 文件加 Tern 自带的 Markdown block；Tern 插件 block；固定结构的 Markdown 文件 |
 | 人的编辑只由 Esc 或完成按钮提交，不自动提交 | 用户决定 | 失去焦点或闲置超时自动提交 |
 
 ## 架构层
@@ -149,11 +151,12 @@
 - 重审条件：需求加入同一块的并发编辑，或 TSP 提供失去焦点事件。
 
 **S2 磁盘文件是持久形式，格式为 YAML。**
-因为 R9 与约束。文件内容为一个映射 `{title, blocks}`，`blocks` 是块的有序列表，每个块是 `{id, title, body, done}`：`id` 形如 `b<正整数>` 并且在文件中唯一，`title` 与 `body` 是字符串，`done` 是布尔值。
+因为 R9 与约束要求结构化文件；块正文是多行 Markdown，YAML 的块标量让它在文件中保持原样的多行文本，git 差异按行显示，人也能在其他编辑器中直接修改。文件内容为一个映射 `{title, blocks}`，`blocks` 是块的有序列表，每个块是 `{id, title, body, done}`：`id` 形如 `b<正整数>` 并且在文件中唯一，`title` 与 `body` 是字符串，`done` 是布尔值。
 - 文档服务在文档变化后 1 s 内以同目录临时文件加原子替换写回文件，每 1 s 检查一次文件的修改时间。修改时间改变并且内容与上次写回的不同时，文档服务解析文件，按块 id 与上次写回的内容比较；每个块的字段改变、新增、删除与顺序改变，各作为一次来源为 `disk` 的编辑应用。
 - 来源为 `disk` 的编辑不受块锁限制。协调者持有的块被修改时，协调者下一次读取时看到修改。人正在编辑的字段被修改时，该字段旁显示"磁盘文件修改了这个字段"，提交时人的编辑草稿覆盖该字段。被锁的块被删除时，块锁解除；人的编辑草稿随之丢弃，并显示"这个块已被磁盘文件删除"。
 - 文件不能解析或不符合上面的格式时，文档服务不应用修改，也不写回文件，在界面上显示错误，直到文件再次符合格式。
-- 替代：固定结构的 Markdown 文件。不选，因为用户决定使用结构化文件。
+- 替代：固定结构的 Markdown 文件。不选，因为约束要求结构化文件。
+- 替代：JSON 文件。不选，因为 JSON 字符串把块正文的换行写成 `\n`，一个块正文在文件与 git 差异中只占一行，人在其他编辑器中无法按行修改。
 - 替代：另存一份编辑历史。不选，因为它会成为第二个权威来源。
 
 **S3 编排只在协调者会话的 `eval` 中运行。**
@@ -169,7 +172,7 @@
 因为 subagent 由协调者会话的 `eval` 创建并持有 handle（D2.1），它的生命周期在协调者会话之内（D2.4），所以 agent 状态的权威来源是协调者会话；D2.5 说明扩展拿不到 subagent 的完整信息，复制一份会产生第二个来源。
 
 **S6 块的渲染视图用 Tern 的 `md` 节点与 omp 的 auto graph 绘制。**
-因为 D1.8 与 D2.6：Tern 已原生绘制 Markdown 与 mermaid，omp 已实现数值表格到图的转换并输出 TSP 节点，两者可以直接使用。渲染视图只用于显示，不进入编译结果，所以 I3 不受影响。规则见 [contracts.md §K4](contracts.md#k4-文档服务--tern)。
+因为 D1.8 与 D2.6：Tern 已原生绘制 Markdown 与 mermaid，omp 已实现数值表格到图的转换并输出 TSP 节点，两者可以直接使用。渲染视图只用于显示，不进入编译结果，所以 I3 不受影响。块正文中的引用在渲染视图中展开，规则见 [references.md §5](references.md#5-文档取回表与预览)；绘制规则见 [contracts.md §K4](contracts.md#k4-文档服务--tern)。
 - auto graph 使用 `always` 模式。不选 `smart`，因为文档服务不连接模型，并且图的选择不需要模型判断。
 - 替代：文档服务自己生成图。不选，因为 auto graph 已覆盖柱状、折线、热力图等十一种图形，并跟随主题着色。
 - 替代：只显示表格，不出图。不选，因为用户要求与 omp 一致的图形渲染。
@@ -194,8 +197,15 @@
 | 对任务做检查 | 块卡片的检查按钮 | `inspect`、`report` | 检查请求事件（[checks.md §4](checks.md#4-触发)） |
 | 从 playbook 开始一次 run | 模板视图的"开始 Run" | `start_run` | 人开始时为 `run_started` 事件（[runs.md §2](runs.md#2-生命周期)）；协调者开始时无 |
 | 结束 run | Run 视图的"结束 Run" | `finish_run` | 人结束时为 `run_finished` 事件；协调者结束时无 |
-| 发状态更新；把消息加入时间线 | Run 视图中写记录 | `post` | 无；记录写入时间线（[runs.md §4](runs.md#4-记录)） |
+| 发状态更新 | Run 视图中写 `update` 记录，可选下次更新的时间 | `post {kind: "update", next?}` | 无；记录写入时间线，`update_due` 随之改变（[runs.md §6](runs.md#6-状态更新提醒与复盘)） |
+| bot 按定时器催状态更新 | Run 视图头部与模板视图列表显示"状态更新已到期" | — | `update_due` 事件（[runs.md §6](runs.md#6-状态更新提醒与复盘)） |
+| 推迟（Snooze）状态更新提醒 | Run 视图头部的"推迟" | `snooze` | 无；`update_snoozed` 写入时间线 |
+| run 结束后 bot 请人写复盘 | 已结束 Run 的模板视图列表标"未复盘"，Run 视图中写复盘 | `post {kind: "retrospective"}` | 人结束 Run 时为 `run_finished` 事件 |
+| bot 私信待办汇总；`/playbook todo` | 模板视图的 Run 列表 | `runs` | 无 |
+| bot 在 run 开始时发欢迎消息 | — | — | 人开始 Run 时为 `run_started` 事件；会话中说什么由协调者决定 |
 | 查看 run 的时间线 | Run 视图的时间线 | `timeline` | 无 |
+| 在频道的任意消息上选 Add to run timeline | 协调者会话中的 `/playbook-add` | `post {quote}` | 扩展以提示显示写入的条目序号（[runs.md §7](runs.md#7-把会话中的消息加入时间线)） |
+| run 详情侧栏与频道并排 | 头部的"启动协调者"与"转到协调者"；协调者会话中的 `/playbook-show` | — | 无（[contracts.md §K5](contracts.md#k5-文档服务协调者扩展--tern-cli)） |
 | 无对应（Mattermost 的任务执行没有持续的依赖通知） | 块卡片 Launch 列表的"关闭" | `close` | 无；`launch_closed` 写入时间线（[launch-events.md §1](launch-events.md#1-launch)） |
 | 无对应 | 点时间线中的 `launch_created` 条目 | `launch_info` | 无 |
 | 无对应（Mattermost 的任务不引用外部内容） | 块卡片中引用的"重新取回" | `refetch` | 无；依赖它的活跃 Launch 不因此改变（[references.md §5](references.md#5-文档取回表与预览)） |
@@ -213,6 +223,18 @@
 因为 R14：U3 要求人回来后不翻阅协调者会话也能知道发生了什么；协调者在 `eval` 中等待 subagent 时，注入的消息要到 `eval` 结束后才进入模型（[E2.3](appendix-evidence.md#e23-aside-投递)），编排代码需要一个可以在运行中读取的来源。时间线只记录文档服务自己知道的事实与写入者的陈述，不复制 agent 状态（I4、S5）。规则见 [runs.md §3](runs.md#3-时间线)。
 - 替代：只依赖协调者会话的记录。不选，因为会话结束后无法从 Playbook 回看，并且人需要逐条翻阅。
 - 替代：由文档服务轮询 omp 取得 agent 状态写入时间线。不选，因为 D2.5 说明扩展拿不到 subagent 的完整信息，并且会产生 agent 状态的第二个来源。
+
+**S11 状态更新到期由文档服务判定并通知协调者；写状态更新、推迟与写复盘是人与协调者共有的操作。**
+因为 R15：Mattermost 中定时器属于 run，bot 在到期时催人写更新，run 结束后请人写复盘（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。本设计中 bot 是 agent，agent 能自己写更新，所以到期通知发给协调者，人在界面中同样看到到期。到期时间是 Run 的状态，文档服务是 Run 的权威来源，所以由它保存与判定。规则见 [runs.md §6](runs.md#6-状态更新提醒与复盘)。
+- 替代：协调者用自己的定时器催更新。不选，因为协调者会话结束后定时器随之消失，而 Run 跨越多个会话（[runs.md §2](runs.md#2-生命周期)）；到期时间也会成为 Run 之外的第二个来源。
+- 替代：文档服务按间隔定时催复盘。不选，因为"未复盘"的标记一直显示在 Run 列表中，协调者也能从 `runs` 读到，定时提醒不提供新信息。
+
+**S12 文档服务的 pane 与协调者的 pane 并排，由 `tern split` 建立、`tern focus` 互相转到；把会话消息加入时间线的入口是协调者扩展的命令。**
+因为 R16：Mattermost 的 run 详情侧栏与频道并排，"不离开对话就能看到谁在参与、要做什么"（[E4](appendix-evidence.md#e4-mattermost-playbooks)），并且时间线可以收录频道中的任意消息。D1.10 说明 pane 中的程序能以 `tern` 子进程建立与聚焦 pane，D2.9 说明扩展能注册命令并读取会话消息。规则见 [contracts.md §K5](contracts.md#k5-文档服务协调者扩展--tern-cli) 与 [runs.md §7](runs.md#7-把会话中的消息加入时间线)。
+- 文档服务与协调者扩展只在人点击或输入命令时改变焦点，因为发出事件时人可能正在编辑块。
+- 替代：用 Window API 的 `cx.agents:start` 建立协调者 pane。不选，因为非插件程序只有在被显式给出控制端点时才能经 `tern ctl … carly lua` 调用 Window API，而 `tern split` 在 daemon 托管的 pane 中直接可用（[E1.6](appendix-evidence.md#e16-pane-中的程序控制-pane)）。
+- 替代：在文档服务中显示协调者会话的消息供人选择。不选，因为会话消息的权威来源是 omp，文档服务没有读取会话的接口，复制一份会产生第二个来源。
+- 重审条件：TSP 提供建立或聚焦 pane 的动词，或 omp 提供在消息上直接触发扩展动作的入口。
 
 ## 范围图
 
@@ -234,6 +256,7 @@ flowchart TB
       end
     end
     Gh["gh 子进程"]
+    TernCli["tern 子进程"]
     File["模板文件、服务记录文件、Run 文件与 Run 记录文件"]
   end
   GitHub["GitHub"]
@@ -246,6 +269,9 @@ flowchart TB
 | 协调者扩展 | 本节点 | 会话加载扩展（omp） | 会话结束（omp） |
 | eval kernel、subagent | 外部（omp） | `eval` 首次执行、`agent()` 返回（omp） | 会话结束或 `.cancel()`（omp） |
 | gh 子进程 | 外部（gh） | 解析器发起请求（文档服务） | 子进程退出（文档服务） |
+| tern 子进程 | 外部（Tern） | 人点击"启动协调者""转到协调者"或输入 `/playbook-show`（文档服务或协调者扩展） | 子进程退出（调用方） |
+
+pane B 由文档服务经 `tern split` 建立时，它仍由 Tern daemon 托管，文档服务进程结束不结束它（[contracts.md §K5](contracts.md#k5-文档服务协调者扩展--tern-cli)）。
 
 生命周期包含：
 
@@ -292,10 +318,13 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  Human["人"] -->|"铅笔、按键、粘贴、edit 事件、提交、勾选、新建与删除块、打断、开始与结束 Run、写记录、关闭 Launch、启动请求、检查请求、重新取回 · K4"| DocSvc["文档服务"]
-  DocSvc -->|"模板视图、Run 视图、块卡片、编辑中的字段、块锁状态、时间线、Launch 记录、预览、检查结果 · K4"| Human
-  Ext["协调者扩展"] -->|"hello/lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/close/launch_info/start_run/finish_run/runs/timeline/post/ack · K1"| DocSvc
-  DocSvc -->|"块变化、启动请求、检查请求、Run 开始与结束、done 改变、打断 · K1"| Ext
+  Human["人"] -->|"铅笔、按键、粘贴、edit 事件、提交、勾选、新建与删除块、打断、开始与结束 Run、写记录、推迟、关闭 Launch、启动请求、检查请求、重新取回、启动协调者、转到协调者 · K4"| DocSvc["文档服务"]
+  DocSvc -->|"模板视图、Run 视图、块卡片、引用展开、编辑中的字段、块锁状态、时间线、Launch 记录、到期与未复盘标记、预览、检查结果 · K4"| Human
+  Human -->|"/playbook-add、/playbook-show · K2"| Ext["协调者扩展"]
+  Ext -->|"hello/lock/unlock/read/set/edit/insert/delete/refetch/compile/inspect/report/launch/bind/rebase/close/launch_info/start_run/finish_run/runs/timeline/post/snooze/ack · K1"| DocSvc
+  DocSvc -->|"块变化、启动请求、检查请求、Run 开始与结束、done 改变、状态更新到期、打断 · K1"| Ext
+  DocSvc -->|"tern split、tern focus · K5"| Tern["Tern CLI 与 daemon"]
+  Ext -->|"tern focus · K5"| Tern
   Ext -->|"playbook 工具结果、aside 消息、abort() · K2"| Coord["协调者会话"]
   Coord -->|"tool.playbook(...)、agent 操作结束 · K2"| Ext
   Coord -->|"agent()、.send()、.cancel()"| Sub["subagent"]
@@ -306,10 +335,11 @@ flowchart LR
 
 | 契约 | 摘要 |
 |---|---|
-| K1 文档服务 ⇄ 协调者扩展 | 本地 socket 协议：协调者对块加锁与解锁，读与修改模板与 Run 的块，开始与结束 Run，读时间线与写记录，重新取回外部目标，编译、检查、报告检查结果、创建与结束 Launch、绑定 agent、改基线、确认事件；文档服务推送事件与打断。 |
-| K2 协调者扩展 ⇄ 协调者会话 | `playbook` 工具（可在 `eval` 中调用）、`aside` 事件消息、打断时的 `abort()`，以及 agent 操作结束时释放它持有的块锁。 |
+| K1 文档服务 ⇄ 协调者扩展 | 本地 socket 协议：协调者对块加锁与解锁，读与修改模板与 Run 的块，开始与结束 Run，读时间线与写记录，推迟状态更新，重新取回外部目标，编译、检查、报告检查结果、创建与结束 Launch、绑定 agent、改基线、确认事件；双方在 `hello` 中交换所在的 pane；文档服务推送事件与打断。 |
+| K2 协调者扩展 ⇄ 协调者会话 | `playbook` 工具（可在 `eval` 中调用）、`aside` 事件消息、打断时的 `abort()`、agent 操作结束时释放它持有的块锁，以及人输入的命令 `/playbook-add`。 |
 | K3 文档服务 → GitHub | 解析器经 `gh api` 只读取回 issue 与 PR。 |
-| K4 文档服务 ⇄ Tern | TSP 表单界面：模板视图与 Run 视图、块卡片与渲染视图、铅笔编辑与提交、块锁状态与打断、时间线、记录与 Launch 记录、预览、检查结果，以及新建、删除、勾选、开始与结束 Run、关闭 Launch、启动、检查与重新取回操作。 |
+| K4 文档服务 ⇄ Tern | TSP 表单界面：模板视图与 Run 视图、块卡片与渲染视图、引用的展开、铅笔编辑与提交、块锁状态与打断、时间线、记录与 Launch 记录、状态更新到期与推迟、预览、检查结果，以及新建、删除、勾选、开始与结束 Run、关闭 Launch、启动、检查、重新取回、启动协调者与转到协调者操作。 |
+| K5 文档服务、协调者扩展 → Tern CLI | `tern split` 在文档服务 pane 旁建立协调者 pane；`tern focus` 转到对方的 pane；`/playbook-show` 命令。 |
 
 完整规格见 [contracts.md](contracts.md)。subagent 与协调者之间的交互属于 omp（D2.1），本设计不规定。
 
@@ -319,12 +349,12 @@ flowchart LR
 |---|---|
 | [references.md](references.md) | 引用语法、目标种类与解析器、截取表达式、编译与错误、文档取回表与预览 |
 | [launch-events.md](launch-events.md) | Launch 与基线、活跃期、块变化判定、事件内容与投递时机 |
-| [runs.md](runs.md) | 模板与 Run、Run 的生命周期、时间线、记录与读取 |
+| [runs.md](runs.md) | 模板与 Run、Run 的生命周期、时间线、记录与读取、状态更新提醒与复盘、把会话消息加入时间线 |
 | [checks.md](checks.md) | 检查状态、确定性检查、jev 判定的问题与阈值、检查的触发、结果显示 |
-| [contracts.md](contracts.md) | K1–K4 的完整规格 |
+| [contracts.md](contracts.md) | K1–K5 的完整规格 |
 
 ## 附录
 
 | 附录 | 内容 |
 |---|---|
-| [appendix-evidence.md](appendix-evidence.md) | D1–D3 的证据：Tern 文档摘录与 TSP 实测（编辑输入、表单块的点击与焦点事件、渲染视图与 auto graph 截图、Tern 自带 Markdown block 的能力）、omp 源码位置与扩展探针记录（eval 工具桥、aside 投递、`abort()` 打断与界面打断、subagent 随会话结束）、jev 判定实测、`gh api` 实测；S8 与 S9 所参照的 Mattermost Playbooks 的界面观察与源码摘录 |
+| [appendix-evidence.md](appendix-evidence.md) | D1–D3 的证据：Tern 文档摘录与 TSP 实测（编辑输入、表单块的点击与焦点事件、渲染视图与 auto graph 截图、Tern 自带 Markdown block 的能力、可折叠的 `section`、pane 中的程序经 `tern` 建立与聚焦 pane）、omp 源码位置与扩展探针记录（eval 工具桥、aside 投递、`abort()` 打断与界面打断、subagent 随会话结束、扩展命令读取会话消息）、jev 判定实测、`gh api` 实测；S8、S9、S11 所参照的 Mattermost Playbooks 的界面观察与源码摘录 |

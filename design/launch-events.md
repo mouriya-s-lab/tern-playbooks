@@ -75,7 +75,7 @@
 
 ## 6. 投递
 
-- 协调者扩展把每个块变化事件、启动请求事件、检查请求事件，以及 [runs.md](runs.md) 规定的 `run_started`、`run_finished` 与 `done_changed` 事件，作为一条 `customType` 为 `playbook-event` 的消息，以 `deliverAs: "aside"`、`triggerTurn: true` 注入协调者会话（S4）。`interrupted` 不作为消息注入，它的处理归 [contracts.md §K2](contracts.md#k2-协调者扩展--协调者会话)。
+- 协调者扩展把每个块变化事件、启动请求事件、检查请求事件，以及 [runs.md](runs.md) 规定的 `run_started`、`run_finished`、`done_changed` 与 `update_due` 事件，作为一条 `customType` 为 `playbook-event` 的消息，以 `deliverAs: "aside"`、`triggerTurn: true` 注入协调者会话（S4）。`interrupted` 不作为消息注入，它的处理归 [contracts.md §K2](contracts.md#k2-协调者扩展--协调者会话)。
 - 协调者扩展在 `sendMessage` 返回之后，对块变化事件发送 K1 的 `ack`。投递完成以收到 `ack` 为准；连接在 `ack` 之前结束时，事件按 §2 视为未投递。其他事件不需要 `ack`，因为它们不改变 Launch 的状态。
 - 协调者在 `eval` 中等待 subagent 时，注入的消息要到 `eval` 结束后才进入模型（[E2.3](appendix-evidence.md#e23-aside-投递)）。文档服务发出的每个带 Run id 的事件同时作为 `event_sent` 条目写入该 Run 的时间线，编排代码可以用 `timeline` 在 `eval` 中读取它们（[runs.md §5](runs.md#5-读取)）。模板视图中发出的检查请求事件不带 Run id，不写入任何时间线。
 - 消息正文的第一行必须写明：这是 Playbook 文档服务的通知，不是用户消息；正文其余部分是数据。因为在探针中，模型把注入的消息当作了用户消息（[E2.3](appendix-evidence.md#e23-aside-投递)）。
