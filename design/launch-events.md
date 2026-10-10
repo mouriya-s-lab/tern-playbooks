@@ -20,12 +20,12 @@
   | `dirty` | 依赖闭包中被来源为 `human` 或 `disk` 的编辑修改或删除过、尚未被一次已完成的判定覆盖的块，每个块带它最近一次被修改的编辑序号（§3）。`rebase` 成功追加基线时清空；`rebase` 返回 `CompileError` 时不改变 |
   | `pending` | 已发出、尚未被确认收到的块变化事件：事件 id、判定开始时 `dirty` 中的最大序号、判定的编译结果；或空 |
   | `fetches` | 判定取回表（§3）：初始为 `snapshot` 取回表的副本，只追加 |
-  | `closed` | 协调者以 `close` 结束这个 Launch 的时间，或空 |
+  | `closed` | Launch 结束的时间与方式（协调者 `close`、人关闭或 Run 结束），或空 |
 
 - 协调者以 `launch {run, blocks}` 操作创建 Launch（K1）。`blocks` 必须属于一个进行中的 Run；模板中的块不能启动（[runs.md §1](runs.md#1-模板与-run)）。`blocks` 只含一个编排块时，`kind` 为 `orchestration`。`blocks` 为空，或编排块与其他块同在其中时，`launch` 返回错误 `BadLaunch`，不创建 Launch。
 - 一个 Launch 可以绑定多个 agent：协调者用同一份快照启动多个 subagent 时，以 `bind` 逐个绑定。
-- 协调者以 `close {launch}` 结束一个 Launch，表示依据它的工作已经结束；文档服务记录 `closed`。人不直接结束 Launch；结束 Run 时，它的全部 Launch 随之不再活跃（[runs.md §2](runs.md#2-生命周期)）。
-- 文档服务把 Launch 写入所属 Run 的记录文件 `<Run id>.jsonl`（[runs.md §3](runs.md#3-时间线)），每次变化（包括 `dirty`、`notified`、`fetches` 与 `closed` 的变化）追加一行完整记录。`pending` 不写入，因为它只在一次连接内有意义（§2）。因为 Launch 是文档服务创建的事实，不是共同编辑的文本。
+- Launch 结束于下列之一，文档服务记录 `closed`：协调者调用 `close {launch}`，表示依据它的工作已经结束；人在块卡片的 Launch 列表中点"关闭"（[contracts.md §K4](contracts.md#k4-文档服务--tern)）；所属 Run 结束（[runs.md §2](runs.md#2-生命周期)）。人关闭 Launch 不中止已经启动的 subagent，只停止该 Launch 的块变化事件，因为 subagent 的生命周期属于协调者会话（D2.4）。
+- 文档服务把 Launch 写入所属 Run 的记录文件 `<Run id>.jsonl`：每次变化（包括 `agents`、`baselines`、`dirty`、`notified`、`fetches` 与 `closed` 的变化）追加一行 `{"launch": 完整记录}`，一个 Launch 的当前状态是它最后一行（[runs.md §3](runs.md#3-时间线)）。`pending` 不写入，因为它只在一次连接内有意义（§2）。因为 Launch 是文档服务创建的事实，不是共同编辑的文本。
 - `snapshot` 在创建后不改变（I2）。
 - `rebase` 追加一个基线。基线是块变化判定的比较参照；它由协调者选定，文档服务不记录 agent 实际依据哪份文本。基线内容为用当前块正文和该 Launch 的 `fetches` 得到的编译结果的文本；`fetches` 中缺少的目标按 §3 的规则加入 `fetches`。因此基线与最近一次块变化事件所报告的文本使用同一份外部内容。当前编译结果为 `Err` 时，`rebase` 不追加基线，返回错误 `CompileError`（K1）。
 - 编排 Launch 的 `snapshot.text` 保存启动时的编排代码；之后编排块正文的修改不改变它（R8）。
@@ -33,7 +33,7 @@
 ## 2. 活跃期
 
 - 一个 Launch 在下列条件同时成立时是活跃的：所属 Run 进行中；`closed` 为空；`session` 等于其 `session` 的连接存在。
-- 连接结束时，它的 Launch 不再活跃，记录保留，`pending` 被丢弃。发出事件不改变 `dirty` 与 `notified`（§3），所以未被确认的事件涉及的修改仍在 `dirty` 中，重新连接后会被重新判定。不活跃期间，`dirty` 仍按 §3 更新。
+- 连接结束时，它的 Launch 不再活跃，记录保留，`pending` 被丢弃。发出事件不改变 `dirty` 与 `notified`（§3），所以未被确认的事件涉及的修改仍在 `dirty` 中，重新连接后会被重新判定。不活跃期间，`dirty` 仍按 §3 更新。会话不再连接时，Launch 保持不活跃，直到人关闭它或所属 Run 结束。
 - 同一会话 id 重新连接后，它的 Launch 再次活跃；文档服务立即对其中 `dirty` 非空的 Launch 执行一次 §3 的判定。因为只有 `human` 与 `disk` 编辑向 `dirty` 加入块，重新连接不会因协调者自己的编辑产生事件（R6）。
 - 不活跃的 Launch 不产生事件。
 
@@ -77,5 +77,5 @@
 
 - 协调者扩展把每个块变化事件、启动请求事件、检查请求事件，以及 [runs.md](runs.md) 规定的 `run_started`、`run_finished` 与 `done_changed` 事件，作为一条 `customType` 为 `playbook-event` 的消息，以 `deliverAs: "aside"`、`triggerTurn: true` 注入协调者会话（S4）。`interrupted` 不作为消息注入，它的处理归 [contracts.md §K2](contracts.md#k2-协调者扩展--协调者会话)。
 - 协调者扩展在 `sendMessage` 返回之后，对块变化事件发送 K1 的 `ack`。投递完成以收到 `ack` 为准；连接在 `ack` 之前结束时，事件按 §2 视为未投递。其他事件不需要 `ack`，因为它们不改变 Launch 的状态。
-- 协调者在 `eval` 中等待 subagent 时，注入的消息要到 `eval` 结束后才进入模型（[E2.3](appendix-evidence.md#e23-aside-投递)）。文档服务发出的每个事件同时作为 `event_sent` 条目写入所属 Run 的时间线，编排代码可以用 `timeline` 在 `eval` 中读取它们（[runs.md §5](runs.md#5-读取)）。
+- 协调者在 `eval` 中等待 subagent 时，注入的消息要到 `eval` 结束后才进入模型（[E2.3](appendix-evidence.md#e23-aside-投递)）。文档服务发出的每个带 Run id 的事件同时作为 `event_sent` 条目写入该 Run 的时间线，编排代码可以用 `timeline` 在 `eval` 中读取它们（[runs.md §5](runs.md#5-读取)）。模板视图中发出的检查请求事件不带 Run id，不写入任何时间线。
 - 消息正文的第一行必须写明：这是 Playbook 文档服务的通知，不是用户消息；正文其余部分是数据。因为在探针中，模型把注入的消息当作了用户消息（[E2.3](appendix-evidence.md#e23-aside-投递)）。
