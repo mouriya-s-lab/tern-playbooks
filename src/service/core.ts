@@ -1,0 +1,1431 @@
+// Document service core: the single owner of Playbook, Run, Launch, lock and timeline state.
+// Rules come from design/; section references are given at each rule.
+import type {
+	Block,
+	BlockField,
+	BlockId,
+	BlockLock,
+	BlockResult,
+	CompileInput,
+	CompileResult,
+	DocRef,
+	EditOrigin,
+	EntryData,
+	EntryOrigin,
+	ExternalTarget,
+	FetchOutcome,
+	Findings,
+	JudgeReport,
+	Launch,
+	LaunchCloser,
+	LaunchId,
+	PlaybookDoc,
+	RecordKind,
+	RunId,
+	RunMeta,
+	TargetKey,
+	TimelineEntry,
+} from "../domain/model";
+import { idNumber } from "../domain/model";
+import type {
+	BlockView,
+	ChecksModule,
+	Connection,
+	CoordinatorStatus,
+	CoreApi,
+	DocView,
+	Fetcher,
+	K1Handler,
+	ReferencesModule,
+	ReferenceView,
+	RenderStatus,
+	ServiceRecord,
+	Store,
+} from "../domain/ports";
+import type { EventPayload, Outcome, Request, RunSummary } from "../domain/protocol";
+import { fail, ok } from "../domain/protocol";
+
+export interface PaneControl {
+	ownPane(): string | null;
+	splitCoordinator(pane: string, cwd: string, command: readonly string[]): Promise<{ ok: true; pane: string } | { ok: false; error: string }>;
+	focusPane(pane: string): Promise<{ ok: true } | { ok: false; error: string }>;
+}
+
+export interface CoreDeps {
+	readonly store: Store;
+	readonly references: ReferencesModule;
+	readonly fetcher: Fetcher;
+	readonly checks: ChecksModule;
+	readonly panes: PaneControl;
+	/** Absolute path of the coordinator extension entry file (contracts.md K5). */
+	readonly extensionEntry: string;
+	readonly now?: () => number;
+}
+
+type DocKey = "template" | RunId;
+
+interface DocState {
+	readonly ref: DocRef;
+	title: string;
+	blocks: Block[];
+	run: RunMeta | null;
+	locks: Map<BlockId, BlockLock>;
+	notices: Map<BlockId, string[]>;
+	/** Text and parsed form of the file as last written or read (README §S2). */
+	lastText: string;
+	lastDoc: PlaybookDoc;
+	lastMtime: number;
+	writeTimer: Timer | undefined;
+	parseError: string | null;
+	findings: Map<BlockId, Findings>;
+	render: Map<BlockId, RenderStatus>;
+	/** Per block-set key: last inspect version, whether its inputs changed since (checks.md §5), and the accepted report. */
+	inspections: Map<string, { blocks: BlockId[]; version: string; stale: boolean; report: JudgeReport | null }>;
+}
+
+interface RunLog {
+	entries: TimelineEntry[];
+}
+
+interface LaunchState {
+	record: Launch;
+	pending: { event: string; maxSeq: number; result: CompileResult } | null;
+	deadline: number | null;
+	timer: Timer | undefined;
+	/** Incremented to discard in-flight judgments (rebase, close, disconnect). */
+	generation: number;
+	judging: boolean;
+}
+
+interface ConnState {
+	conn: Connection;
+	session: string | null;
+	pane: string | null;
+}
+
+const JUDGE_DELAY_MS = 2_000;
+const WRITE_DELAY_MS = 1_000;
+const DISK_POLL_MS = 1_000;
+
+function keyOf(ref: DocRef): DocKey {
+	return ref.kind === "template" ? "template" : ref.run;
+}
+function refOf(key: DocKey): DocRef {
+	return key === "template" ? { kind: "template" } : { kind: "run", run: key };
+}
+function sameResult(a: CompileResult | null, b: CompileResult | null): boolean {
+	if (a === null || b === null) return a === b;
+	if (a.kind !== b.kind) return false;
+	if (a.kind === "Ok" && b.kind === "Ok") return a.text === b.text;
+	return JSON.stringify(a) === JSON.stringify(b);
+}
+/** Orchestration block: the whole body is one `js` or `py` fenced code block (README §定义). */
+export function isOrchestration(body: string): boolean {
+	const match = /^(`{3,}|~{3,})(js|py)[ \t]*\n[\s\S]*?\n\1[ \t]*\n?$/.exec(body.trim() + "\n");
+	return match !== null;
+}
+
+export class Core implements CoreApi, K1Handler {
+	readonly #store: Store;
+	readonly #refs: ReferencesModule;
+	readonly #fetcher: Fetcher;
+	readonly #checks: ChecksModule;
+	readonly #panes: PaneControl;
+	readonly #extensionEntry: string;
+	readonly #now: () => number;
+
+	readonly #docs = new Map<DocKey, DocState>();
+	readonly #logs = new Map<RunId, RunLog>();
+	readonly #launches = new Map<LaunchId, LaunchState>();
+	/** Document fetch table (references.md §5); not persisted. */
+	readonly #fetches = new Map<TargetKey, FetchOutcome>();
+	readonly #inflight = new Map<TargetKey, Promise<FetchOutcome>>();
+	readonly #listeners = new Set<(ref: DocRef | null) => void>();
+	readonly #reminders = new Map<RunId, Timer>();
+	readonly #errors: string[] = [];
+
+	#maxBlock = 0;
+	#maxRun = 0;
+	#maxLaunch = 0;
+	#editSeq = 0;
+	#eventSeq = 0;
+	#conn: ConnState | null = null;
+	#diskTimer: Timer | undefined;
+
+	constructor(deps: CoreDeps) {
+		this.#store = deps.store;
+		this.#refs = deps.references;
+		this.#fetcher = deps.fetcher;
+		this.#checks = deps.checks;
+		this.#panes = deps.panes;
+		this.#extensionEntry = deps.extensionEntry;
+		this.#now = deps.now ?? Date.now;
+	}
+
+	// ============================================================ loading
+
+	/** Load template, Runs, service records and Run logs; start disk polling and reminders. */
+	load(): string | null {
+		const template = this.#store.readTemplate();
+		if (!template.ok) return template.error;
+		this.#docs.set("template", this.#newDocState({ kind: "template" }, template.doc, null));
+		for (const record of this.#store.readServiceRecords()) this.#noteRecord(record);
+		for (const [run, parsed] of this.#store.readRuns()) {
+			if (!parsed.ok || parsed.run === null) {
+				this.#errors.push(`Run ${run} 的文件不能解析：${parsed.ok ? "缺少 run 映射" : parsed.error}`);
+				continue;
+			}
+			this.#docs.set(run, this.#newDocState({ kind: "run", run }, parsed.doc, parsed.run));
+			this.#maxRun = Math.max(this.#maxRun, idNumber(run));
+			const log = this.#store.readRunLog(run);
+			this.#logs.set(run, { entries: log.entries });
+			for (const launch of log.launches.values()) {
+				this.#maxLaunch = Math.max(this.#maxLaunch, idNumber(launch.id));
+				this.#launches.set(launch.id, { record: launch, pending: null, deadline: null, timer: undefined, generation: 0, judging: false });
+			}
+		}
+		for (const doc of this.#docs.values()) for (const block of doc.blocks) this.#maxBlock = Math.max(this.#maxBlock, idNumber(block.id));
+		for (const doc of this.#docs.values()) if (doc.run?.status === "running") this.#scheduleReminder(doc.run.id, true);
+		this.#diskTimer = setInterval(() => this.#pollDisk(), DISK_POLL_MS);
+		for (const key of this.#docs.keys()) void this.#recomputeChecks(key);
+		return null;
+	}
+
+	stop(): void {
+		clearInterval(this.#diskTimer);
+		for (const timer of this.#reminders.values()) clearTimeout(timer);
+		for (const launch of this.#launches.values()) clearTimeout(launch.timer);
+		for (const doc of this.#docs.values()) {
+			if (doc.writeTimer) {
+				clearTimeout(doc.writeTimer);
+				this.#writeNow(doc);
+			}
+		}
+	}
+
+	#newDocState(ref: DocRef, doc: PlaybookDoc, run: RunMeta | null): DocState {
+		const text = this.#store.serialize(doc, run);
+		const stat = this.#store.stat(ref);
+		return {
+			ref,
+			title: doc.title,
+			blocks: [...doc.blocks],
+			run,
+			locks: new Map(doc.blocks.map(block => [block.id, { kind: "none" }])),
+			notices: new Map(),
+			lastText: stat?.text ?? text,
+			lastDoc: doc,
+			lastMtime: stat?.mtimeMs ?? 0,
+			writeTimer: undefined,
+			parseError: null,
+			findings: new Map(),
+			render: new Map(),
+			inspections: new Map(),
+		};
+	}
+
+	#noteRecord(record: ServiceRecord): void {
+		switch (record.kind) {
+			case "block":
+				this.#maxBlock = Math.max(this.#maxBlock, idNumber(record.id));
+				return;
+			case "run":
+				this.#maxRun = Math.max(this.#maxRun, idNumber(record.id));
+				return;
+			case "launch":
+				this.#maxLaunch = Math.max(this.#maxLaunch, idNumber(record.id));
+				return;
+		}
+	}
+
+	// ============================================================ lookup helpers
+
+	#doc(ref: DocRef): DocState | null {
+		return this.#docs.get(keyOf(ref)) ?? null;
+	}
+	#block(doc: DocState, id: BlockId): Block | null {
+		return doc.blocks.find(block => block.id === id) ?? null;
+	}
+	#bodies(doc: DocState): Map<BlockId, string> {
+		return new Map(doc.blocks.map(block => [block.id, block.body]));
+	}
+	#isFinished(doc: DocState): boolean {
+		return doc.run !== null && doc.run.status === "finished";
+	}
+	#emit(ref: DocRef | null): void {
+		for (const listener of this.#listeners) listener(ref);
+	}
+
+	// ============================================================ timeline
+
+	#append(run: RunId, origin: EntryOrigin, data: EntryData): TimelineEntry {
+		const log = this.#logs.get(run);
+		if (!log) throw new Error(`no log for ${run}`);
+		const entry: TimelineEntry = { seq: (log.entries.at(-1)?.seq ?? 0) + 1, at: this.#now(), origin, data };
+		log.entries.push(entry);
+		this.#store.appendEntry(run, entry);
+		return entry;
+	}
+
+	/** Block result table of a Run (references.md §4). */
+	#results(run: RunId | null): Map<BlockId, BlockResult> {
+		const table = new Map<BlockId, BlockResult>();
+		if (run === null) return table;
+		for (const entry of this.#logs.get(run)?.entries ?? []) {
+			const data = entry.data;
+			if (data.type === "post" && data.kind === "result" && data.block !== undefined) {
+				table.set(data.block, { text: data.text, at: entry.at, seq: entry.seq, origin: entry.origin, launch: data.launch ?? null });
+			}
+		}
+		return table;
+	}
+
+	// ============================================================ fetching and compiling
+
+	async #fetchTarget(target: ExternalTarget, replace: boolean): Promise<FetchOutcome> {
+		const key = this.#refs.targetKey(target);
+		const existing = this.#fetches.get(key);
+		if (existing && !replace) return existing;
+		const inflight = this.#inflight.get(key);
+		if (inflight) return inflight;
+		const promise = this.#fetcher.fetch(target, this.#store.baseDir).then(outcome => {
+			this.#fetches.set(key, outcome);
+			this.#inflight.delete(key);
+			if (replace) {
+				for (const doc of this.#docs.values()) {
+					this.#invalidateInspections(doc, blocks => this.#refs.externalTargets(blocks, this.#bodies(doc)).some(other => this.#refs.targetKey(other) === key));
+				}
+			}
+			return outcome;
+		});
+		this.#inflight.set(key, promise);
+		this.#emit(null);
+		return promise;
+	}
+
+	/** Fetch every external target the closure of `roots` references that is missing from the document table. */
+	async #ensureFetched(doc: DocState, roots: readonly BlockId[]): Promise<void> {
+		const targets = this.#refs.externalTargets(roots, this.#bodies(doc));
+		await Promise.all(targets.filter(target => !this.#fetches.has(this.#refs.targetKey(target))).map(target => this.#fetchTarget(target, false)));
+	}
+
+	#input(doc: DocState, fetches: ReadonlyMap<TargetKey, FetchOutcome>, bodies?: ReadonlyMap<BlockId, string>, results?: ReadonlyMap<BlockId, BlockResult>): CompileInput {
+		return {
+			blocks: bodies ?? this.#bodies(doc),
+			fetches,
+			results: results ?? this.#results(doc.run?.id ?? null),
+			inTemplate: doc.run === null,
+		};
+	}
+
+	/** Compile after fetching missing targets; the compile itself runs synchronously on current state. */
+	async #compileNow(doc: DocState, blocks: readonly BlockId[]): Promise<CompileResult> {
+		await this.#ensureFetched(doc, blocks);
+		return this.#refs.compile(blocks, this.#input(doc, this.#fetches));
+	}
+
+	// ============================================================ edits
+
+	/**
+	 * Apply one edit and its consequences: timeline entry, dirty tracking for Launches
+	 * (launch-events.md §3), write-back scheduling (README §S2), checks and redraw.
+	 */
+	#applyEdit(doc: DocState, origin: EditOrigin, change: EditChange): number {
+		const seq = ++this.#editSeq;
+		const beforeBodies = this.#bodies(doc);
+		let touched: BlockId | null = null;
+		let bodyOrExistence = false;
+		switch (change.kind) {
+			case "field": {
+				const index = doc.blocks.findIndex(block => block.id === change.block);
+				const block = doc.blocks[index]!;
+				doc.blocks[index] = change.field === "title" ? { ...block, title: change.text } : { ...block, body: change.text };
+				touched = change.block;
+				bodyOrExistence = change.field === "body";
+				if (doc.run) this.#append(doc.run.id, origin, { type: "block_edited", block: change.block, field: change.field, text: change.text, edit: seq });
+				break;
+			}
+			case "done": {
+				const index = doc.blocks.findIndex(block => block.id === change.block);
+				doc.blocks[index] = { ...doc.blocks[index]!, done: change.done };
+				if (doc.run) this.#append(doc.run.id, origin, { type: "done_changed", block: change.block, done: change.done });
+				break;
+			}
+			case "insert": {
+				const index = change.after === null ? doc.blocks.length : doc.blocks.findIndex(block => block.id === change.after) + 1;
+				doc.blocks.splice(index, 0, change.block);
+				doc.locks.set(change.block.id, { kind: "none" });
+				touched = change.block.id;
+				bodyOrExistence = true;
+				if (doc.run) this.#append(doc.run.id, origin, { type: "block_added", block: change.block.id, title: change.block.title, body: change.block.body });
+				break;
+			}
+			case "delete": {
+				const index = doc.blocks.findIndex(block => block.id === change.block);
+				const [removed] = doc.blocks.splice(index, 1);
+				doc.locks.delete(change.block);
+				touched = change.block;
+				bodyOrExistence = true;
+				if (doc.run && removed) this.#append(doc.run.id, origin, { type: "block_deleted", block: removed.id, title: removed.title, body: removed.body });
+				break;
+			}
+			case "reorder": {
+				const byId = new Map(doc.blocks.map(block => [block.id, block]));
+				doc.blocks = change.order.flatMap(id => {
+					const block = byId.get(id);
+					return block ? [block] : [];
+				});
+				if (doc.run) this.#append(doc.run.id, origin, { type: "blocks_reordered", order: change.order });
+				break;
+			}
+		}
+		if (touched !== null && bodyOrExistence) {
+			const changed = touched;
+			const afterBodies = this.#bodies(doc);
+			this.#invalidateInspections(doc, blocks => this.#refs.closure(blocks, beforeBodies).has(changed) || this.#refs.closure(blocks, afterBodies).has(changed));
+		}
+		if (doc.run && touched !== null && bodyOrExistence && origin !== "coordinator") this.#markDirty(doc, touched, seq, beforeBodies);
+		this.#scheduleWrite(doc);
+		this.#afterChange(doc);
+		return seq;
+	}
+
+	/** checks.md §5: a pending inspection and a shown report end when their inputs change. */
+	#invalidateInspections(doc: DocState, affects: (blocks: readonly BlockId[]) => boolean): void {
+		for (const [setKey, inspection] of doc.inspections) {
+			if (inspection.stale || !affects(inspection.blocks)) continue;
+			doc.inspections.set(setKey, { ...inspection, stale: true, report: null });
+		}
+	}
+
+	/** launch-events.md §3: human and disk edits of body or existence enter `dirty`. */
+	#markDirty(doc: DocState, block: BlockId, seq: number, beforeBodies: ReadonlyMap<BlockId, string>): void {
+		const run = doc.run!.id;
+		const afterBodies = this.#bodies(doc);
+		for (const launch of this.#launches.values()) {
+			if (launch.record.run !== run || launch.record.closed !== null) continue;
+			const inBefore = this.#refs.closure(launch.record.blocks, beforeBodies).has(block);
+			const inAfter = this.#refs.closure(launch.record.blocks, afterBodies).has(block);
+			if (!inBefore && !inAfter) continue;
+			const dirty = new Map(launch.record.dirty);
+			dirty.set(block, seq);
+			this.#setLaunch(launch, { ...launch.record, dirty: [...dirty] });
+			launch.deadline = this.#now() + JUDGE_DELAY_MS;
+			this.#scheduleJudge(launch);
+		}
+	}
+
+	#afterChange(doc: DocState): void {
+		void this.#recomputeChecks(keyOf(doc.ref));
+		this.#emit(doc.ref);
+	}
+
+	// ============================================================ write-back and disk edits (README §S2)
+
+	#scheduleWrite(doc: DocState): void {
+		if (doc.writeTimer) return;
+		doc.writeTimer = setTimeout(() => {
+			doc.writeTimer = undefined;
+			this.#writeNow(doc);
+		}, WRITE_DELAY_MS);
+	}
+
+	#writeNow(doc: DocState): void {
+		if (doc.parseError !== null) return;
+		const snapshot: PlaybookDoc = { title: doc.title, blocks: [...doc.blocks] };
+		const text = this.#store.serialize(snapshot, doc.run);
+		this.#store.write(doc.ref, text);
+		doc.lastText = text;
+		doc.lastDoc = snapshot;
+		doc.lastMtime = this.#store.stat(doc.ref)?.mtimeMs ?? doc.lastMtime;
+	}
+
+	/** Run mapping changes are written immediately, before their timeline entry (runs.md §6). */
+	#writeRunNow(doc: DocState): void {
+		if (doc.writeTimer) {
+			clearTimeout(doc.writeTimer);
+			doc.writeTimer = undefined;
+		}
+		this.#writeNow(doc);
+	}
+
+	#pollDisk(): void {
+		for (const doc of this.#docs.values()) {
+			const stat = this.#store.stat(doc.ref);
+			if (!stat || stat.mtimeMs === doc.lastMtime) continue;
+			doc.lastMtime = stat.mtimeMs;
+			if (stat.text === doc.lastText) {
+				if (doc.parseError !== null) {
+					doc.parseError = null;
+					this.#emit(doc.ref);
+				}
+				continue;
+			}
+			const parsed = this.#store.parse(stat.text, doc.run !== null);
+			if (!parsed.ok) {
+				doc.parseError = parsed.error;
+				this.#emit(doc.ref);
+				continue;
+			}
+			if (doc.parseError !== null) {
+				doc.parseError = null;
+				this.#emit(doc.ref);
+			}
+			doc.lastText = stat.text;
+			this.#applyDisk(doc, parsed.doc);
+			doc.lastDoc = parsed.doc;
+		}
+	}
+
+	#applyDisk(doc: DocState, next: PlaybookDoc): void {
+		const before = new Map(doc.lastDoc.blocks.map(block => [block.id, block]));
+		const after = new Map(next.blocks.map(block => [block.id, block]));
+		if (next.title !== doc.lastDoc.title) {
+			doc.title = next.title;
+			this.#scheduleWrite(doc);
+			this.#emit(doc.ref);
+		}
+		for (const [id, old] of before) {
+			if (after.has(id) || !this.#block(doc, id)) continue;
+			const lock = doc.locks.get(id);
+			this.#applyEdit(doc, "disk", { kind: "delete", block: id });
+			if (lock?.kind === "human") this.#docNotice(doc, `这个块已被磁盘文件删除（${id} ${old.title}）`);
+		}
+		next.blocks.forEach((block, index) => {
+			const current = this.#block(doc, block.id);
+			if (!current) {
+				const afterId = index === 0 ? null : (next.blocks[index - 1]?.id ?? null);
+				this.#maxBlock = Math.max(this.#maxBlock, idNumber(block.id));
+				this.#applyEdit(doc, "disk", { kind: "insert", after: afterId && this.#block(doc, afterId) ? afterId : null, block });
+				return;
+			}
+			// Compare with the last written content, not the current block (README §S2): unchanged
+			// fields on disk must not overwrite edits made since the last write-back.
+			const previous = before.get(block.id) ?? current;
+			const lock = doc.locks.get(block.id);
+			for (const field of ["title", "body"] as const) {
+				if (block[field] === previous[field] || block[field] === current[field]) continue;
+				this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field, text: block[field] });
+				if (lock?.kind === "human" && lock.field === field) this.#notice(doc, block.id, "磁盘文件修改了这个字段");
+			}
+			if (block.done !== previous.done && block.done !== current.done) this.#applyEdit(doc, "disk", { kind: "done", block: block.id, done: block.done });
+		});
+		const order = next.blocks.map(block => block.id);
+		if (order.join() !== doc.blocks.map(block => block.id).join()) this.#applyEdit(doc, "disk", { kind: "reorder", order });
+	}
+
+	#notice(doc: DocState, block: BlockId, text: string): void {
+		const list = doc.notices.get(block) ?? [];
+		list.push(text);
+		doc.notices.set(block, list);
+	}
+	#docNotice(doc: DocState, text: string): void {
+		this.#errors.push(text);
+		this.#emit(doc.ref);
+	}
+
+	// ============================================================ Launch persistence and judgment (launch-events.md)
+
+	#setLaunch(launch: LaunchState, record: Launch): void {
+		launch.record = record;
+		this.#store.appendLaunch(record.run, record);
+	}
+
+	#isActive(launch: LaunchState): boolean {
+		const doc = this.#docs.get(launch.record.run);
+		return doc?.run?.status === "running" && launch.record.closed === null && this.#conn?.session === launch.record.session;
+	}
+
+	#scheduleJudge(launch: LaunchState): void {
+		clearTimeout(launch.timer);
+		launch.timer = undefined;
+		if (launch.deadline === null) return;
+		const wait = Math.max(0, launch.deadline - this.#now());
+		launch.timer = setTimeout(() => {
+			launch.timer = undefined;
+			void this.#judge(launch);
+		}, wait);
+	}
+
+	/** launch-events.md §3 judgment. */
+	async #judge(launch: LaunchState): Promise<void> {
+		if (!this.#isActive(launch) || launch.pending !== null || launch.judging) return;
+		if (launch.record.dirty.length === 0) return;
+		if (launch.deadline !== null && launch.deadline > this.#now()) return;
+		const doc = this.#docs.get(launch.record.run)!;
+		const bodies = this.#bodies(doc);
+		const maxSeq = Math.max(...launch.record.dirty.map(([, seq]) => seq));
+		const changed = launch.record.dirty.map(([block]) => block);
+		const generation = launch.generation;
+		launch.judging = true;
+		const fetches = await this.#launchFetches(launch, bodies);
+		launch.judging = false;
+		if (generation !== launch.generation || !this.#isActive(launch) || launch.pending !== null) return;
+		const results = new Map(launch.record.snapshot.results);
+		const result = this.#refs.compile(launch.record.blocks, this.#input(doc, fetches, bodies, results));
+		const baseline = launch.record.baselines.at(-1)!;
+		const dropUpTo = (): void => {
+			this.#setLaunch(launch, { ...launch.record, dirty: launch.record.dirty.filter(([, seq]) => seq > maxSeq) });
+		};
+		if (result.kind === "Ok" && result.text === baseline) {
+			launch.record = { ...launch.record, notified: null };
+			dropUpTo();
+		} else if (!sameResult(result, launch.record.notified)) {
+			const id = `e${++this.#eventSeq}`;
+			launch.pending = { event: id, maxSeq, result };
+			this.#send({
+				event: "block_changed",
+				data: {
+					id,
+					launch: { id: launch.record.id, kind: launch.record.kind, run: launch.record.run },
+					agents: launch.record.agents,
+					changed,
+					diff: result.kind === "Ok" ? this.#refs.unifiedDiff(baseline, result.text) : "",
+					current: result,
+				},
+			});
+		} else {
+			dropUpTo();
+		}
+		this.#emit(refOf(launch.record.run));
+		if (launch.pending === null && launch.record.dirty.length > 0 && launch.deadline !== null && launch.deadline <= this.#now()) void this.#judge(launch);
+	}
+
+	/** The judgment fetch table of a Launch, extended with newly referenced targets (launch-events.md §3). */
+	async #launchFetches(launch: LaunchState, bodies: ReadonlyMap<BlockId, string>): Promise<Map<TargetKey, FetchOutcome>> {
+		const table = new Map(launch.record.fetches);
+		const added: [TargetKey, FetchOutcome][] = [];
+		for (const target of this.#refs.externalTargets(launch.record.blocks, bodies)) {
+			const key = this.#refs.targetKey(target);
+			if (table.has(key)) continue;
+			const outcome = this.#fetches.get(key) ?? (await this.#fetchTarget(target, false));
+			table.set(key, outcome);
+			added.push([key, outcome]);
+		}
+		if (added.length > 0) this.#setLaunch(launch, { ...launch.record, fetches: [...launch.record.fetches, ...added] });
+		return table;
+	}
+
+	#closeLaunch(launch: LaunchState, by: LaunchCloser, origin: EntryOrigin): void {
+		launch.generation++;
+		launch.pending = null;
+		launch.deadline = null;
+		clearTimeout(launch.timer);
+		launch.timer = undefined;
+		this.#setLaunch(launch, { ...launch.record, closed: { at: this.#now(), by } });
+		this.#append(launch.record.run, origin, { type: "launch_closed", launch: launch.record.id });
+	}
+
+	// ============================================================ events
+
+	/** Send an event to the current connection and record it (launch-events.md §6). Returns false without a connection. */
+	#send(payload: EventPayload): boolean {
+		if (!this.#conn || this.#conn.session === null) return false;
+		this.#conn.conn.send(payload);
+		const run = "run" in payload.data && typeof payload.data.run === "string" ? payload.data.run : payload.event === "block_changed" ? payload.data.launch.run : null;
+		if (run !== null) this.#append(run as RunId, "service", { type: "event_sent", event: payload.event, data: payload.data });
+		return true;
+	}
+
+	// ============================================================ reminders (runs.md §6)
+
+	#scheduleReminder(run: RunId, startup = false): void {
+		const existing = this.#reminders.get(run);
+		clearTimeout(existing);
+		this.#reminders.delete(run);
+		const doc = this.#docs.get(run);
+		const meta = doc?.run;
+		if (!doc || !meta || meta.status !== "running" || meta.updateDue === null) return;
+		const due = meta.updateDue;
+		const fired = (this.#logs.get(run)?.entries ?? []).some(entry => entry.data.type === "update_due" && entry.data.due === due);
+		if (fired) return;
+		const wait = Math.max(0, due - this.#now());
+		if (startup && wait === 0) {
+			this.#fireReminder(run, due);
+			return;
+		}
+		this.#reminders.set(
+			run,
+			setTimeout(() => this.#fireReminder(run, due), wait),
+		);
+	}
+
+	#fireReminder(run: RunId, due: number): void {
+		this.#reminders.delete(run);
+		const doc = this.#docs.get(run);
+		if (!doc?.run || doc.run.status !== "running" || doc.run.updateDue !== due) return;
+		this.#append(run, "service", { type: "update_due", due });
+		this.#send({ event: "update_due", data: { run, due, last_update: this.#lastUpdateAt(run) } });
+		this.#emit(doc.ref);
+	}
+
+	#lastUpdateAt(run: RunId): number | null {
+		const entries = this.#logs.get(run)?.entries ?? [];
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i]!;
+			if (entry.data.type === "post" && entry.data.kind === "update") return entry.at;
+		}
+		return null;
+	}
+
+	#setDue(doc: DocState, due: number | null): void {
+		doc.run = { ...doc.run!, updateDue: due };
+		this.#writeRunNow(doc);
+		this.#scheduleReminder(doc.run.id);
+	}
+
+	// ============================================================ checks (checks.md)
+
+	async #recomputeChecks(key: DocKey): Promise<void> {
+		const doc = this.#docs.get(key);
+		if (!doc) return;
+		await this.#ensureFetched(
+			doc,
+			doc.blocks.map(block => block.id),
+		);
+		const input = this.#input(doc, this.#fetches);
+		let changed = false;
+		for (const block of doc.blocks) {
+			const compiled = this.#refs.compile([block.id], input);
+			const expansions = this.#refs.parseReferences(block.body).map(reference => this.#refs.expandOne(block.id, reference, input));
+			const render = doc.render.get(block.id) ?? { blockError: false, documentError: false, pendingOverdue: false, chartNodes: 0, view: { md: [], images: [] } };
+			const next = this.#checks.findings({ compiled, expansions, body: block.body, render });
+			const lock = doc.locks.get(block.id);
+			const editingBody = lock?.kind === "human" && lock.field === "body";
+			const previous = doc.findings.get(block.id);
+			const value = editingBody && previous ? { ...next, chart: previous.chart } : next;
+			if (JSON.stringify(previous) !== JSON.stringify(value)) changed = true;
+			doc.findings.set(block.id, value);
+		}
+		for (const [setKey, inspection] of doc.inspections) {
+			if (inspection.report === null) continue;
+			if (this.#version(doc, inspection.blocks, input) !== inspection.version) {
+				doc.inspections.set(setKey, { ...inspection, report: null });
+				changed = true;
+			}
+		}
+		if (changed) this.#emit(doc.ref);
+	}
+
+	#version(doc: DocState, blocks: readonly BlockId[], input: CompileInput): string {
+		const bodies = this.#bodies(doc);
+		const closure = new Map<BlockId, string | null>();
+		for (const id of this.#refs.closure(blocks, bodies)) closure.set(id, bodies.get(id) ?? null);
+		const results = this.#refs.resultTargets(blocks, bodies).flatMap(id => {
+			const result = input.results.get(id);
+			return result ? [result] : [];
+		});
+		return this.#checks.version({ closure, results, compiled: this.#refs.compile(blocks, input) });
+	}
+
+	#inspectState(doc: DocState, blocks: readonly BlockId[]): unknown {
+		const input = this.#input(doc, this.#fetches);
+		const version = this.#version(doc, blocks, input);
+		const setKey = blocks.join(",");
+		const previous = doc.inspections.get(setKey);
+		doc.inspections.set(setKey, { blocks: [...blocks], version, stale: false, report: previous?.version === version && !previous.stale ? previous.report : null });
+		return {
+			blocks,
+			source: Object.fromEntries(blocks.map(id => [id, this.#block(doc, id)?.body ?? null])),
+			compiled: this.#refs.compile(blocks, input),
+			view: Object.fromEntries(blocks.map(id => [id, doc.render.get(id)?.view ?? { md: [], images: [] }])),
+			findings: Object.fromEntries(blocks.map(id => [id, doc.findings.get(id) ?? null])),
+			version,
+		};
+	}
+
+	// ============================================================ K1 handler
+
+	connected(conn: Connection): void {
+		if (this.#conn === null) this.#conn = { conn, session: null, pane: null };
+	}
+
+	disconnected(conn: Connection): void {
+		if (this.#conn?.conn !== conn) return;
+		this.#conn = null;
+		for (const doc of this.#docs.values()) {
+			for (const [block, lock] of doc.locks) if (lock.kind === "coordinator") doc.locks.set(block, { kind: "none" });
+		}
+		for (const launch of this.#launches.values()) {
+			launch.generation++;
+			launch.pending = null;
+			launch.judging = false;
+		}
+		this.#emit(null);
+	}
+
+	async handle(conn: Connection, requestId: string, request: Request): Promise<Outcome<unknown>> {
+		if (this.#conn === null) this.#conn = { conn, session: null, pane: null };
+		if (this.#conn.conn !== conn) return fail("Busy", "另一个协调者已连接");
+		if (request.op !== "hello" && this.#conn.session === null) return fail("NotHello", "第一条请求必须是 hello");
+		const session = this.#conn.session;
+		switch (request.op) {
+			case "hello": {
+				if (this.#conn.session !== null) return fail("Busy", "本连接已 hello");
+				this.#conn.session = request.args.session;
+				this.#conn.pane = request.args.pane ?? null;
+				for (const launch of this.#launches.values()) {
+					if (launch.record.session === request.args.session && launch.record.dirty.length > 0 && this.#isActive(launch)) {
+						launch.deadline = this.#now();
+						void this.#judge(launch);
+					}
+				}
+				this.#emit(null);
+				const pane = this.#panes.ownPane();
+				return ok({ blocks: this.#docs.get("template")!.blocks.map(block => block.id), runs: this.runs(), ...(pane ? { pane } : {}) });
+			}
+			case "lock": {
+				const target = this.#target(request.args.run, request.args.block, true);
+				if (!target.ok) return target;
+				const { doc, block } = target.result;
+				const lock = doc.locks.get(block.id)!;
+				if (lock.kind === "human") return fail("Locked", "人正在编辑这个块");
+				doc.locks.set(block.id, { kind: "coordinator", request: requestId });
+				this.#emit(doc.ref);
+				return ok({ block });
+			}
+			case "unlock": {
+				const doc = this.#docOf(request.args.run);
+				if (!doc.ok) return doc;
+				const lock = doc.result.locks.get(request.args.block);
+				if (lock?.kind === "coordinator" && lock.request === request.args.request) {
+					doc.result.locks.set(request.args.block, { kind: "none" });
+					this.#emit(doc.result.ref);
+				}
+				return ok(null);
+			}
+			case "read": {
+				const doc = this.#docOf(request.args.run);
+				if (!doc.ok) return doc;
+				if (request.args.block !== undefined) {
+					const block = this.#block(doc.result, request.args.block);
+					return block ? ok(block) : fail("UnknownBlock", `块 ${request.args.block} 不存在`);
+				}
+				return ok({ title: doc.result.title, blocks: doc.result.blocks, ...(doc.result.run ? { run: doc.result.run } : {}) });
+			}
+			case "set": {
+				const held = this.#held(request.args.run, request.args.block);
+				if (!held.ok) return held;
+				const { doc } = held.result;
+				if (request.args.field === "title") this.#applyEdit(doc, "coordinator", { kind: "field", block: request.args.block, field: "title", text: request.args.value });
+				else this.#applyEdit(doc, "coordinator", { kind: "done", block: request.args.block, done: request.args.value });
+				return ok(null);
+			}
+			case "edit": {
+				const held = this.#held(request.args.run, request.args.block);
+				if (!held.ok) return held;
+				const { doc, block } = held.result;
+				const first = block.body.indexOf(request.args.find);
+				if (first < 0) return fail("NotFound", "find 文本不在块正文中");
+				if (block.body.indexOf(request.args.find, first + 1) >= 0) return fail("Ambiguous", "find 文本出现多次");
+				const text = block.body.slice(0, first) + request.args.replace + block.body.slice(first + request.args.find.length);
+				this.#applyEdit(doc, "coordinator", { kind: "field", block: block.id, field: "body", text });
+				return ok(null);
+			}
+			case "insert": {
+				const doc = this.#docOf(request.args.run);
+				if (!doc.ok) return doc;
+				if (this.#isFinished(doc.result)) return fail("RunFinished", "Run 已结束");
+				if (request.args.after !== undefined && !this.#block(doc.result, request.args.after)) return fail("UnknownBlock", `块 ${request.args.after} 不存在`);
+				const id = this.#allocateBlock(doc.result);
+				this.#applyEdit(doc.result, "coordinator", { kind: "insert", after: request.args.after ?? null, block: { id, title: request.args.title, body: request.args.body, done: false } });
+				return ok({ block: id });
+			}
+			case "delete": {
+				const held = this.#held(request.args.run, request.args.block);
+				if (!held.ok) return held;
+				this.#applyEdit(held.result.doc, "coordinator", { kind: "delete", block: request.args.block });
+				return ok(null);
+			}
+			case "refetch": {
+				const fetched: { target: string; ok: boolean }[] = [];
+				const targets: ExternalTarget[] = [];
+				for (const text of request.args.targets) {
+					const target = this.#refs.parseTarget(text);
+					if (!target || target.kind === "block" || target.kind === "result") return fail("UnknownTarget", `${text} 不是外部目标`);
+					targets.push(target);
+				}
+				for (const target of targets) {
+					const outcome = await this.#fetchTarget(target, true);
+					fetched.push({ target: this.#refs.targetKey(target), ok: outcome.ok });
+				}
+				for (const key of this.#docs.keys()) void this.#recomputeChecks(key);
+				return ok({ fetched });
+			}
+			case "compile": {
+				const doc = this.#blocksOf(request.args.run, request.args.blocks);
+				if (!doc.ok) return doc;
+				return ok(await this.#compileNow(doc.result, request.args.blocks));
+			}
+			case "inspect": {
+				const doc = this.#blocksOf(request.args.run, request.args.blocks);
+				if (!doc.ok) return doc;
+				await this.#ensureFetched(doc.result, request.args.blocks);
+				return ok(this.#inspectState(doc.result, request.args.blocks));
+			}
+			case "report":
+				return this.#report(request.args.run, request.args.blocks, request.args.version, request.args.result);
+			case "launch":
+				return this.#launch(session!, request.args.run, request.args.blocks);
+			case "bind": {
+				const launch = this.#owned(session!, request.args.launch);
+				if (!launch.ok) return launch;
+				this.#setLaunch(launch.result, { ...launch.result.record, agents: [...launch.result.record.agents, request.args.agent] });
+				this.#append(launch.result.record.run, "coordinator", { type: "agent_bound", launch: request.args.launch, agent: request.args.agent });
+				this.#emit(refOf(launch.result.record.run));
+				return ok(null);
+			}
+			case "rebase":
+				return this.#rebase(session!, request.args.launch);
+			case "close": {
+				const launch = this.#owned(session!, request.args.launch);
+				if (!launch.ok) return launch;
+				if (launch.result.record.closed === null) this.#closeLaunch(launch.result, "coordinator", "coordinator");
+				this.#emit(refOf(launch.result.record.run));
+				return ok(null);
+			}
+			case "launch_info": {
+				const launch = this.#launches.get(request.args.launch);
+				return launch ? ok(launch.record) : fail("UnknownLaunch", `Launch ${request.args.launch} 不存在`);
+			}
+			case "start_run":
+				return ok({ run: this.#startRun(request.args.name, request.args.update_every ?? null, "coordinator") });
+			case "finish_run": {
+				const result = this.#finishRun(request.args.run, "coordinator");
+				return result === null ? ok(null) : result;
+			}
+			case "runs":
+				return ok({ runs: this.runs() });
+			case "timeline": {
+				if (!this.#logs.has(request.args.run)) return fail("UnknownRun", `Run ${request.args.run} 不存在`);
+				const after = request.args.after ?? 0;
+				return ok({ entries: this.#logs.get(request.args.run)!.entries.filter(entry => entry.seq > after) });
+			}
+			case "post": {
+				const args = request.args;
+				const result = this.#post(args.run, args.kind, args.text, args.block ?? null, args.launch ?? null, args.next ?? null, args.quote ?? null, args.origin === "human" ? "human" : "coordinator", session);
+				return result;
+			}
+			case "snooze":
+				return this.#snooze(request.args.run, request.args.after, "coordinator");
+			case "ack": {
+				for (const launch of this.#launches.values()) {
+					if (launch.pending?.event !== request.args.event) continue;
+					const pending = launch.pending;
+					launch.pending = null;
+					this.#setLaunch(launch, {
+						...launch.record,
+						notified: pending.result,
+						dirty: launch.record.dirty.filter(([, seq]) => seq > pending.maxSeq),
+					});
+					if (launch.record.dirty.length > 0 && launch.deadline !== null && launch.deadline <= this.#now()) void this.#judge(launch);
+					return ok(null);
+				}
+				return fail("UnknownEvent", `事件 ${request.args.event} 不是待确认的事件`);
+			}
+		}
+	}
+
+	// ------------------------------------------------------------ K1 helpers
+
+	#docOf(run: RunId | undefined): Outcome<DocState> {
+		const doc = this.#docs.get(run ?? "template");
+		return doc ? ok(doc) : fail("UnknownRun", `Run ${run} 不存在`);
+	}
+
+	#target(run: RunId | undefined, id: BlockId, modifying: boolean): Outcome<{ doc: DocState; block: Block }> {
+		const doc = this.#docOf(run);
+		if (!doc.ok) return doc;
+		if (modifying && this.#isFinished(doc.result)) return fail("RunFinished", "Run 已结束");
+		const block = this.#block(doc.result, id);
+		return block ? ok({ doc: doc.result, block }) : fail("UnknownBlock", `块 ${id} 不存在`);
+	}
+
+	#held(run: RunId | undefined, id: BlockId): Outcome<{ doc: DocState; block: Block }> {
+		const target = this.#target(run, id, true);
+		if (!target.ok) return target;
+		const lock = target.result.doc.locks.get(id);
+		return lock?.kind === "coordinator" ? target : fail("NotLocked", `本连接不持有块 ${id} 的块锁`);
+	}
+
+	#blocksOf(run: RunId | undefined, blocks: readonly BlockId[]): Outcome<DocState> {
+		const doc = this.#docOf(run);
+		if (!doc.ok) return doc;
+		for (const id of blocks) if (!this.#block(doc.result, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
+		return doc;
+	}
+
+	#owned(session: string, id: LaunchId): Outcome<LaunchState> {
+		const launch = this.#launches.get(id);
+		if (!launch) return fail("UnknownLaunch", `Launch ${id} 不存在`);
+		if (launch.record.session !== session) return fail("NotOwner", `Launch ${id} 属于其他会话`);
+		return ok(launch);
+	}
+
+	#allocateBlock(doc: DocState): BlockId {
+		const docMax = Math.max(0, ...doc.blocks.map(block => idNumber(block.id)));
+		const n = Math.max(this.#maxBlock, docMax) + 1;
+		this.#maxBlock = n;
+		const id = `b${n}` as BlockId;
+		this.#store.appendServiceRecord({ kind: "block", id });
+		return id;
+	}
+
+	async #launch(session: string, run: RunId, blocks: readonly BlockId[]): Promise<Outcome<unknown>> {
+		const docState = this.#docs.get(run);
+		if (!docState?.run) return fail("UnknownRun", `Run ${run} 不存在`);
+		if (docState.run.status === "finished") return fail("RunFinished", "Run 已结束");
+		if (blocks.length === 0) return fail("BadLaunch", "blocks 为空");
+		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
+		const orchestration = blocks.filter(id => isOrchestration(this.#block(docState, id)!.body));
+		if (orchestration.length > 0 && blocks.length > 1) return fail("BadLaunch", "编排块只能单独启动");
+		await this.#ensureFetched(docState, blocks);
+		if (this.#isFinished(docState)) return fail("RunFinished", "Run 已结束");
+		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
+		const bodies = this.#bodies(docState);
+		const results = this.#results(run);
+		const result = this.#refs.compile(blocks, this.#input(docState, this.#fetches, bodies, results));
+		if (result.kind === "Err") return fail("CompileError", "编译失败", result.error);
+		const fetchKeys = this.#refs.externalTargets(blocks, bodies).map(target => this.#refs.targetKey(target));
+		const fetches = fetchKeys.flatMap(key => {
+			const outcome = this.#fetches.get(key);
+			return outcome ? [[key, outcome] as const] : [];
+		});
+		const usedResults = this.#refs.resultTargets(blocks, bodies).flatMap(id => {
+			const value = results.get(id);
+			return value ? [[id, value] as const] : [];
+		});
+		this.#maxLaunch++;
+		const id = `l${this.#maxLaunch}` as LaunchId;
+		this.#store.appendServiceRecord({ kind: "launch", id });
+		const record: Launch = {
+			id,
+			run,
+			session,
+			blocks: [...blocks],
+			kind: orchestration.length > 0 ? "orchestration" : "prompt",
+			snapshot: { result, fetches, results: usedResults },
+			agents: [],
+			baselines: [result.text],
+			notified: null,
+			dirty: [],
+			fetches,
+			closed: null,
+		};
+		const state: LaunchState = { record, pending: null, deadline: null, timer: undefined, generation: 0, judging: false };
+		this.#launches.set(id, state);
+		this.#store.appendLaunch(run, record);
+		this.#append(run, "coordinator", { type: "launch_created", launch: id, kind: record.kind, blocks: record.blocks });
+		this.#emit(docState.ref);
+		return ok({ launch: id, text: result.text });
+	}
+
+	async #rebase(session: string, id: LaunchId): Promise<Outcome<unknown>> {
+		const owned = this.#owned(session, id);
+		if (!owned.ok) return owned;
+		const launch = owned.result;
+		const doc = this.#docs.get(launch.record.run)!;
+		const bodies = this.#bodies(doc);
+		const fetches = await this.#launchFetches(launch, bodies);
+		const result = this.#refs.compile(launch.record.blocks, this.#input(doc, fetches, bodies, new Map(launch.record.snapshot.results)));
+		if (result.kind === "Err") return fail("CompileError", "编译失败", result.error);
+		launch.generation++;
+		launch.pending = null;
+		launch.judging = false;
+		launch.deadline = null;
+		clearTimeout(launch.timer);
+		launch.timer = undefined;
+		this.#setLaunch(launch, { ...launch.record, baselines: [...launch.record.baselines, result.text], notified: null, dirty: [] });
+		this.#emit(doc.ref);
+		return ok({ baseline: result.text });
+	}
+
+	#report(run: RunId | undefined, blocks: readonly BlockId[], version: string, result: JudgeReport): Outcome<unknown> {
+		const doc = this.#blocksOf(run, blocks);
+		if (!doc.ok) return doc;
+		if (!this.#checks.validateReport(result)) return fail("BadReport", "report 的 result 不完整或越界");
+		const setKey = blocks.join(",");
+		const inspection = doc.result.inspections.get(setKey);
+		const current = this.#version(doc.result, blocks, this.#input(doc.result, this.#fetches));
+		if (!inspection || inspection.stale || inspection.version !== version || current !== version) return ok(null);
+		doc.result.inspections.set(setKey, { ...inspection, report: result });
+		if (doc.result.run) this.#append(doc.result.run.id, "coordinator", { type: "check_reported", blocks: [...blocks], version, result });
+		this.#emit(doc.result.ref);
+		return ok(null);
+	}
+
+	// ------------------------------------------------------------ Runs (runs.md)
+
+	#startRun(name: string, updateEvery: number | null, origin: "human" | "coordinator"): RunId {
+		const template = this.#docs.get("template")!;
+		this.#maxRun++;
+		const id = `r${this.#maxRun}` as RunId;
+		this.#store.appendServiceRecord({ kind: "run", id });
+		const started = this.#now();
+		const meta: RunMeta = {
+			id,
+			name,
+			status: "running",
+			startedAt: started,
+			finishedAt: null,
+			updateEvery,
+			updateDue: updateEvery === null ? null : started + updateEvery * 1000,
+		};
+		const doc: PlaybookDoc = { title: template.title, blocks: template.blocks.map(block => ({ ...block, done: false })) };
+		const text = this.#store.serialize(doc, meta);
+		this.#store.write({ kind: "run", run: id }, text);
+		const state = this.#newDocState({ kind: "run", run: id }, doc, meta);
+		this.#docs.set(id, state);
+		this.#logs.set(id, { entries: [] });
+		this.#append(id, origin, { type: "run_started", name });
+		if (origin === "human") this.#send({ event: "run_started", data: { run: id, name } });
+		this.#scheduleReminder(id);
+		void this.#recomputeChecks(id);
+		this.#emit(null);
+		return id;
+	}
+
+	#finishRun(run: RunId, origin: "human" | "coordinator"): Outcome<never> | null {
+		const doc = this.#docs.get(run);
+		if (!doc?.run) return fail("UnknownRun", `Run ${run} 不存在`);
+		if (doc.run.status === "finished") return fail("RunFinished", "Run 已结束");
+		for (const launch of this.#launches.values()) if (launch.record.run === run && launch.record.closed === null) this.#closeLaunch(launch, "run_finished", "service");
+		for (const [block, lock] of doc.locks) {
+			if (lock.kind === "human") this.#notice(doc, block, "Run 已结束，未提交的修改已丢弃");
+			doc.locks.set(block, { kind: "none" });
+		}
+		doc.run = { ...doc.run, status: "finished", finishedAt: this.#now(), updateDue: null };
+		this.#writeRunNow(doc);
+		this.#scheduleReminder(run);
+		this.#append(run, origin, { type: "run_finished" });
+		if (origin === "human") this.#send({ event: "run_finished", data: { run } });
+		this.#emit(null);
+		return null;
+	}
+
+	#post(
+		run: RunId,
+		kind: RecordKind,
+		text: string,
+		block: BlockId | null,
+		launch: LaunchId | null,
+		next: number | null,
+		quote: string | null,
+		origin: "human" | "coordinator",
+		session: string | null,
+	): Outcome<unknown> {
+		const doc = this.#docs.get(run);
+		if (!doc?.run) return fail("UnknownRun", `Run ${run} 不存在`);
+		if (kind === "retrospective" && doc.run.status !== "finished") return fail("BadValue", "复盘只能写在已结束的 Run 中");
+		if (next !== null && kind !== "update") return fail("BadValue", "next 只用于 update");
+		if (block !== null && !this.#block(doc, block)) return fail("UnknownBlock", `块 ${block} 不存在`);
+		if (launch !== null && !this.#launches.has(launch)) return fail("UnknownLaunch", `Launch ${launch} 不存在`);
+		if (kind === "update" && doc.run.status === "running") {
+			const seconds = next ?? doc.run.updateEvery;
+			if (seconds !== null) this.#setDue(doc, this.#now() + seconds * 1000);
+		}
+		const entry = this.#append(run, origin, {
+			type: "post",
+			kind,
+			text,
+			...(block !== null ? { block } : {}),
+			...(launch !== null ? { launch } : {}),
+			...(quote !== null ? { quote } : {}),
+			...(session !== null ? { session } : {}),
+		});
+		if (kind === "result" && block !== null) {
+			this.#invalidateInspections(doc, blocks => this.#refs.resultTargets(blocks, this.#bodies(doc)).includes(block));
+			void this.#recomputeChecks(run);
+		}
+		this.#emit(doc.ref);
+		return ok({ seq: entry.seq });
+	}
+
+	#snooze(run: RunId, after: number, origin: "human" | "coordinator"): Outcome<unknown> {
+		const doc = this.#docs.get(run);
+		if (!doc?.run) return fail("UnknownRun", `Run ${run} 不存在`);
+		if (doc.run.updateDue === null) return fail("BadValue", "没有待到期的状态更新");
+		const due = this.#now() + after * 1000;
+		this.#setDue(doc, due);
+		this.#append(run, origin, { type: "update_snoozed", due });
+		this.#emit(doc.ref);
+		return ok({ due });
+	}
+
+	// ============================================================ CoreApi (human, K4)
+
+	view(ref: DocRef): DocView {
+		const doc = this.#doc(ref);
+		if (!doc) return { ref, title: "", run: null, blocks: [], timeline: [], lastUpdateAt: null, retrospective: false, errors: [`文档不存在`] };
+		const input = this.#input(doc, this.#fetches);
+		const entries = doc.run ? (this.#logs.get(doc.run.id)?.entries ?? []) : [];
+		const blocks: BlockView[] = doc.blocks.map(block => {
+			const references: ReferenceView[] = this.#refs.parseReferences(block.body).map((reference, index) => {
+				const target = this.#refs.parseTarget(reference.targetText);
+				const external = target !== null && target.kind !== "block" && target.kind !== "result";
+				const key = target ? this.#refs.targetKey(target) : reference.targetText;
+				const fetched = external ? this.#fetches.get(key) : undefined;
+				const fetching = external && !fetched;
+				if (fetching && target && !this.#inflight.has(key)) void this.#fetchTarget(target as ExternalTarget, false).then(() => this.#emit(doc.ref));
+				return {
+					key: `${index}:${reference.text}`,
+					reference,
+					external,
+					status: fetching ? "fetching" : "ready",
+					fetchedAt: fetched ? fetched.at : null,
+					fetchFailed: fetched ? !fetched.ok : false,
+					expansion: fetching ? null : this.#refs.expandOne(block.id, reference, input),
+				};
+			});
+			const launches = [...this.#launches.values()]
+				.filter(launch => doc.run !== null && launch.record.run === doc.run.id && launch.record.closed === null && this.#refs.closure(launch.record.blocks, input.blocks).has(block.id))
+				.map(launch => ({ id: launch.record.id, active: this.#isActive(launch), session: launch.record.session, agents: launch.record.agents }));
+			const latestRecord = [...entries].reverse().find(entry => entry.data.type === "post" && entry.data.block === block.id) ?? null;
+			const report = [...doc.inspections.values()].find(inspection => inspection.report !== null && inspection.blocks.includes(block.id));
+			return {
+				block,
+				lock: doc.locks.get(block.id) ?? { kind: "none" },
+				references,
+				launches,
+				latestRecord,
+				findings: doc.findings.get(block.id) ?? null,
+				report: report && report.report ? { version: report.version, result: report.report } : null,
+				notices: doc.notices.get(block.id) ?? [],
+			};
+		});
+		return {
+			ref,
+			title: doc.title,
+			run: doc.run,
+			blocks,
+			timeline: entries,
+			lastUpdateAt: doc.run ? this.#lastUpdateAt(doc.run.id) : null,
+			retrospective: entries.some(entry => entry.data.type === "post" && entry.data.kind === "retrospective"),
+			errors: doc.parseError ? [`文件不能解析：${doc.parseError}`] : [],
+		};
+	}
+
+	runs(): RunSummary[] {
+		const now = this.#now();
+		return [...this.#docs.values()].flatMap(doc => {
+			if (!doc.run) return [];
+			const entries = this.#logs.get(doc.run.id)?.entries ?? [];
+			return [
+				{
+					id: doc.run.id,
+					name: doc.run.name,
+					status: doc.run.status,
+					started_at: doc.run.startedAt,
+					finished_at: doc.run.finishedAt,
+					done: doc.blocks.filter(block => block.done).length,
+					total: doc.blocks.length,
+					update_due: doc.run.updateDue,
+					update_overdue: doc.run.updateDue !== null && doc.run.updateDue <= now,
+					retrospective: entries.some(entry => entry.data.type === "post" && entry.data.kind === "retrospective"),
+				},
+			];
+		});
+	}
+
+	coordinator(): CoordinatorStatus {
+		return { connected: this.#conn?.session != null, session: this.#conn?.session ?? null, pane: this.#conn?.pane ?? null };
+	}
+
+	coordinatorCommand(): string {
+		return ["env", `PLAYBOOK_DOC=${this.#store.templatePath}`, "omp", "-e", this.#extensionEntry].join(" ");
+	}
+
+	canStartCoordinator(): boolean {
+		return this.#panes.ownPane() !== null && !this.coordinator().connected;
+	}
+
+	async startCoordinator(): Promise<string | null> {
+		const pane = this.#panes.ownPane();
+		if (pane === null) return "文档服务不在 session daemon 托管的 pane 中";
+		const result = await this.#panes.splitCoordinator(pane, this.#store.baseDir, ["env", `PLAYBOOK_DOC=${this.#store.templatePath}`, "omp", "-e", this.#extensionEntry]);
+		if (!result.ok) return this.#k5Error(result.error);
+		return null;
+	}
+
+	async focusCoordinator(): Promise<string | null> {
+		const pane = this.#conn?.pane ?? null;
+		if (pane === null) return "协调者没有给出它的 pane";
+		const result = await this.#panes.focusPane(pane);
+		return result.ok ? null : this.#k5Error(result.error);
+	}
+
+	#k5Error(error: string): string {
+		this.#errors.push(error);
+		this.#emit(null);
+		return error;
+	}
+
+	errors(): readonly string[] {
+		return this.#errors;
+	}
+
+	onChange(listener: (ref: DocRef | null) => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	setRenderStatus(ref: DocRef, block: BlockId, status: RenderStatus): void {
+		const doc = this.#doc(ref);
+		if (!doc) return;
+		const previous = doc.render.get(block);
+		doc.render.set(block, status);
+		if (JSON.stringify(previous) !== JSON.stringify(status)) void this.#recomputeChecks(keyOf(ref));
+	}
+
+	#humanTarget(ref: DocRef, id: BlockId): { doc: DocState; block: Block } | string {
+		const doc = this.#doc(ref);
+		if (!doc) return "文档不存在";
+		if (this.#isFinished(doc)) return "Run 已结束";
+		const block = this.#block(doc, id);
+		return block ? { doc, block } : `块 ${id} 不存在`;
+	}
+
+	#hasHumanDraft(): boolean {
+		for (const doc of this.#docs.values()) for (const lock of doc.locks.values()) if (lock.kind === "human") return true;
+		return false;
+	}
+
+	pencil(ref: DocRef, id: BlockId, field: BlockField): string | null {
+		const target = this.#humanTarget(ref, id);
+		if (typeof target === "string") return target;
+		const lock = target.doc.locks.get(id);
+		if (lock?.kind !== "none") return lock?.kind === "coordinator" ? "协调者正在编辑" : "已在编辑";
+		if (this.#hasHumanDraft()) return "请先提交正在编辑的字段";
+		target.doc.locks.set(id, { kind: "human", field, draft: target.block[field] });
+		target.doc.notices.delete(id);
+		this.#emit(ref);
+		return null;
+	}
+
+	setDraft(ref: DocRef, id: BlockId, text: string): string | null {
+		const doc = this.#doc(ref);
+		const lock = doc?.locks.get(id);
+		if (!doc || lock?.kind !== "human") return "没有正在编辑的字段";
+		doc.locks.set(id, { ...lock, draft: text });
+		return null;
+	}
+
+	commit(ref: DocRef, id: BlockId): string | null {
+		const doc = this.#doc(ref);
+		const lock = doc?.locks.get(id);
+		if (!doc || lock?.kind !== "human") return "没有正在编辑的字段";
+		const block = this.#block(doc, id);
+		doc.locks.set(id, { kind: "none" });
+		if (block && lock.draft !== block[lock.field]) this.#applyEdit(doc, "human", { kind: "field", block: id, field: lock.field, text: lock.draft });
+		else this.#afterChange(doc);
+		return null;
+	}
+
+	interrupt(ref: DocRef, id: BlockId): string | null {
+		const doc = this.#doc(ref);
+		const lock = doc?.locks.get(id);
+		if (!doc || lock?.kind !== "coordinator") return "协调者没有持有这个块";
+		doc.locks.set(id, { kind: "none" });
+		const run = doc.run?.id;
+		if (run) this.#append(run, "human", { type: "interrupted", block: id, request: lock.request });
+		this.#conn?.conn.send({ event: "interrupted", data: { ...(run ? { run } : {}), block: id, request: lock.request } });
+		this.#emit(ref);
+		return null;
+	}
+
+	setDone(ref: DocRef, id: BlockId, done: boolean): string | null {
+		const target = this.#humanTarget(ref, id);
+		if (typeof target === "string") return target;
+		if (target.doc.locks.get(id)?.kind !== "none") return "块正在编辑";
+		this.#applyEdit(target.doc, "human", { kind: "done", block: id, done });
+		const run = target.doc.run;
+		if (run) this.#send({ event: "done_changed", data: { run: run.id, block: id, done } });
+		return null;
+	}
+
+	insertBlock(ref: DocRef, after: BlockId | null): string | null {
+		const doc = this.#doc(ref);
+		if (!doc) return "文档不存在";
+		if (this.#isFinished(doc)) return "Run 已结束";
+		const id = this.#allocateBlock(doc);
+		this.#applyEdit(doc, "human", { kind: "insert", after, block: { id, title: "", body: "", done: false } });
+		return null;
+	}
+
+	deleteBlock(ref: DocRef, id: BlockId): string | null {
+		const target = this.#humanTarget(ref, id);
+		if (typeof target === "string") return target;
+		if (target.doc.locks.get(id)?.kind !== "none") return "块正在编辑";
+		this.#applyEdit(target.doc, "human", { kind: "delete", block: id });
+		return null;
+	}
+
+	requestLaunch(run: RunId, blocks: readonly BlockId[]): string | null {
+		const doc = this.#docs.get(run);
+		if (!doc?.run || doc.run.status !== "running") return "Run 不在进行中";
+		if (blocks.some(id => isOrchestration(this.#block(doc, id)?.body ?? "")) && blocks.length > 1) return "编排块只能单独启动";
+		return this.#send({ event: "launch_requested", data: { run, blocks: [...blocks] } }) ? null : "没有协调者连接";
+	}
+
+	requestCheck(ref: DocRef, blocks: readonly BlockId[]): string | null {
+		void this.#recomputeChecks(keyOf(ref));
+		const run = ref.kind === "run" ? ref.run : null;
+		return this.#send({ event: "check_requested", data: { run, blocks: [...blocks] } }) ? null : "没有协调者连接";
+	}
+
+	async preview(ref: DocRef, blocks: readonly BlockId[]): Promise<CompileResult> {
+		const doc = this.#doc(ref);
+		if (!doc) throw new Error("文档不存在");
+		return this.#compileNow(doc, blocks);
+	}
+
+	async refetch(_ref: DocRef, key: TargetKey): Promise<string | null> {
+		const target = this.#refs.parseTarget(key);
+		if (!target || target.kind === "block" || target.kind === "result") return `${key} 不是外部目标`;
+		const outcome = await this.#fetchTarget(target, true);
+		for (const docKey of this.#docs.keys()) void this.#recomputeChecks(docKey);
+		this.#emit(null);
+		return outcome.ok ? null : outcome.error;
+	}
+
+	startRun(name: string, updateEvery: number | null): string | null {
+		if (name.trim() === "") return "请填写 Run 名称";
+		if (updateEvery !== null && (!Number.isInteger(updateEvery) || updateEvery <= 0)) return "状态更新间隔必须是正整数秒";
+		this.#startRun(name, updateEvery, "human");
+		return null;
+	}
+
+	finishRun(run: RunId): string | null {
+		const result = this.#finishRun(run, "human");
+		return result === null || result.ok ? null : result.error.message;
+	}
+
+	post(run: RunId, kind: RecordKind, text: string, block: BlockId | null, next: number | null): string | null {
+		const result = this.#post(run, kind, text, block, null, next, null, "human", null);
+		return result.ok ? null : result.error.message;
+	}
+
+	snooze(run: RunId, after: number): string | null {
+		const result = this.#snooze(run, after, "human");
+		return result.ok ? null : result.error.message;
+	}
+
+	closeLaunch(id: LaunchId): string | null {
+		const launch = this.#launches.get(id);
+		if (!launch) return `Launch ${id} 不存在`;
+		if (launch.record.closed === null) this.#closeLaunch(launch, "human", "human");
+		this.#emit(refOf(launch.record.run));
+		return null;
+	}
+
+	launchInfo(id: LaunchId): Launch | null {
+		return this.#launches.get(id)?.record ?? null;
+	}
+}
+
+type EditChange =
+	| { readonly kind: "field"; readonly block: BlockId; readonly field: BlockField; readonly text: string }
+	| { readonly kind: "done"; readonly block: BlockId; readonly done: boolean }
+	| { readonly kind: "insert"; readonly after: BlockId | null; readonly block: Block }
+	| { readonly kind: "delete"; readonly block: BlockId }
+	| { readonly kind: "reorder"; readonly order: readonly BlockId[] };

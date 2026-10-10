@@ -67,12 +67,13 @@
 
 Mattermost Playbooks 的 bot 按定时器催状态更新，人可以推迟；run 结束后 bot 请人写复盘（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。本设计中 bot 是 agent，因此到期由文档服务判定并通知协调者，写更新与写复盘由人或协调者完成。
 
-- `update_every` 是 Run 的状态更新间隔，单位为秒，或空。它在开始 Run 时给出，之后不改变；空表示这个 Run 没有状态更新提醒。
+- `update_every` 是 Run 的默认状态更新间隔，单位为秒，或空。它在开始 Run 时给出，之后不改变。空表示没有默认间隔：开始 Run 时不安排提醒，不带 `next` 的 `update` 记录不改变 `update_due`；带 `next` 的 `update` 记录仍安排下一次提醒。
 - `update_due` 是下一次状态更新的到期时间，或空。开始 Run 时，`update_every` 非空则 `update_due` 设为开始时间加 `update_every`，否则为空。
-- 写入 `update` 记录时，`update_due` 设为写入时间加 `next`；`next` 是该记录给出的秒数，没有给出时取 `update_every`；`next` 与 `update_every` 都为空时 `update_due` 不变。这与 Mattermost 中每次状态更新设定下一次提醒的做法相同（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。
-- 推迟：人在 Run 视图头部点"推迟"并选择时长，或协调者调用 `snooze {run, after}`。`update_due` 设为当前时间加该时长，时间线追加 `update_snoozed`。`update_due` 为空时推迟不可用，`snooze` 返回 `BadValue`。
+- 在进行中的 Run 写入 `update` 记录时，`update_due` 设为写入时间加 `next`；`next` 是该记录给出的秒数，没有给出时取 `update_every`；两者都为空时 `update_due` 不变。这与 Mattermost 中每次状态更新设定下一次提醒的做法相同（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。在已结束的 Run 写入的 `update` 记录不改变 `update_due`，因为已结束的 Run 不再有提醒。
+- 推迟：人在进行中的 Run 视图头部点"推迟"并选择时长，或协调者调用 `snooze {run, after}`。`update_due` 设为当前时间加该时长，时间线追加 `update_snoozed`。`update_due` 为空时（包括 Run 已结束）推迟不可用，`snooze` 返回 `BadValue`。
 - 到期：进行中的 Run 的 `update_due` 到达时，文档服务在时间线中追加 `update_due`，并向当前连接发出 `update_due` 事件，内容为 Run id、`update_due` 与最近一条 `update` 记录的时间。每个 `update_due` 值只到期一次：之后 `update_due` 保持原值，Run 视图头部显示"状态更新已到期"，直到下一条 `update` 记录或推迟。文档服务启动时，进行中的 Run 的 `update_due` 已过、而时间线中没有 `data.due` 等于它的 `update_due` 条目时，立即按到期处理，因为文档服务不运行期间没有判定到期。没有连接时不保存事件，因为模板视图列表与 Run 视图头部已显示到期；协调者连接后从 `runs` 读到它。
 - Run 结束时 `update_due` 置空（§2），不再产生到期。
+- `run` 映射的每次改变（开始、结束、`update_due` 改变）立即写回 Run 文件，写回完成后才追加对应的时间线条目。因此时间线中记下的开始、结束、推迟与到期，在 Run 文件中都已生效；进程在两次写入之间结束时，只丢失这一条时间线条目。Run 文件的 `run` 映射是 Run 状态的唯一来源，时间线只是事实记录（S10）。
 - 复盘：已结束、没有 `retrospective` 记录的 Run 在模板视图列表中标为"未复盘"，Run 视图中显示写复盘的输入框。人在该输入框中写复盘；协调者以 `post {kind: "retrospective"}` 写复盘，它从 `run_finished` 事件或 `runs` 的摘要得知哪个 Run 未复盘。文档服务不定时催复盘，因为未复盘的标记一直显示在列表中，协调者也能随时读到。
 - 欢迎消息不单独设计：人开始 Run 时协调者已收到 `run_started` 事件（§2），在会话中说什么由协调者决定。
 

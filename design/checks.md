@@ -45,7 +45,8 @@ jev 判定在协调者会话的 `eval` 中用 `judge_batch` 执行（S7），判
 
 ## 4. 触发
 
-- 一个块的依赖闭包是以该块为唯一起点的依赖闭包（[launch-events.md §3](launch-events.md#3-块变化判定)）。下列任一情况发生后，文档服务重新计算 `compile`、`empty_expansion` 与 `chart`：该闭包中任一块 id 的块正文改变，或该块被新增或删除；该闭包引用的外部目标在文档取回表中的结果改变；该闭包引用的块结果有了新的 `result` 记录（[runs.md §4](runs.md#4-记录)）。
+- 一个块的依赖闭包是以该块为唯一起点的依赖闭包（[launch-events.md §3](launch-events.md#3-块变化判定)）。下列任一情况发生后，文档服务重新计算 `compile`、`empty_expansion` 与 `chart`：该闭包中任一块 id 的块正文改变，或该块被新增或删除；该闭包引用的外部目标在文档取回表中的结果改变；该闭包引用的块结果有了新的 `result` 记录（[runs.md §4](runs.md#4-记录)）；该块的块正文字段由编辑中换回渲染视图。
+- 该块的块正文字段在编辑中时，`chart` 保持进入编辑前的结果，因为编辑中的字段不显示渲染视图，没有图节点可比较（[contracts.md §K4](contracts.md#k4-文档服务--tern)）。
 - 下列任一情况发生后，文档服务重新计算该块的 `render_error` 与 `render_pending`：包含该块节点的帧发出；该帧发出满 2 s；收到覆盖该帧的 `ack`；收到对应到该块或不能对应到块的 `error` 事件。
 - 人可以在表单中对选中的块执行"检查"操作（[contracts.md §K4](contracts.md#k4-文档服务--tern)）；文档服务立即重新计算这些块的 `findings`，并把操作作为 `check_requested` 事件发给协调者，内容为 Run id（在模板视图中为空）与块 id 列表。没有连接时按启动请求的规则处理（[launch-events.md §5](launch-events.md#5-启动请求)）。
 - 检查结果不阻止 `launch`。何时检查、结果不通过时做什么，属于编排，由协调者决定（S3）。

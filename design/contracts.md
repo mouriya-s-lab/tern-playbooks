@@ -52,11 +52,11 @@
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：协调者扩展（根节点设计）。使用方：协调者会话中的模型与 `eval` 代码，以及在协调者会话中输入命令的人（omp） |
-| 交换 | 工具 `playbook`，参数 `{doc, op, args}`，`doc` 为 Playbook 文件路径，`op` 与 `args` 同 K1，以下除外：`hello` 与 `ack` 由协调者扩展自己发送；`unlock` 的 `args` 为 `{run?, block}`，扩展填入当前 agent 操作中为该块最近一次记录的 `lock` 请求 id，没有记录时不发送；`post` 的 `args` 不含 `origin`，扩展发送时不带它。结果为 K1 的 `result` 或错误。命令 `/playbook-add [doc]`：扩展用 `registerCommand` 注册；参数为 Playbook 文件路径，省略时为扩展当前唯一连接的文档，有多个连接时先让人选择。扩展从 `ctx.sessionManager.getBranch()` 中取最近 20 条带文本的用户与助手消息，经 `ctx.ui.select` 让人选一条（选项以消息 id 开头），再经 `ctx.ui.select` 选 Run（来自 `runs`）、`kind`、块（可选"不关于块"），然后发送 `post {run, kind, text, block?, quote, origin: "human"}`，`text` 为该消息全部文本块的拼接，`quote` 为消息 id，最后以 `ctx.ui.notify` 提示条目序号或错误。事件消息：`customType: "playbook-event"`，正文按 [launch-events.md §6](launch-events.md#6-投递)。扩展对会话调用 `abort()`（D2.8），并订阅会话的 `agent_end` 事件 |
+| 交换 | 工具 `playbook`，参数 `{doc, op, args}`，`doc` 为 Playbook 文件路径，`op` 与 `args` 同 K1，以下除外：`hello` 与 `ack` 由协调者扩展自己发送；`unlock` 的 `args` 为 `{run?, block}`，扩展填入当前 agent 操作中为该块最近一次记录的 `lock` 请求 id，没有记录时不发送；`post` 的 `args` 不含 `origin`，扩展发送时不带它。结果为 K1 的 `result` 或错误。环境变量 `PLAYBOOK_DOC`：协调者会话进程环境中的 Playbook 文件路径，由 K5 的启动命令设置，可以没有。命令 `/playbook-add [doc]`：扩展用 `registerCommand` 注册；参数为 Playbook 文件路径；省略时依次取扩展当前唯一连接的文档、有多个连接时让人选择、没有连接时取 `PLAYBOOK_DOC`；三者都没有时以 `ctx.ui.notify` 提示"请指定 Playbook 文件路径"并结束。扩展从 `ctx.sessionManager.getBranch()` 中取最近 20 条带文本的用户与助手消息，经 `ctx.ui.select` 让人选一条（选项以消息 id 开头），再经 `ctx.ui.select` 选 Run（来自 `runs`）、`kind`、块（可选"不关于块"），然后发送 `post {run, kind, text, block?, quote, origin: "human"}`，`text` 为该消息全部文本块的拼接，`quote` 为消息 id，最后以 `ctx.ui.notify` 提示条目序号或错误。事件消息：`customType: "playbook-event"`，正文按 [launch-events.md §6](launch-events.md#6-投递)。扩展对会话调用 `abort()`（D2.8），并订阅会话的 `agent_end` 事件 |
 | 前置条件 | `doc` 指向的文档有一个正在运行的文档服务 |
-| 保证 | 工具可在 `eval` 中以 `tool.playbook(...)` 调用。协调者扩展在第一次使用某个 `doc` 时建立连接。事件按 [launch-events.md §6](launch-events.md#6-投递) 注入。协调者扩展记录当前 agent 操作中成功的 `lock` 请求的 id、Run id 与块 id；收到 `interrupted` 时，它的 `request` 在记录中，扩展才调用 `abort()` 中止该操作（D2.8），否则不做任何事。收到 `agent_end` 时，扩展对记录中的每一项发送 `unlock {run, block, request}`，然后清空记录。因为 `unlock` 只解除由该请求取得的块锁，一个已结束操作的清理不会解除后来的操作取得的块锁 |
+| 保证 | 工具可在 `eval` 中以 `tool.playbook(...)` 调用。协调者扩展在第一次使用某个 `doc` 时建立连接；会话加载扩展时环境中有 `PLAYBOOK_DOC`，扩展立即对它建立连接，这是对该文档的第一次使用。任何请求（包括命令中的 `runs` 与 `post`）发出时该文档没有连接，扩展先按第一次使用的规则建立连接，再发出请求。事件按 [launch-events.md §6](launch-events.md#6-投递) 注入。协调者扩展记录当前 agent 操作中成功的 `lock` 请求的 id、Run id 与块 id；收到 `interrupted` 时，它的 `request` 在记录中，扩展才调用 `abort()` 中止该操作（D2.8），否则不做任何事。收到 `agent_end` 时，扩展对记录中的每一项发送 `unlock {run, block, request}`，然后清空记录。因为 `unlock` 只解除由该请求取得的块锁，一个已结束操作的清理不会解除后来的操作取得的块锁 |
 | 错误 | K1 的全部错误，加上 `NoService`（socket 不存在或拒绝连接），以及 `Disconnected`（请求已发出，连接在响应之前断开；修改操作是否已应用未知） |
-| 失败语义 | 协调者会话结束（`session_shutdown`）：协调者扩展关闭全部连接，块锁随连接解除。连接在响应之前断开时，工具调用返回 `Disconnected`；不自动重试修改操作。`/playbook-add` 中人在任一选择中取消（`ctx.ui.select` 返回 `undefined`）时，命令不发送 `post`；`post` 返回错误或 `Disconnected` 时，命令以 `ctx.ui.notify` 显示该错误，不重试（[E2.9](appendix-evidence.md#e29-扩展命令读取会话消息)） |
+| 失败语义 | 协调者会话结束（`session_shutdown`）：协调者扩展关闭全部连接，块锁随连接解除。连接在响应之前断开时，工具调用返回 `Disconnected`；不自动重试修改操作。请求发出前建立连接失败时返回 `NoService`，请求不发出。`/playbook-add` 中人在任一选择中取消（`ctx.ui.select` 返回 `undefined`）时，命令不发送 `post`；`runs` 或 `post` 返回错误、`NoService` 或 `Disconnected` 时，命令以 `ctx.ui.notify` 显示该错误并结束，不重试（[E2.9](appendix-evidence.md#e29-扩展命令读取会话消息)） |
 | 生命周期 | 开始：会话加载扩展。结束：`session_shutdown` |
 | 质量 | Q1、Q4 |
 | 不承诺 | 不承诺把事件合并成一条消息；不承诺协调者会对事件采取动作 |
@@ -66,7 +66,7 @@
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：GitHub，经 `gh` CLI（外部）。使用方：文档服务的解析器（根节点设计） |
-| 交换 | `gh api repos/<owner>/<repo>/issues/<n>` 输出一个对象，含 `title`、`body`；PR 编号同样适用，对象另含 `pull_request` 字段。`gh api --paginate repos/<owner>/<repo>/issues/<n>/comments` 输出一个 JSON 数组（跨页合并），每个元素含 `user.login`、`created_at`、`body`，只含会话评论，不含 PR 的行内审查评论。解析器把 `user.login` 映射为 `author`（[references.md §2](references.md#2-目标种类与解析器)） |
+| 交换 | `gh api repos/<owner>/<repo>/issues/<n>` 输出一个对象，含 `title`、`body`；PR 编号同样适用，对象另含 `pull_request` 字段。`gh api --paginate --slurp repos/<owner>/<repo>/issues/<n>/comments` 输出页数组的数组，解析器把各页依次展平成一个评论列表；每个元素含 `user.login`、`created_at`、`body`，只含会话评论，不含 PR 的行内审查评论。解析器把 `user.login` 映射为 `author`，把为 `null` 的 `body` 当作空文本（[references.md §2](references.md#2-目标种类与解析器)） |
 | 前置条件 | `gh` 已认证（D3.4） |
 | 保证 | 只读。每个外部目标只在首次被引用或显式重新取回时取回（[references.md §5](references.md#5-文档取回表与预览)） |
 | 错误 | `FetchFailed`：`gh` 非零退出或超时，附退出码与错误输出 |
@@ -94,11 +94,11 @@
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：Tern 的 `tern` CLI 与 session daemon（外部）。使用方：文档服务与协调者扩展（根节点设计） |
-| 交换 | 子进程。启动协调者：`tern split "$TERN_PANE" right --cwd <模板文件所在目录> --json -- <启动协调者的命令>`，输出 `{"block": <新 pane id>}`；`<启动协调者的命令>` 与头部显示的命令相同（K4）。转到另一方：`tern focus <pane id> --json`，输出 `{"block": <pane id>}`。`TERN_PANE` 取自进程环境；对方的 pane id 取自 K1 `hello` 交换的 `pane`。协调者扩展注册命令 `/playbook-show [doc]`（参数规则同 K2 的 `/playbook-add`），对该文档服务的 pane 执行转到 |
-| 前置条件 | 调用方的进程环境中有 `TERN_PANE`，即它运行在 session daemon 托管的 pane 中；`tern` 在 `PATH` 中。不满足时，文档服务不显示"启动协调者"，K1 `hello` 不带 `pane`（[E1.6](appendix-evidence.md#e16-pane-中的程序控制-pane)） |
-| 保证 | "启动协调者"在文档服务 pane 的右侧新建一个 pane，在模板文件所在目录中运行启动协调者的命令；文档服务不持有该 pane，协调者扩展连接并 `hello` 成功后，头部才改为显示协调者会话。"转到协调者"与 `/playbook-show` 让 Tern 窗口显示并聚焦对方的 pane。文档服务与协调者扩展在其他时候不改变焦点：发出启动请求、检查请求等事件后，焦点留在人操作的 pane 中 |
-| 错误 | `tern` 非零退出：文档服务在头部显示退出码与错误输出；协调者扩展以 `ctx.ui.notify` 显示 |
-| 失败语义 | 不重试。新 pane 已建立而协调者未能连接时，头部保持"没有协调者连接"，人在新 pane 中看到启动失败的输出。对方的 pane 已关闭时，`tern focus` 非零退出，按错误处理 |
-| 生命周期 | 每次调用一个子进程：开始于人点击按钮或输入命令，结束于子进程退出（调用方确认）。新建的协调者 pane 由 Tern daemon 托管：开始于 `tern split` 返回，结束于其中的程序退出或人关闭它（Tern daemon 确认）；文档服务进程结束不结束它 |
+| 交换 | 子进程。启动协调者：`tern split "$TERN_PANE" right --cwd <模板文件所在目录> --json -- env PLAYBOOK_DOC=<模板文件绝对路径> omp -e <协调者扩展入口文件绝对路径>`，输出 `{"block": <新 pane id>}`；`--` 之后的部分是启动协调者的命令，K4 头部显示的就是它；协调者扩展入口文件与文档服务属于同一安装。转到另一方：`tern focus <pane id> --json`，输出 `{"block": <pane id>}`。`TERN_PANE` 取自进程环境；对方的 pane id 取自 K1 `hello` 交换的 `pane`。协调者扩展注册命令 `/playbook-show [doc]`（`doc` 的选择规则同 K2 的 `/playbook-add`），对该文档服务的 pane 执行转到 |
+| 前置条件 | 调用方的进程环境中有 `TERN_PANE`，即它运行在 session daemon 托管的 pane 中。没有时，文档服务不显示"启动协调者"，K1 `hello` 不带 `pane`（[E1.6](appendix-evidence.md#e16-pane-中的程序控制-pane)）。转到另一方还要求对方在 `hello` 中给出了 `pane` |
+| 保证 | "启动协调者"在文档服务 pane 的右侧新建一个 pane，在模板文件所在目录中运行启动协调者的命令；新会话加载协调者扩展后立即按 `PLAYBOOK_DOC` 连接该文档并 `hello`（K2），头部随之改为显示协调者会话。文档服务不持有该 pane。"转到协调者"与 `/playbook-show` 让 Tern 窗口显示并聚焦对方的 pane。文档服务与协调者扩展在其他时候不改变焦点：发出启动请求、检查请求等事件后，焦点留在人操作的 pane 中 |
+| 错误 | `tern` 不能运行（不在 `PATH` 中或不可执行）：附系统错误。`tern` 非零退出：附退出码与错误输出。对方没有给出 `pane`：`/playbook-show` 不调用 `tern`，报告"文档服务不在 session daemon 托管的 pane 中"。文档服务在头部显示错误；协调者扩展以 `ctx.ui.notify` 显示 |
+| 失败语义 | 不重试。新 pane 已建立而协调者未能连接时，头部保持"没有协调者连接"；启动命令以非零退出时 pane 保留并显示它的输出与退出码（[E1.6](appendix-evidence.md#e16-pane-中的程序控制-pane)），人在其中看到失败原因。对方的 pane 已关闭时，`tern focus` 非零退出，按错误处理 |
+| 生命周期 | 每次调用一个子进程：开始于人点击按钮或输入命令，结束于子进程退出（调用方确认）。新建的协调者 pane 由 Tern daemon 托管：开始于 `tern split` 返回，结束于其中的程序以退出码 0 退出或人关闭它（Tern daemon 确认）；文档服务进程结束不结束它 |
 | 质量 | 无 |
 | 不承诺 | 不承诺在没有 session daemon 的窗口中可用。不比较不同 API 给出的 pane id，因为 Tern 规定 id 只能原样传回给给出它的接口（E1.6） |
