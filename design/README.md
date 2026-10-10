@@ -160,6 +160,20 @@
 - 替代：全部检查交给 jev。不选，因为确定性条件不需要模型，并且 jev 在"图是否对应表格"上答错（E2.6）。
 - 重审条件：omp 扩展 API 提供判定接口，此时可以把判定移进协调者扩展。
 
+**S8 Playbook 与协调者会话的分工仿照 Mattermost Playbooks：Playbook 文档对应 run 的 checklist，协调者会话对应 run 的频道，agent（协调者与它启动的 subagent）对应 Playbooks bot。**
+因为 Mattermost Playbooks 的核心是 checklist 与频道并排：checklist 上的操作落到频道里，频道里的 bot 推动流程（[E4](appendix-evidence.md#e4-mattermost-playbooks)）。用户决定由 agent 担任 bot。每个操作，人与 agent 都有入口：
+
+| Mattermost 中的交互 | 人的入口（K4） | agent 的入口（K1、K2） | 在协调者会话中出现的内容 |
+|---|---|---|---|
+| 点任务的 Run，执行任务 | 块卡片的启动按钮 | `launch`，然后在 `eval` 中用 `agent()` 启动 subagent | 启动请求事件（[launch-events.md §5](launch-events.md#5-启动请求)） |
+| 勾选任务完成；完成与执行是两个操作 | `done` 复选框 | `set {field: "done"}` | 无 |
+| 新增、编辑、删除任务 | 新建、铅笔编辑、删除 | `insert`；`lock` 后 `set`、`edit`、`delete` | 无 |
+| 任务内容在 run 中被改动 | 提交编辑草稿 | — | 块变化事件（[launch-events.md §4](launch-events.md#4-块变化事件)） |
+| 对任务做检查 | 块卡片的检查按钮 | `inspect`、`report` | 检查请求事件（[checks.md §4](checks.md#4-触发)） |
+
+- 替代：只在协调者会话中用文字驱动全部操作，不提供表单入口。不选，因为用户决定人与 agent 都有操作入口。
+- 替代：只提供表单，agent 不参与推动。不选，因为 bot 推动流程是参考对象的核心。
+
 ## 范围图
 
 进程/主机包含：

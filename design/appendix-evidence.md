@@ -1,6 +1,6 @@
 # 附录：证据
 
-本附录挂在根节点上，记录 [README.md §域](README.md#域) 中 D1–D3 的证据。它不设立规则。
+本附录挂在根节点上，记录 [README.md §域](README.md#域) 中 D1–D3 的证据，以及 S8 所参照的 Mattermost Playbooks 的观察。它不设立规则。
 
 ## E1 Tern
 
@@ -218,3 +218,17 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
   - PR 的会话评论 id 与 `pulls/<n>/comments` 的行内评论 id 交集为空；会话评论对象中没有 `path`、`diff_hunk`、`pull_request_review_id`。
   - 运行记录：`/tmp/gh-api-contract-check/run4.stdout`。
 
+## E4 Mattermost Playbooks
+
+来源：博客 [Getting Started with Playbooks](https://mattermost.com/blog/getting-started-with-playbooks/) 的全部截图，与其中两段视频（Wistia `l4bx0jse7h`，41 s；`80g6onote4`，14 min 56 s）。本地副本在 `/tmp/pb-ui/mm-blog/`，第二段视频的旁白转写在 `walkthrough.srt`。下表的时间点均为第二段视频中的时间，每一行都对照了该时间点的画面。
+
+| 时间 | 人的操作 | 频道或 checklist 中的结果 |
+|---|---|---|
+| 6:00–6:30 | 启动 run | 新建这次 run 专属的频道；Playbooks bot 加入，并发出欢迎消息；右侧 Run details 显示摘要、Owner、Post update 与 checklist |
+| 8:20–8:26 | 点任务旁的 Run | 任务的斜杠命令以用户身份在频道中发出 `@channel Remember to prep for the kickoff meeting!`，按钮变为 Rerun |
+| 8:38 | 勾选该任务 | 只有 checklist 进度改变（Kickoff 0/4 → 1/4）；执行与完成是两个操作 |
+| 10:41–11:27 | 在任意消息上选 Add to run timeline | 该消息按时间顺序进入 run 的时间线 |
+| 11:32–12:10 | 点 Post update，填写 Markdown，设定下次更新的时间 | bot 在频道中发出 "@DemoUser posted an update" 卡片，附 "3 of 18 tasks checked · 2 participants" |
+| 12:28–12:42 | 定时器到期 | bot 在频道中发出 "@DemoUser, please provide a status update."，消息带 Post update 与 Snooze 按钮；Post update 按钮变红 |
+| 12:58–13:03 | 点 Finish run 并确认 | 频道中出现 "marked this run as finished"，bot 发出 "Would you like to fill out the retrospective report?"，带 Yes 与 No 按钮 |
+| 8:52–9:40 | — | bot 私信汇总超期的状态更新、未完成的任务与进行中的 run；`/playbook todo` 随时给出同一汇总 |
