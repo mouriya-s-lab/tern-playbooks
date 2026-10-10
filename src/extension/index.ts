@@ -127,7 +127,10 @@ export default function (pi: ExtensionAPI): void {
 		return client;
 	}
 
-	pi.registerTool({
+	// R4: the document service offers no interface to subagents. omp loads this extension in
+	// every child session too (same process, same environment), so the tool, the commands and
+	// the PLAYBOOK_DOC connection exist only in the main coordinator session.
+	const registerPlaybookTool = (): void => pi.registerTool({
 		name: "playbook", label: "Playbook", loadMode: "essential",
 		description: "Operate a running Playbook document service using K1 operations. Omit run to operate on the template. Block writes require lock; locks end when this agent operation ends. hello and ack are managed by the extension. post records coordinator-authored text.",
 		parameters,
@@ -160,6 +163,9 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		registerPlaybookTool();
+		registerCommands();
 		if (!process.env.PLAYBOOK_DOC) return;
 		try {
 			const client = await clientFor(process.env.PLAYBOOK_DOC, ctx);
@@ -202,6 +208,7 @@ export default function (pi: ExtensionAPI): void {
 		return reply.result;
 	}
 
+	function registerCommands(): void {
 	pi.registerCommand("playbook-add", {
 		description: "Add a recent session message to a Playbook Run timeline",
 		handler: async (args, ctx) => {
@@ -247,4 +254,5 @@ export default function (pi: ExtensionAPI): void {
 			} catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
 		},
 	});
+	}
 }
