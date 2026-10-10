@@ -238,6 +238,12 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
 
 - 命令执行期间没有 `agent_start`：命令不经过模型。记录在 `/tmp/omp-command-entry-probe/evidence.jsonl`。
 
+### E2.10 subagent 重新加载扩展
+
+- 源码（`@oh-my-pi/pi-coding-agent` 18.8.7）：`src/task/structured-subagent.ts:597-600` 把父会话准备好的扩展转交给子会话，`src/sdk.ts:2652-2663` 为子会话重新调用扩展工厂；`src/extensibility/extensions/types.ts:466-483` 上下文的 `agent` 字段为 `{kind: "main" | "sub", id, name, depth, parentId?}`，`src/sdk.ts:3299-3305` 由宿主创建并冻结；`src/sdk.ts:4740-4743` 支持在 `session_start` 之后注册工具。omp 18.8.9 的可执行文件中有相同的实现。
+- 探针（omp 18.8.9，`omp -p --no-session --auto-approve -e /tmp/tern-subagent-probe.ts`，模型在 JS `eval` 中 `await agent(prompt, {agent: "task:low"})`，记录在 `/tmp/tern-subagent-probe-final.jsonl`）：扩展工厂运行两次；父会话 `ctx.agent` 为 `{kind: "main", depth: 0}`，子会话为 `{kind: "sub", depth: 1, parentId: "Main"}`；两者进程 id 与 `PLAYBOOK_DOC` 相同。只在 `kind` 为 `main` 的 `session_start` 中注册的工具出现在父会话的模型请求中，不出现在子会话的工具列表与模型请求中。
+- 端到端验收（`local://e2e-u4.md`）观察到修复前的后果：文档服务重启后，一个已结束的 subagent 的会话 id 成为文档服务的连接，协调者的请求得到 `Busy`。
+
 ## E3 GitHub
 
 - D3.2：GitHub 公开仓库中，任何登录账号都可以评论 issue 与 PR。

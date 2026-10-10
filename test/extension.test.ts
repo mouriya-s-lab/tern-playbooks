@@ -99,7 +99,7 @@ type TextPart = { type: "text"; text: string } | { type: "thinking"; thinking: s
 type Entry = { type: "message"; id: string; message: { role: "user" | "assistant" | "toolResult"; content: string | TextPart[] } } | { type: "custom"; id: string };
 type Tool = { parameters: { parse(value: unknown): unknown }; execute(id: string, params: unknown, signal: undefined, update: undefined, ctx: ExtensionContext): Promise<{ content: { type: string; text?: string }[]; isError?: boolean }> };
 type Handler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
-function harness() {
+function harness(kind: "main" | "sub" = "main") {
 	let tool: Tool | undefined;
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
@@ -114,6 +114,7 @@ function harness() {
 		{ type: "message", id: "assistant-1", message: { role: "assistant", content: [{ type: "text", text: "FULL FIRST" }, { type: "thinking", thinking: "NO" }, { type: "text", text: "FULL SECOND" }] } },
 	];
 	const ctx = {
+		agent: { kind },
 		sessionManager: { getSessionId: () => "session-test", getBranch: () => branch },
 		abort: () => { aborted++; },
 		ui: {
@@ -132,14 +133,22 @@ function harness() {
 		sendMessage: (message: { customType: string; content: string; display: boolean }, options: unknown) => { messages.push({ message, options }); },
 	} as unknown as ExtensionAPI;
 	extension(api);
-	async function event(name: string): Promise<void> { await handlers.get(name)!({}, ctx); }
+	let started = false;
+	async function event(name: string): Promise<void> {
+		if (name === "session_start") started = true;
+		await handlers.get(name)!({}, ctx);
+	}
+	// omp fires session_start before the session can run tools or commands.
+	async function start(): Promise<void> {
+		if (!started) await event("session_start");
+	}
 	cleanup.push(() => event("session_shutdown"));
 	return {
 		ctx, messages, notices, menus, choices, event,
-		get aborted() { return aborted; }, get tool() { return tool!; },
+		get aborted() { return aborted; }, get tool() { return tool!; }, get registered() { return { tool: tool !== undefined, commands: [...commands.keys()] }; },
 		set branch(value: Entry[]) { branch = value; }, set selectHook(value: typeof selectHook) { selectHook = value; },
-		execute: (params: unknown) => tool!.execute("tool", params, undefined, undefined, ctx),
-		command: (name: string, doc = "") => commands.get(name)!.handler(doc, ctx),
+		execute: async (params: unknown) => { await start(); return tool!.execute("tool", params, undefined, undefined, ctx); },
+		command: async (name: string, doc = "") => { await start(); return commands.get(name)!.handler(doc, ctx); },
 	};
 }
 async function fakeTern(exit = 0) {
@@ -230,6 +239,13 @@ test("session loading without PLAYBOOK_DOC is idle; unavailable startup doc noti
 	const h = harness(); await h.event("session_start"); expect(h.notices).toEqual([]);
 	process.env.PLAYBOOK_DOC = "/tmp/no-playbook-" + randomUUID(); await h.event("session_start");
 	expect(h.notices.at(-1)).toMatchObject({ type: "error" }); expect(h.notices.at(-1)!.message).toContain("NoService");
+});
+
+test("a child session registers no tool or command and never connects, even with PLAYBOOK_DOC (R4)", async () => {
+	const s = await service(); process.env.PLAYBOOK_DOC = s.doc;
+	const h = harness("sub"); await h.event("session_start");
+	expect(h.registered).toEqual({ tool: false, commands: [] });
+	expect(s.frames).toHaveLength(0);
 });
 
 for (const command of ["playbook-add", "playbook-show"]) {
