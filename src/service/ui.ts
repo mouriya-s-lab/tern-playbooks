@@ -228,7 +228,12 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 	}
 	function edit(event: Extract<TspEvent, { ev: "edit" }>): void {
 		const value = fields.get(event.id);
-		if (!value) return;
+		if (!value) {
+			// The field was committed (Esc or 完成) before this edit arrived: its draft no longer
+			// exists, so the edit is stale like a len mismatch (contracts.md K4 错误) and is shown.
+			if (/^b[1-9][0-9]*\.(title|body)$/.test(event.id)) { notices.set(event.id, "一次输入因文本已变化未应用"); redraw(); }
+			return;
+		}
 		const current = value.text();
 		if (event.len !== current.length) { notices.set(event.id, "一次输入因文本已变化未应用"); redraw(); return; }
 		applyText(event.id, current.slice(0, event.from) + event.text + current.slice(event.to), event.cursor);

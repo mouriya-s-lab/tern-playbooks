@@ -100,6 +100,13 @@ describe("K4 form UI", () => {
 		tsp.event({ ev: "edit", id: "b1.title", from: 0, to: 4, text: "stale", cursor: 5, len: 4 });
 		expect(core.calls.filter(call => call.method === "setDraft")).toHaveLength(1); expect(tsp.node("b1.title.notice").p?.text).toBe("一次输入因文本已变化未应用"); expect(tsp.node("b1.title").p?.text).toBe("Tasknew");
 	});
+	test("an edit arriving after Esc committed the field is not silently lost", async () => {
+		const { core, tsp } = await fixture(); tsp.click("b1.title.pencil"); await tick();
+		tsp.keys("\x1b"); await tick();
+		tsp.event({ ev: "edit", id: "b1.title", from: 0, to: 4, text: "replacement", cursor: 11, len: 4 }); await tick();
+		expect(core.calls.filter(call => call.method === "setDraft")).toHaveLength(0);
+		expect(tsp.node("b1.title.notice").p?.text).toBe("一次输入因文本已变化未应用");
+	});
 	test("keys, paste, Unicode deletion, caret-only edit and undo", async () => {
 		const { core, tsp } = await fixture(); tsp.click("b1.title.pencil"); await tick();
 		tsp.keys("😀"); tsp.keys("\x7f"); tsp.keys("\x1b[200~ pasted\x1b[201~");
