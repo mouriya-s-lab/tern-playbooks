@@ -115,6 +115,18 @@ describe("K4 form UI", () => {
 		tsp.event({ ev: "undo", id: "b1.title" }); expect(core.calls.at(-1)?.args.at(-1)).toBe("Task");
 		tsp.click("b1.title.commit"); expect(core.calls.at(-1)?.method).toBe("commit");
 	});
+	test("text keys arriving after Esc committed the field are not silently lost", async () => {
+		const { core, tsp } = await fixture(); tsp.click("b1.body.pencil"); await tick();
+		tsp.keys("\x1b"); await tick();
+		tsp.keys("late text"); await tick();
+		expect(core.calls.filter(call => call.method === "setDraft")).toHaveLength(0);
+		expect(tsp.node("b1.body.notice").p?.text).toBe("一次输入因文本已变化未应用");
+	});
+	test("navigation keys after a commit change no text and show nothing", async () => {
+		const { tsp } = await fixture(); tsp.click("b1.body.pencil"); await tick();
+		tsp.keys("\x1b"); await tick(); tsp.keys("\x1b[D"); await tick();
+		expect(() => tsp.node("b1.body.notice")).toThrow("Missing b1.body.notice");
+	});
 	test("coalesced pty reads and split paste preserve text before Esc, including kitty keys", async () => {
 		const { core, tsp } = await fixture(); tsp.click("b1.title.pencil"); await tick();
 		tsp.keys("\x1b[200~pa"); tsp.keys("ste\x1b[201~");
