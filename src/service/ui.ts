@@ -28,6 +28,8 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 	let opened = false;
 	let mounted = false;
 	let focus: string | null = null;
+	/** The field committed last, until the human focuses a field again: input arriving for it is late (K4 错误). */
+	let committed: string | null = null;
 	let documentError: string | null = null;
 	let runName = "";
 	let runEvery = "";
@@ -111,7 +113,7 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 			c.push(row(`${prefix}.${name}.controls`, [text(`${prefix}.${name}.label`, name === "title" ? "标题" : "正文"), editing ? button(`${prefix}.${name}.commit`, "完成", () => commit(block.id)) : button(`${prefix}.${name}.pencil`, "铅笔", () => {
 				const error = core.pencil(ref, block.id, name);
 				if (error) return showError(error);
-				focus = `${prefix}.${name}`;
+				focus = `${prefix}.${name}`; committed = null;
 				carets.delete(focus); undo.delete(focus); notices.delete(focus);
 				redraw();
 			}, !canEdit)]));
@@ -148,8 +150,10 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 		return { id: `${prefix}.card`, k: "card", p: { head: block.id }, c };
 	}
 	function commit(block: BlockId): void {
+		const lock = core.view(ref).blocks.find(item => item.block.id === block)?.lock;
 		const error = core.commit(ref, block);
 		if (error) return showError(error);
+		committed = lock?.kind === "human" ? `${block}.${lock.field}` : null;
 		focus = null;
 		redraw();
 	}
@@ -226,12 +230,15 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 		carets.set(id, { cursor: Math.max(0, Math.min(next.length, cursor)), anchor });
 		updateField(id);
 	}
+	/** contracts.md K4 错误: input for a field that was committed before the input arrived is shown, never silently dropped. */
+	function late(id: string): void {
+		notices.set(id, "一次输入因文本已变化未应用");
+		redraw();
+	}
 	function edit(event: Extract<TspEvent, { ev: "edit" }>): void {
 		const value = fields.get(event.id);
 		if (!value) {
-			// The field was committed (Esc or 完成) before this edit arrived: its draft no longer
-			// exists, so the edit is stale like a len mismatch (contracts.md K4 错误) and is shown.
-			if (/^b[1-9][0-9]*\.(title|body)$/.test(event.id)) { notices.set(event.id, "一次输入因文本已变化未应用"); redraw(); }
+			if (event.id === committed) late(event.id);
 			return;
 		}
 		const current = value.text();
@@ -274,9 +281,12 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 			if (editing) commit(editing.block.id);
 			return;
 		}
-		if (!focus) return;
-		const value = fields.get(focus);
-		if (!value) return;
+		const value = focus === null ? undefined : fields.get(focus);
+		if (focus === null || !value) {
+			const changesText = bytes === "\x7f" || bytes === "\b" || bytes === `${ESC}[3~` || bytes.startsWith(`${ESC}[200~`) || !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(bytes);
+			if (committed !== null && changesText) late(committed);
+			return;
+		}
 		const current = value.text();
 		const caret = carets.get(focus) ?? { cursor: current.length, anchor: null };
 		let cursor = caret.cursor;
@@ -305,7 +315,7 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 			case "change": changes.get(input.id)?.(input); break;
 			case "edit": edit(input); break;
 			case "undo": undoField(input.id); break;
-			case "focus": if (fields.has(input.id)) { focus = input.id; tsp.frame([["focus", focus]], []); } break;
+			case "focus": if (fields.has(input.id)) { focus = input.id; committed = null; tsp.frame([["focus", focus]], []); } break;
 			case "theme": void setTheme(input.dark ? "dark" : "light").then(result => { if (!result.success) documentError = result.error ?? "主题切换失败"; redraw(); }); break;
 			case "error": if (input.s === undefined) { documentError = input.msg ?? "Tern 渲染错误"; redraw(); } break;
 			case "ack": case "toggle": break;
