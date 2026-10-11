@@ -103,6 +103,16 @@ Native composer editing 关闭（在设置页点击开关，截图确认已关�
 - `tern split 2 right --cwd /tmp/pb-pane-control --keep-open --json -- python3 /tmp/pb-pane-control/child.py` 退出码 0，在 pane 2 右侧建立新 pane，并在其中运行该命令。
 - `tern focus PaneControlChild --json` 返回 `{"block":17179869185}`，窗口焦点移到新 pane；`tern focus 2 --json` 返回 `{"block":2}`，焦点回到原 pane。
 - 没有 session daemon 的无头窗口中，pane 环境没有 `TERN_PANE`，`tern whoami --json` 以退出码 1 报告 "not inside a Tern pane (TERN_PANE_SOCKET and TERN_PANE are unset)"。
+- 不带 `--keep-open` 时，pane 中的程序以非零退出码结束后 pane 保留：`tern` 的 inspect 报告 `exited:7, keep_open:false, live:true`，pane 显示退出码与"Restart / Close"（`/tmp/pb-panes/`）。子 pane 自己环境中的 `TERN_PANE` 可以直接用于 `tern focus`。
+
+### E1.7 本地选区与全量重绘
+
+条件：`tern 0.7.2 (5d1cc64)`；无头 `tern serve` 加 loopback session daemon；文档服务的 `/tmp` 副本在 PTY 入口与发出的帧处记录原始输入与帧内容（`/tmp/editor-redraw/trace.jsonl`）。
+
+- 点击铅笔后立即发送 `key Meta+a` 与文字：前后两次 `tree .sf-editor` 都没有找到编辑框；程序没有收到任何对应 ⌘A 的字节或事件，随后的文字以普通按键到达，插在光标处（默认在文本末尾），结果是追加而不是替换。编辑框出现后再按 ⌘A，随后的输入以 `edit` 事件 `{from: 0, to: <全文长度>}` 到达，结果是替换。
+- ⌘A 选中全文后，外部程序修改另一个块的 YAML，使文档服务发出 `del main`、`add main`、`focus` 的全量重绘帧；本地选区保留，下一个字符仍以 `{from: 0, to: 5}` 的 `edit` 事件到达。已输入 `ABCDE`、光标在 3 时经历全量重绘，下一个字符得到 `ABCZDE`。
+- 连续输入 190 个字符期间，`done` 勾选引发全量重绘，此时草稿长度为 176，其余 14 个字符在重绘之后到达；Esc 提交并写回完整的 190 个字符。
+- 在真实协调者用 `eval` 的 `agent()` 编排、subagent 工作并不断写时间线的负载下，对一个编排块的正文执行"铅笔、⌘A、输入 776 个字符、Esc"共 67 轮（ecd136d 37 轮、75c52da 30 轮）：67 轮全部在 Esc 之前收到完整文字，提交内容与写回文件一致；没有一轮提交旧正文。其中 2 轮因 ⌘A 先于编辑框出现而得到追加（`/tmp/pb-oldbody/`）。
 
 ## E2 omp
 
