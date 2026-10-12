@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { closeSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { BlockField, BlockId, DocRef, FetchOutcome, PlaybookDoc, RunId } from "../src/domain/model";
+import { fieldText, withField, type BlockField, type BlockId, type DocRef, type FetchOutcome, type PlaybookDoc, type RunId } from "../src/domain/model";
 import type { Connection } from "../src/domain/ports";
 import type { EventPayload, Request } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
@@ -13,10 +13,16 @@ const template: DocRef = { kind: "template" };
 const initial: PlaybookDoc = {
 	title: "Disk integration",
 	blocks: [
-		{ id: "b1", title: "Root", body: "root ((b2))", done: false },
-		{ id: "b2", title: "Source", body: "before", done: false },
-		{ id: "b3", title: "Disposable", body: "third", done: false },
+		{ id: "b1", title: "Root", content: { kind: "task", body: "root ((b2))" }, done: false },
+		{ id: "b2", title: "Source", content: { kind: "task", body: "before" }, done: false },
+		{ id: "b3", title: "Disposable", content: { kind: "task", body: "third" }, done: false },
 	],
+};
+const designInitial: PlaybookDoc = {
+	...initial,
+	blocks: initial.blocks.map(block => block.id === "b2"
+		? { ...block, content: { kind: "design", requirement: "original requirement", design: "## A Original design\n\nDesign content" } }
+		: block),
 };
 // S2 specifies one-second polling/writeback. The extra 150 ms only allows
 // scheduling and observation overhead; it is not a second polling interval.
@@ -130,21 +136,32 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		const next: PlaybookDoc = {
 			title: "External document title",
 			blocks: [
-				{ id: "b4", title: "New first", body: "new content", done: true },
-				{ id: "b2", title: "Changed title", body: "after", done: true },
+				{ id: "b4", title: "New first", content: { kind: "task", body: "new content" }, done: true },
+				{ id: "b2", title: "Changed title", content: { kind: "task", body: "after" }, done: true },
 				initial.blocks[0]!,
 			],
 		};
 		f.externalDoc(ref, next);
-		await eventually(() => JSON.stringify(f.document(ref)) === JSON.stringify(next));
-		expect(await f.request({ op: "read", args: { run } })).toEqual({ ok: true, result: { ...next, run: f.core.view(ref).run } });
+		await eventually(() => Bun.deepEquals(f.document(ref), next));
+		expect(await f.request({ op: "read", args: { run } })).toEqual({
+			ok: true,
+			result: {
+				title: next.title,
+				blocks: [
+					{ id: "b4", kind: "task", title: "New first", body: "new content", done: true },
+					{ id: "b2", kind: "task", title: "Changed title", body: "after", done: true },
+					{ id: "b1", kind: "task", title: "Root", body: "root ((b2))", done: false },
+				],
+				run: f.core.view(ref).run,
+			},
+		});
 		const entries = f.core.view(ref).timeline.filter(entry => entry.origin === "disk");
 		expect(entries.map(entry => entry.data)).toEqual(expect.arrayContaining([
 			expect.objectContaining({ type: "block_edited", block: "b2", field: "title", text: "Changed title" }),
 			expect.objectContaining({ type: "block_edited", block: "b2", field: "body", text: "after" }),
 			{ type: "done_changed", block: "b2", done: true },
-			{ type: "block_added", block: "b4", title: "New first", body: "new content" },
-			{ type: "block_deleted", block: "b3", title: "Disposable", body: "third" },
+			{ type: "block_added", block: "b4", title: "New first", content: { kind: "task", body: "new content" } },
+			{ type: "block_deleted", block: "b3", title: "Disposable", content: { kind: "task", body: "third" } },
 			{ type: "blocks_reordered", order: ["b4", "b2", "b1"] },
 		]));
 		expect(f.store.readRunLog(run).entries.filter(entry => entry.origin === "disk")).toEqual(entries);
@@ -152,16 +169,19 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 	});
 
 	test("a disk body edit bypasses the coordinator lock and notifies the dependent active Launch", async () => {
-		const f = fixture({ ...initial, blocks: initial.blocks.map(block => block.id === "b2" ? { ...block, body: "before ((file:stable.md))" } : block) });
+		const f = fixture({ ...initial, blocks: initial.blocks.map(block => block.id === "b2" ? withField(block, "body", "before ((file:stable.md))")! : block) });
 		await f.hello();
 		const { run, ref } = await f.startRun();
 		expect((await f.request({ op: "launch", args: { run, blocks: ["b1"] } })).ok).toBe(true);
 		const launch = f.block(ref, "b1").launches[0]!.id;
 		expect((await f.request({ op: "bind", args: { launch, agent: "disk-agent" } })).ok).toBe(true);
 		expect((await f.request({ op: "lock", args: { run, block: "b2" } })).ok).toBe(true);
-		f.externalDoc(ref, { ...f.document(ref), blocks: f.document(ref).blocks.map(block => block.id === "b2" ? { ...block, body: "after ((file:stable.md))" } : block) });
-		await eventually(() => f.block(ref, "b2").block.body.startsWith("after"));
-		expect((await f.request({ op: "read", args: { run, block: "b2" } }))).toEqual({ ok: true, result: f.block(ref, "b2").block });
+		f.externalDoc(ref, { ...f.document(ref), blocks: f.document(ref).blocks.map(block => block.id === "b2" ? withField(block, "body", "after ((file:stable.md))")! : block) });
+		await eventually(() => fieldText(f.block(ref, "b2").block, "body")?.startsWith("after") === true);
+		expect((await f.request({ op: "read", args: { run, block: "b2" } }))).toEqual({
+			ok: true,
+			result: { id: "b2", kind: "task", title: "Source", body: "after ((file:stable.md))", done: false },
+		});
 		expect(f.block(ref, "b2").lock.kind).toBe("coordinator");
 		await eventually(() => f.events.some(event => event.event === "block_changed"), 2_200);
 		const event = f.events.find(event => event.event === "block_changed");
@@ -215,18 +235,20 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		}, 6_000);
 	}
 
-	for (const field of ["title", "body"] satisfies BlockField[]) {
+	for (const field of ["title", "body", "requirement"] as const satisfies BlockField[]) {
 		test(`disk change of an edited ${field} shows a notice, preserves the draft and lets commit overwrite disk`, async () => {
-			const f = fixture();
+			const baseline = field === "requirement" ? designInitial : initial;
+			const f = fixture(baseline);
 			const draft = `human ${field} draft`;
 			expect(f.core.pencil(template, "b2", field)).toBeNull();
 			expect(f.core.setDraft(template, "b2", draft)).toBeNull();
-			f.externalDoc(template, { ...initial, blocks: initial.blocks.map(block => block.id === "b2" ? { ...block, [field]: `disk ${field}` } : block) });
-			await eventually(() => f.block(template, "b2").notices.includes("磁盘文件修改了这个字段"));
-			expect(f.block(template, "b2").block[field]).toBe(`disk ${field}`);
+			f.externalDoc(template, { ...baseline, blocks: baseline.blocks.map(block => block.id === "b2" ? withField(block, field, `disk ${field}`)! : block) });
+			await eventually(() => fieldText(f.block(template, "b2").block, field) === `disk ${field}`);
+			expect(f.block(template, "b2").notices.length).toBeGreaterThan(0);
+			expect(fieldText(f.block(template, "b2").block, field)).toBe(`disk ${field}`);
 			expect(f.block(template, "b2").lock).toEqual({ kind: "human", field, draft });
 			expect(f.core.commit(template, "b2")).toBeNull();
-			expect(f.block(template, "b2").block[field]).toBe(draft);
+			expect(fieldText(f.block(template, "b2").block, field)).toBe(draft);
 			expect(f.block(template, "b2").lock).toEqual({ kind: "none" });
 			await eventually(() => readFileSync(f.path, "utf8") === f.store.serialize(f.document(template), null));
 		});
@@ -240,7 +262,7 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		await eventually(() => f.block(template, "b2").block.title === "external title");
 		expect(f.block(template, "b2").notices).toEqual([]);
 		expect(f.block(template, "b2").lock).toEqual({ kind: "human", field: "body", draft: "uncommitted body" });
-		expect(f.block(template, "b2").block.body).toBe("before");
+		expect(fieldText(f.block(template, "b2").block, "body")).toBe("before");
 	});
 
 	test("disk deletion of a human-locked block discards the draft, unlocks and shows a deletion notice", async () => {
@@ -261,7 +283,7 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		f.externalDoc(template, initial);
 		await eventually(() => f.core.view(template).blocks.some(value => value.block.id === "b2"));
 		expect(f.block(template, "b2").lock).toEqual({ kind: "none" });
-		expect(f.block(template, "b2").block.body).toBe("before");
+		expect(fieldText(f.block(template, "b2").block, "body")).toBe("before");
 	});
 
 	test("a document-title-only disk edit invalidates the subscribed view", async () => {
@@ -289,6 +311,122 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		expect(observedErrors).toContain(0);
 	});
 
+	test("disk requirement and design edits merge separately in a Run without replacing a valid prompt draft", async () => {
+		const f = fixture(designInitial);
+		await f.hello();
+		const { run, ref } = await f.startRun();
+		expect(f.core.pencil(ref, "b2", "prompt")).toBeNull();
+		expect(f.core.setDraft(ref, "b2", "Please revise the overview")).toBeNull();
+		const content = { kind: "design", requirement: "disk requirement", design: "## A Disk design\n\nUpdated design" } as const;
+		f.externalDoc(ref, {
+			...designInitial,
+			blocks: designInitial.blocks.map(block => block.id === "b2" ? { ...block, content } : block),
+		});
+		await eventually(() => fieldText(f.block(ref, "b2").block, "design") === content.design);
+		expect(f.block(ref, "b2").block.content).toEqual(content);
+		expect(f.block(ref, "b2").lock).toEqual({ kind: "human", field: "prompt", draft: "Please revise the overview" });
+		expect(f.block(ref, "b2").notices).toEqual([]);
+		const entries = f.core.view(ref).timeline.filter(entry => entry.origin === "disk");
+		expect(entries.map(entry => entry.data)).toEqual([
+			expect.objectContaining({ type: "block_edited", block: "b2", field: "requirement", text: content.requirement }),
+			expect.objectContaining({ type: "block_edited", block: "b2", field: "design", text: content.design }),
+		]);
+		expect(f.store.readRunLog(run).entries.filter(entry => entry.origin === "disk")).toEqual(entries);
+	});
+
+	test("a disk design edit preserves a human requirement draft without a conflict notice", async () => {
+		const f = fixture(designInitial);
+		expect(f.core.pencil(template, "b2", "requirement")).toBeNull();
+		expect(f.core.setDraft(template, "b2", "uncommitted requirement")).toBeNull();
+		f.externalDoc(template, {
+			...designInitial,
+			blocks: designInitial.blocks.map(block => block.id === "b2" ? withField(block, "design", "## A External design")! : block),
+		});
+		await eventually(() => fieldText(f.block(template, "b2").block, "design") === "## A External design");
+		expect(f.block(template, "b2").notices).toEqual([]);
+		expect(f.block(template, "b2").lock).toEqual({ kind: "human", field: "requirement", draft: "uncommitted requirement" });
+		expect(fieldText(f.block(template, "b2").block, "requirement")).toBe("original requirement");
+	});
+
+	for (const pendingField of ["requirement", "design"] as const) {
+		test(`disk merge preserves pending ${pendingField} while applying the other design field`, async () => {
+			const f = fixture(designInitial);
+			const pending = `pending ${pendingField}`;
+			if (pendingField === "requirement") {
+				expect(f.core.pencil(template, "b2", "requirement")).toBeNull();
+				expect(f.core.setDraft(template, "b2", pending)).toBeNull();
+				expect(f.core.commit(template, "b2")).toBeNull();
+			} else {
+				await f.hello();
+				expect((await f.request({ op: "lock", args: { block: "b2" } })).ok).toBe(true);
+				expect((await f.request({ op: "write", args: { block: "b2", text: pending } })).ok).toBe(true);
+			}
+			const diskField = pendingField === "requirement" ? "design" : "requirement";
+			const diskText = `disk ${diskField}`;
+			// Keep the pending field at the last-written value on disk: only the
+			// other field is an external edit, not a whole-content replacement.
+			f.externalDoc(template, {
+				...designInitial,
+				blocks: designInitial.blocks.map(block => block.id === "b2" ? withField(block, diskField, diskText)! : block),
+			});
+			await eventually(() => fieldText(f.block(template, "b2").block, diskField) === diskText);
+			expect(f.block(template, "b2").block.content).toEqual({
+				kind: "design",
+				requirement: pendingField === "requirement" ? pending : diskText,
+				design: pendingField === "design" ? pending : diskText,
+			});
+			expect(f.block(template, "b2").lock.kind).toBe(pendingField === "design" ? "coordinator" : "none");
+			await eventually(() => readFileSync(f.path, "utf8") === f.store.serialize(f.document(template), null));
+		});
+	}
+
+	test("a disk task-to-design switch atomically replaces content, records the Run change and ends a body draft", async () => {
+		const f = fixture();
+		await f.hello();
+		const { run, ref } = await f.startRun();
+		expect(f.core.pencil(ref, "b2", "body")).toBeNull();
+		expect(f.core.setDraft(ref, "b2", "discard this body draft")).toBeNull();
+		const content = { kind: "design", requirement: "new requirement", design: "## A New design" } as const;
+		f.externalDoc(ref, {
+			...initial,
+			blocks: initial.blocks.map(block => block.id === "b2" ? { ...block, content } : block),
+		});
+		await eventually(() => f.block(ref, "b2").block.content.kind === "design");
+		expect(f.block(ref, "b2").block).toEqual({ id: "b2", title: "Source", done: false, content });
+		expect(f.block(ref, "b2").lock).toEqual({ kind: "none" });
+		expect(f.block(ref, "b2").notices.length).toBeGreaterThan(0);
+		expect(f.core.commit(ref, "b2")).not.toBeNull();
+		const entries = f.core.view(ref).timeline.filter(entry => entry.origin === "disk");
+		expect(entries.map(entry => entry.data)).toEqual([{ type: "content_replaced", block: "b2", content }]);
+		expect(f.store.readRunLog(run).entries.filter(entry => entry.origin === "disk")).toEqual(entries);
+		expect(f.core.pencil(ref, "b2", "requirement")).toBeNull();
+		expect(f.block(ref, "b2").lock).toEqual({ kind: "human", field: "requirement", draft: content.requirement });
+	});
+
+	for (const field of ["requirement", "prompt"] as const) {
+		test(`a disk design-to-task switch ends a ${field} draft with a notice`, async () => {
+			const f = fixture(designInitial);
+			await f.hello();
+			const { run, ref } = await f.startRun();
+			expect(f.core.pencil(ref, "b2", field)).toBeNull();
+			expect(f.core.setDraft(ref, "b2", `discard this ${field} draft`)).toBeNull();
+			f.externalDoc(ref, initial);
+			await eventually(() => f.block(ref, "b2").block.content.kind === "task");
+			expect(f.block(ref, "b2").block).toEqual(initial.blocks[1]!);
+			expect(f.block(ref, "b2").lock).toEqual({ kind: "none" });
+			expect(f.block(ref, "b2").notices.length).toBeGreaterThan(0);
+			expect(f.core.commit(ref, "b2")).not.toBeNull();
+			const entries = f.core.view(ref).timeline.filter(entry => entry.origin === "disk");
+			expect(entries.map(entry => entry.data)).toEqual([
+				{ type: "content_replaced", block: "b2", content: { kind: "task", body: "before" } },
+			]);
+			expect(f.store.readRunLog(run).entries.filter(entry => entry.origin === "disk")).toEqual(entries);
+			expect(f.core.revisions(ref, "b2")).toEqual([]);
+			expect(f.core.pencil(ref, "b2", "body")).toBeNull();
+			expect(f.block(ref, "b2").lock).toEqual({ kind: "human", field: "body", draft: "before" });
+		});
+	}
+
 	test("disk comparison with the last write preserves an untouched field's pending human commit", async () => {
 		const f = fixture();
 		expect(f.core.pencil(template, "b2", "body")).toBeNull();
@@ -298,7 +436,7 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 		// body, so it is not a disk body edit under S2's comparison rule.
 		f.externalDoc(template, { ...initial, blocks: initial.blocks.map(block => block.id === "b2" ? { ...block, title: "disk title only" } : block) });
 		await eventually(() => f.block(template, "b2").block.title === "disk title only");
-		expect(f.block(template, "b2").block.body).toBe("newly committed human body");
+		expect(fieldText(f.block(template, "b2").block, "body")).toBe("newly committed human body");
 		await eventually(() => readFileSync(f.path, "utf8") === f.store.serialize(f.document(template), null));
 	});
 });

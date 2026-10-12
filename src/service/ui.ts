@@ -1,27 +1,51 @@
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
+import { prepareSvg } from "@oh-my-pi/pi-tui/chat/svg-source";
+import { svgFigurePalette } from "@oh-my-pi/pi-tui/chat/svg-figure";
 import { describeTableChart, lookupTableChart, setTableCharts, splitTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
 import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
 import { initThemeSync, setTheme } from "@oh-my-pi/pi-tui/theme/theme";
-import type { BlockId, CompileResult, DocRef, EntryData, RecordKind, TimelineEntry } from "../domain/model";
-import { parseRunId } from "../domain/model";
+import type { BlockId, CompileResult, DocRef, EntryData, HumanField, RecordKind, TimelineEntry } from "../domain/model";
+import { fieldText, parseRunId } from "../domain/model";
 import type { BlockView, CoreApi, DocView, RenderStatus } from "../domain/ports";
+import { isOrchestration } from "./core";
+import { renderDraft, type DraftHost } from "./draft/components";
+import type { ChangeView, FileRead } from "./draft/contract";
 import type { FrameOp, TspEvent, TspInput, TspNode, TspSession } from "./tsp-types";
 
 const SURFACE = "playbook";
 const ESC = "\x1b";
-const TYPES: readonly EntryData["type"][] = ["run_started", "run_finished", "block_edited", "block_added", "block_deleted", "blocks_reordered", "done_changed", "launch_created", "agent_bound", "launch_closed", "event_sent", "interrupted", "check_reported", "post", "update_due", "update_snoozed"];
+const TYPES: readonly EntryData["type"][] = ["run_started", "run_finished", "block_edited", "block_added", "block_deleted", "content_replaced", "blocks_reordered", "done_changed", "launch_created", "agent_bound", "launch_closed", "event_sent", "interrupted", "check_reported", "post", "update_due", "update_snoozed"];
+const LABELS: Readonly<Record<HumanField, string>> = { title: "标题", body: "正文", requirement: "需求", prompt: "修改 prompt" };
+const VIEWS: readonly { readonly view: ChangeView; readonly label: string }[] = [{ view: "changes", label: "变更" }, { view: "before", label: "之前" }, { view: "after", label: "之后" }];
+/** SVG user units per terminal column (16 per row on 1:2 cells), as pi-tui sizes its native chart images. */
+const UNITS_PER_COLUMN = 8;
 type Caret = { cursor: number; anchor: number | null };
 type UndoStep = Caret & { text: string };
 type Field = { readonly multiline: boolean; text(): string; write(text: string): string | null };
-type Summary = Pick<RenderStatus, "chartNodes" | "view">;
+type Summary = Pick<RenderStatus, "chartNodes" | "view" | "draftErrors">;
 const text = (id: string, value: string, tone?: string): TspNode => ({ id, k: "text", p: { text: value, ...(tone ? { tone } : {}) } });
 const col = (id: string, c: readonly TspNode[]): TspNode => ({ id, k: "col", p: { gap: "sm" }, c });
 const row = (id: string, c: readonly TspNode[]): TspNode => ({ id, k: "row", p: { gap: "sm", wrap: true }, c });
 const time = (at: number | null): string => at === null ? "无" : new Date(at).toISOString();
 const compileText = (result: CompileResult): string => result.kind === "Ok" ? result.text : JSON.stringify(result.error, null, 2);
-const orchestration = (body: string): boolean => /^\s*```(?:js|py)\s*\n[\s\S]*\n```\s*$/.test(body);
+
+/** Read a file a design draft names: relative to the Playbook directory, and only inside it. */
+function readDraftFile(baseDir: string, path: string): FileRead {
+	try {
+		const base = realpathSync(baseDir);
+		const target = realpathSync(resolve(base, path));
+		const inside = relative(base, target);
+		if (inside.startsWith("..") || isAbsolute(inside)) return { ok: false, error: `只能引用 Playbook 目录内的文件：${path}` };
+		return { ok: true, bytes: new Uint8Array(readFileSync(target)), path: target };
+	} catch (error) {
+		return { ok: false, error: `无法读取 ${path}：${error instanceof Error ? error.message : String(error)}` };
+	}
+}
 
 /** K4 front end. Core owns every document, lock and draft; local state is only interaction state. */
-export function startUi(core: CoreApi, tsp: TspSession): void {
+export function startUi(core: CoreApi, tsp: TspSession, baseDir: string): void {
 	initThemeSync();
 	setTableCharts("always");
 	let ref: DocRef = { kind: "template" };
@@ -50,6 +74,49 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 	const changes = new Map<string, (event: Extract<TspEvent, { ev: "change" }>) => void>();
 	const fields = new Map<string, Field>();
 	const info = new Map<string, string>();
+	/** View of each marked draft component, by `<block>.<component key>`; UI state only. */
+	const views = new Map<string, ChangeView>();
+	const sentBlobs = new Set<string>();
+
+	function imageNode(id: string, bytes: Uint8Array, mime: string, alt: string, size?: { readonly w: number; readonly h: number }): TspNode {
+		const blob = createHash("sha256").update(bytes).digest("hex");
+		if (!sentBlobs.has(blob)) { tsp.blob(blob, mime, bytes); sentBlobs.add(blob); }
+		return { id, k: "image", p: { blob, alt, ...(size ? { w: size.w, h: size.h, max: { w: `${Math.max(1, Math.round(size.w / UNITS_PER_COLUMN))}ch` } } : {}) } };
+	}
+	function draftHost(block: BlockId): DraftHost {
+		return {
+			id: `${block}.design.view`,
+			context: {
+				// Resolved per draw, so a theme change redraws figures in the new palette.
+				svg: (id, svg, size, alt) => imageNode(id, new TextEncoder().encode(prepareSvg(svg, svgFigurePalette())), "image/svg+xml", alt, size),
+				image: (id, bytes, mime, alt) => imageNode(id, bytes, mime, alt),
+				readFile: path => readDraftFile(baseDir, path),
+			},
+			view: key => views.get(`${block}.${key}`) ?? "changes",
+			viewSwitch: (id, key, current) => row(id, VIEWS.map(option => check(`${id}.${option.view}`, option.label, current === option.view, false, checked => { if (checked) { views.set(`${block}.${key}`, option.view); redraw(); } }, id, option.view))),
+		};
+	}
+	function startDraft(block: BlockId, name: HumanField): void {
+		const error = core.pencil(ref, block, name);
+		if (error) return showError(error);
+		focus = `${block}.${name}`; committed = null;
+		carets.delete(focus); undo.delete(focus); notices.delete(focus);
+		redraw();
+	}
+	function draftField(block: BlockId, name: HumanField): TspNode {
+		return field(`${block}.${name}`, { multiline: name !== "title", text: () => {
+			const item = core.view(ref).blocks.find(candidate => candidate.block.id === block);
+			const lock = item?.lock;
+			if (lock?.kind === "human" && lock.field === name) return lock.draft;
+			return name === "prompt" || !item ? "" : fieldText(item.block, name) ?? "";
+		}, write: draft => core.setDraft(ref, block, draft) }, name === "prompt" ? "写给协调者的修改要求：哪里、改成什么" : `${block} ${LABELS[name]}`);
+	}
+	function submitPrompt(block: BlockId): void {
+		const error = core.commit(ref, block);
+		if (error) return showError(error);
+		focus = null;
+		redraw();
+	}
 
 	function showError(error: string | null): void { if (error) { documentError = error; redraw(); } }
 	function button(id: string, label: string, action: () => void, disabled = false): TspNode {
@@ -106,24 +173,35 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 		const unlocked = item.lock.kind === "none";
 		const canEdit = unlocked && !hasDraft && !finished;
 		const targets = selectedBlocks(view, block.id);
-		const mixed = targets.length > 1 && view.blocks.some(other => targets.includes(other.block.id) && orchestration(other.block.body));
+		const mixed = targets.length > 1 && view.blocks.some(other => targets.includes(other.block.id) && isOrchestration(other.block.content));
+		const designSelected = view.blocks.some(other => targets.includes(other.block.id) && other.block.content.kind === "design");
 		const c: TspNode[] = [row(`${prefix}.state`, [check(`${prefix}.selected`, "选择", selected.has(block.id), false, checked => { if (checked) selected.add(block.id); else selected.delete(block.id); redraw(); }), check(`${prefix}.done`, "done", block.done, !unlocked || finished, done => { showError(core.setDone(ref, block.id, done)); }), text(`${prefix}.lock`, item.lock.kind === "coordinator" ? "协调者正在编辑" : item.lock.kind === "human" ? "人正在编辑" : "块锁：无"), ...(item.lock.kind === "coordinator" ? [button(`${prefix}.interrupt`, "打断", () => showError(core.interrupt(ref, block.id)), finished)] : [])])];
-		for (const name of ["title", "body"] as const) {
+		const editable: readonly ("title" | "body" | "requirement")[] = block.content.kind === "task" ? ["title", "body"] : ["title", "requirement"];
+		for (const name of editable) {
 			const editing = item.lock.kind === "human" && item.lock.field === name;
-			c.push(row(`${prefix}.${name}.controls`, [text(`${prefix}.${name}.label`, name === "title" ? "标题" : "正文"), editing ? button(`${prefix}.${name}.commit`, "完成", () => commit(block.id)) : button(`${prefix}.${name}.pencil`, "铅笔", () => {
-				const error = core.pencil(ref, block.id, name);
-				if (error) return showError(error);
-				focus = `${prefix}.${name}`; committed = null;
-				carets.delete(focus); undo.delete(focus); notices.delete(focus);
-				redraw();
-			}, !canEdit)]));
-			if (editing) c.push(field(`${prefix}.${name}`, { multiline: name === "body", text: () => {
-				const current = core.view(ref).blocks.find(candidate => candidate.block.id === block.id)?.lock;
-				return current?.kind === "human" && current.field === name ? current.draft : block[name];
-			}, write: draft => core.setDraft(ref, block.id, draft) }, `${block.id} ${name}`));
-			else c.push(...(name === "body" ? rendered(`${prefix}.body.view`, block.body) : [{ id: `${prefix}.title.view`, k: "md", p: { text: block.title } }]));
+			c.push(row(`${prefix}.${name}.controls`, [text(`${prefix}.${name}.label`, LABELS[name]), editing ? button(`${prefix}.${name}.commit`, "完成", () => commit(block.id)) : button(`${prefix}.${name}.pencil`, "铅笔", () => startDraft(block.id, name), !canEdit)]));
+			if (editing) c.push(draftField(block.id, name));
+			else if (name === "title") c.push({ id: `${prefix}.title.view`, k: "md", p: { text: block.title } });
+			else if (name === "body" && block.content.kind === "task") c.push(...rendered(`${prefix}.body.view`, block.content.body));
+			else if (name === "requirement" && block.content.kind === "design") c.push(block.content.requirement.trim() ? { id: `${prefix}.requirement.view`, k: "md", p: { text: block.content.requirement } } : text(`${prefix}.requirement.empty`, "（还没有写需求）", "muted"));
 			const notice = notices.get(`${prefix}.${name}`);
 			if (notice) c.push(text(`${prefix}.${name}.notice`, notice, "warning"));
+		}
+		let draftErrors = 0;
+		if (block.content.kind === "design") {
+			const drawn = renderDraft(block.content.design, draftHost(block.id));
+			draftErrors = drawn.diagnostics.filter(found => found.severity === "error").length;
+			c.push(section(`${prefix}.design`, "设计（由协调者按修改 prompt 修订）", block.content.design.trim() ? [...drawn.nodes] : [text(`${prefix}.design.empty`, "（协调者还没有写设计）", "muted")]));
+			if (drawn.diagnostics.length) c.push(section(`${prefix}.diagnostics`, `稿件问题 ${drawn.diagnostics.length}`, drawn.diagnostics.map((found, index) => text(`${prefix}.diagnostic.${index}`, `第 ${found.line} 行 · ${found.component} · ${found.message}`, found.severity === "error" ? "error" : "warning"))));
+			const writing = item.lock.kind === "human" && item.lock.field === "prompt";
+			c.push(row(`${prefix}.prompt.controls`, writing
+				? [text(`${prefix}.prompt.label`, "修改 prompt"), button(`${prefix}.prompt.submit`, "提交修改", () => submitPrompt(block.id)), button(`${prefix}.prompt.discard`, "放弃", () => { focus = null; showError(core.discard(ref, block.id)); redraw(); })]
+				: [button(`${prefix}.prompt.pencil`, "写修改 prompt", () => startDraft(block.id, "prompt"), !canEdit)]));
+			if (writing) c.push(draftField(block.id, "prompt"));
+			const notice = notices.get(`${prefix}.prompt`);
+			if (notice) c.push(text(`${prefix}.prompt.notice`, notice, "warning"));
+			const history = core.revisions(ref, block.id);
+			c.push({ ...section(`${prefix}.revisions`, `修改记录 ${history.length}`, history.length ? history.map(revision => col(`${prefix}.revision.${revision.seq}`, [text(`${prefix}.revision.${revision.seq}.meta`, `#${revision.seq} ${time(revision.at)}`, "muted"), { id: `${prefix}.revision.${revision.seq}.text`, k: "md", p: { text: revision.prompt } }])) : [text(`${prefix}.revisions.empty`, "没有修改记录", "muted")]), p: { head: `修改记录 ${history.length}`, key: `${prefix}.revisions`, collapsible: true, collapsed: true } });
 		}
 		item.references.forEach((reference, index) => {
 			const id = `${prefix}.reference.${index}`;
@@ -131,8 +209,9 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 			const head = row(`${id}.head`, [text(`${id}.label`, reference.reference.text + suffix), ...(reference.external ? [button(`${id}.refetch`, "重新取回", () => { void core.refetch(ref, reference.reference.targetText).then(showError); })] : [])]);
 			c.push(section(id, head, reference.expansion ? [{ id: `${id}.expansion`, k: "md", p: { text: compileText(reference.expansion) } }] : [text(`${id}.pending`, "取回中")], `${index}:${reference.reference.text}`));
 		});
-		c.push(row(`${prefix}.actions`, [button(`${prefix}.insert`, "新建", () => showError(core.insertBlock(ref, block.id)), !unlocked || finished), button(`${prefix}.delete`, "删除", () => showError(core.deleteBlock(ref, block.id)), !unlocked || finished), ...(view.run ? [button(`${prefix}.launch`, "启动", () => { if (view.run) showError(core.requestLaunch(view.run.id, targets)); }, finished || mixed)] : []), button(`${prefix}.check`, "检查", () => showError(core.requestCheck(ref, targets))), button(`${prefix}.preview`, "预览", () => { void core.preview(ref, targets).then(result => { previews.set(prefix, result); redraw(); }); })]));
+		c.push(row(`${prefix}.actions`, [button(`${prefix}.insert`, "新建执行块", () => showError(core.insertBlock(ref, block.id, "task")), !unlocked || finished), button(`${prefix}.insert-design`, "新建设计块", () => showError(core.insertBlock(ref, block.id, "design")), !unlocked || finished), button(`${prefix}.delete`, "删除", () => showError(core.deleteBlock(ref, block.id)), !unlocked || finished), ...(view.run ? [button(`${prefix}.launch`, "启动", () => { if (view.run) showError(core.requestLaunch(view.run.id, targets)); }, finished || mixed || designSelected)] : []), button(`${prefix}.check`, "检查", () => showError(core.requestCheck(ref, targets))), button(`${prefix}.preview`, "预览", () => { void core.preview(ref, targets).then(result => { previews.set(prefix, result); redraw(); }); })]));
 		if (view.run && mixed) c.push(text(`${prefix}.mixed`, "编排块只能单独启动", "warning"));
+		if (view.run && designSelected) c.push(text(`${prefix}.design-launch`, "设计块不能直接启动：在执行块中引用它", "warning"));
 		if (view.run) c.push(section(`${prefix}.launches`, "Launch", item.launches.map(launch => row(`${prefix}.launch.${launch.id}`, [text(`${prefix}.launch.${launch.id}.detail`, `${launch.id} · ${launch.active ? "活跃" : `不活跃 · 会话 ${launch.session}`} · agents: ${launch.agents.join(", ") || "无"}`), button(`${prefix}.launch.${launch.id}.close`, "关闭", () => showError(core.closeLaunch(launch.id)))]))));
 		if (item.latestRecord) c.push(section(`${prefix}.latest`, "最近记录", [record(`${prefix}.latest.entry`, item.latestRecord)]));
 		const findingNodes = item.findings ? Object.entries(item.findings).map(([name, failed]) => text(`${prefix}.finding.${name}`, `${name}: ${failed ? "不通过" : "通过"}`, failed ? "error" : "success")) : [text(`${prefix}.finding.pending`, "未判定")];
@@ -145,9 +224,11 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 		let chartNodes = 0;
 		function collect(node: TspNode): void { if (node.k === "md" && typeof node.p?.text === "string") md.push(node.p.text); if (node.k === "image") { chartNodes++; if (typeof node.p?.alt === "string") images.push(node.p.alt); } node.c?.forEach(collect); }
 		c.forEach(collect);
+		// Only task bodies hold chartable tables; a design's images are its own drawings.
+		if (block.content.kind === "design") chartNodes = 0;
 		if (item.lock.kind === "human" && item.lock.field === "body") chartNodes = summaries.get(block.id)?.chartNodes ?? 0;
-		summaries.set(block.id, { chartNodes, view: { md, images } });
-		return { id: `${prefix}.card`, k: "card", p: { head: block.id }, c };
+		summaries.set(block.id, { chartNodes, view: { md, images }, draftErrors });
+		return { id: `${prefix}.card`, k: "card", p: { head: `${block.id} · ${block.content.kind === "task" ? "执行块" : "设计块"}` }, c };
 	}
 	function commit(block: BlockId): void {
 		const lock = core.view(ref).blocks.find(item => item.block.id === block)?.lock;
@@ -178,7 +259,7 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 		}
 		const hasDraft = [core.view({ kind: "template" }), ...runs.map(run => core.view({ kind: "run", run: run.id }))].some(doc => doc.blocks.some(item => item.lock.kind === "human"));
 		c.push(...view.blocks.map(item => blockCard(view, item, hasDraft)));
-		if (!view.blocks.length) c.push(button("block.insert", "新建", () => showError(core.insertBlock(ref, null)), view.run?.status === "finished"));
+		if (!view.blocks.length) c.push(row("block.insert", [button("block.insert.task", "新建执行块", () => showError(core.insertBlock(ref, null, "task")), view.run?.status === "finished"), button("block.insert.design", "新建设计块", () => showError(core.insertBlock(ref, null, "design")), view.run?.status === "finished")]));
 		if (view.run) {
 			const run = view.run;
 			if (!postKindChosen) postKind = run.status === "finished" && !view.retrospective ? "retrospective" : "update";
@@ -277,8 +358,9 @@ export function startUi(core: CoreApi, tsp: TspSession): void {
 			bytes = code === 13 ? "\r" : String.fromCodePoint(code);
 		}
 		if (bytes === ESC || bytes === "\x1b[27u") {
+			// Esc finishes a field edit; a change request is only sent by its button.
 			const editing = core.view(ref).blocks.find(item => item.lock.kind === "human");
-			if (editing) commit(editing.block.id);
+			if (editing && !(editing.lock.kind === "human" && editing.lock.field === "prompt")) commit(editing.block.id);
 			return;
 		}
 		const value = focus === null ? undefined : fields.get(focus);

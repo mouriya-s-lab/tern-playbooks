@@ -4,7 +4,7 @@
 //   tern-playbook --reveal <playbook.yaml>  show the running service's pane; exit 4 when none runs
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { socketPath } from "../domain/protocol";
 import { checks } from "./checks";
 import { Core } from "./core";
@@ -56,7 +56,7 @@ try {
 	process.stderr.write(`这个 Playbook 的文档服务已在运行：${templatePath}\n${outcome.kind === "failed" ? `${outcome.message}\n` : ""}`);
 	process.exit(3);
 }
-startUi(core, createTspSession());
+startUi(core, createTspSession(), dirname(templatePath));
 
 const shutdown = (): void => {
 	core.stop();

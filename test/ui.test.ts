@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { startUi } from "../src/service/ui";
-import type { BlockField, BlockId, CompileResult, DocRef, Launch, LaunchId, RecordKind, RunId } from "../src/domain/model";
+import { fieldText, withField, type BlockContent, type BlockId, type CompileResult, type DocRef, type HumanField, type Launch, type LaunchId, type RecordKind, type Revision, type RunId } from "../src/domain/model";
 import type { BlockView, CoreApi, DocView, RenderStatus } from "../src/domain/ports";
 import type { RunSummary } from "../src/domain/protocol";
 import type { FrameOp, FrameStatus, TspEvent, TspInput, TspNode, TspSession } from "../src/service/tsp-types";
@@ -9,13 +9,22 @@ const template: DocRef = { kind: "template" };
 const runRef: DocRef = { kind: "run", run: "r1" };
 const body = "## Work\n\n| Phase | ms |\n|---|---|\n| Compile | 12 |\n| Fetch | 340 |\n| Launch | 85 |\n| Write | 9 |\n\n((file:context.md))";
 function item(id: BlockId = "b1", value = body): BlockView {
-	return { block: { id, title: "Task", body: value, done: false }, lock: { kind: "none" }, references: [{ key: "reference", reference: { text: "((file:context.md))", targetText: "file:context.md", expressionText: null, offset: value.indexOf("((") }, external: true, status: "ready", fetchedAt: 1000, fetchFailed: false, expansion: { kind: "Ok", text: '<external source="file:context.md" fetched="1970-01-01T00:00:01.000Z">\nContext\n</external>', sources: [] } }], launches: [{ id: "l1", active: false, session: "session-a", agents: ["agent-a"] }], latestRecord: null, findings: { compile: false, empty_expansion: false, render_error: false, render_pending: false, chart: false }, report: { version: "v1", result: { kind: "answers", answers: { missing: 0.75 } } }, notices: ["卡片通知"] };
+	return { block: { id, title: "Task", content: { kind: "task", body: value }, done: false }, lock: { kind: "none" }, references: [{ key: "reference", reference: { text: "((file:context.md))", targetText: "file:context.md", expressionText: null, offset: value.indexOf("((") }, external: true, status: "ready", fetchedAt: 1000, fetchFailed: false, expansion: { kind: "Ok", text: '<external source="file:context.md" fetched="1970-01-01T00:00:01.000Z">\nContext\n</external>', sources: [] } }], launches: [{ id: "l1", active: false, session: "session-a", agents: ["agent-a"] }], latestRecord: null, findings: { compile: false, empty_expansion: false, render_error: false, render_pending: false, chart: false, draft: false }, report: { version: "v1", result: { kind: "answers", answers: { missing: 0.75 } } }, notices: ["卡片通知"] };
+}
+const design = "## A Storage\n\n```kv\nOwner: Platform\n```\n\n```callout info Review\nKeep writes atomic.\n```\n\n| Layer | Status |\n| --- | --- |\n| Journal | ok Durable |\n";
+const requirement = "Keep submitted changes durable.";
+function designItem(id: BlockId = "b1", draft = design): BlockView {
+	return { ...item(id), block: { id, title: "Storage design", done: false, content: { kind: "design", requirement, design: draft } }, references: [], launches: [], report: null, notices: [] };
+}
+function descendants(node: TspNode): TspNode[] {
+	return [node, ...(node.c ?? []).flatMap(descendants)];
 }
 class FakeCore implements CoreApi {
 	calls: { method: string; args: readonly unknown[] }[] = [];
 	listener: (ref: DocRef | null) => void = () => {};
 	connected = false;
 	statuses: { ref: DocRef; block: BlockId; status: RenderStatus }[] = [];
+	history: readonly Revision[] = [];
 	template: DocView = { ref: template, title: "Playbook", run: null, blocks: [item(), item("b2", "Other")], timeline: [], lastUpdateAt: null, retrospective: false, errors: [] };
 	run: DocView = { ref: runRef, title: "Playbook", run: { id: "r1", name: "Incident", status: "running", startedAt: 1000, finishedAt: null, updateEvery: 60, updateDue: 2000 }, blocks: [item(), item("b2", "Other")], timeline: [{ seq: 1, at: 1000, origin: "coordinator", data: { type: "launch_created", launch: "l1", kind: "prompt", blocks: ["b1"] } }, { seq: 2, at: 2000, origin: "human", data: { type: "post", kind: "result", text: "Finished work", block: "b1", launch: "l1", quote: "message-a", session: "session-a" } }], lastUpdateAt: 1500, retrospective: false, errors: [] };
 	call(method: string, ...args: readonly unknown[]): null { this.calls.push({ method, args }); return null; }
@@ -26,16 +35,27 @@ class FakeCore implements CoreApi {
 	errors(): readonly string[] { return []; }
 	onChange(listener: (ref: DocRef | null) => void) { this.listener = listener; return () => {}; }
 	setRenderStatus(ref: DocRef, block: BlockId, status: RenderStatus): void { this.statuses.push({ ref, block, status }); }
+	revisions(ref: DocRef, block: BlockId): readonly Revision[] { this.call("revisions", ref, block); return this.history.filter(revision => revision.block === block); }
 	change(ref: DocRef, block: BlockId, transform: (value: BlockView) => BlockView): void {
 		const next = { ...this.view(ref), blocks: this.view(ref).blocks.map(value => value.block.id === block ? transform(value) : value) };
 		if (ref.kind === "template") this.template = next; else this.run = next;
 	}
-	pencil(ref: DocRef, block: BlockId, field: BlockField) { this.call("pencil", ref, block, field); this.change(ref, block, value => ({ ...value, lock: { kind: "human", field, draft: value.block[field] } })); this.listener(ref); return null; }
+	pencil(ref: DocRef, block: BlockId, field: HumanField) { this.call("pencil", ref, block, field); this.change(ref, block, value => ({ ...value, lock: { kind: "human", field, draft: field === "prompt" ? "" : fieldText(value.block, field) ?? "" } })); this.listener(ref); return null; }
 	setDraft(ref: DocRef, block: BlockId, text: string) { this.call("setDraft", ref, block, text); this.change(ref, block, value => value.lock.kind === "human" ? { ...value, lock: { ...value.lock, draft: text } } : value); return null; }
-	commit(ref: DocRef, block: BlockId) { this.call("commit", ref, block); this.change(ref, block, value => value.lock.kind === "human" ? { ...value, block: { ...value.block, [value.lock.field]: value.lock.draft }, lock: { kind: "none" } } : value); this.listener(ref); return null; }
+	commit(ref: DocRef, block: BlockId) {
+		this.call("commit", ref, block);
+		this.change(ref, block, value => {
+			if (value.lock.kind !== "human") return value;
+			const updated = value.lock.field === "prompt" ? value.block : withField(value.block, value.lock.field, value.lock.draft);
+			if (!updated) throw new Error("Draft field does not belong to block");
+			return { ...value, block: updated, lock: { kind: "none" } };
+		});
+		this.listener(ref); return null;
+	}
+	discard(ref: DocRef, block: BlockId) { this.call("discard", ref, block); this.change(ref, block, value => ({ ...value, lock: { kind: "none" } })); this.listener(ref); return null; }
 	interrupt(ref: DocRef, block: BlockId) { return this.call("interrupt", ref, block); }
 	setDone(ref: DocRef, block: BlockId, done: boolean) { return this.call("setDone", ref, block, done); }
-	insertBlock(ref: DocRef, after: BlockId | null) { return this.call("insertBlock", ref, after); }
+	insertBlock(ref: DocRef, after: BlockId | null, kind: BlockContent["kind"]) { return this.call("insertBlock", ref, after, kind); }
 	deleteBlock(ref: DocRef, block: BlockId) { return this.call("deleteBlock", ref, block); }
 	requestLaunch(run: RunId, blocks: readonly BlockId[]) { return this.call("requestLaunch", run, blocks); }
 	requestCheck(ref: DocRef, blocks: readonly BlockId[]) { return this.call("requestCheck", ref, blocks); }
@@ -75,8 +95,8 @@ class FakeTsp implements TspSession {
 		const node = this.root && find(this.root); if (!node) throw new Error(`Missing ${id}`); return node;
 	}
 }
-async function fixture(): Promise<{ core: FakeCore; tsp: FakeTsp }> {
-	const core = new FakeCore(), tsp = new FakeTsp(); startUi(core, tsp);
+async function fixture(core = new FakeCore()): Promise<{ core: FakeCore; tsp: FakeTsp }> {
+	const tsp = new FakeTsp(); startUi(core, tsp, process.cwd());
 	const ready = tsp.nextFrame(); tsp.input({ kind: "hello", dark: true }); await ready;
 	expect(tsp.root).not.toBeNull(); return { core, tsp };
 }
@@ -141,8 +161,8 @@ describe("K4 form UI", () => {
 		tsp.click("b2.interrupt"); expect(core.calls.at(-1)).toEqual({ method: "interrupt", args: [template, "b2"] }); expect(tsp.node("b2.delete").p?.actions).toBeUndefined();
 	});
 	test("all card actions route to Core with selected blocks in document order", async () => {
-		const { core, tsp } = await fixture(); tsp.event({ ev: "change", id: "b1.done", checked: true }); tsp.click("b1.insert"); tsp.click("b1.delete"); tsp.click("b1.reference.0.refetch"); tsp.click("b1.preview"); await tick();
-		expect(core.calls).toEqual([{ method: "setDone", args: [template, "b1", true] }, { method: "insertBlock", args: [template, "b1"] }, { method: "deleteBlock", args: [template, "b1"] }, { method: "refetch", args: [template, "file:context.md"] }, { method: "preview", args: [template, ["b1"]] }]); expect(tsp.node("b1.compiled.text").p?.text).toBe("Compiled text"); expect(tsp.node("b1.compiled.length").p?.text).toBe("13 字符");
+		const { core, tsp } = await fixture(); tsp.event({ ev: "change", id: "b1.done", checked: true }); tsp.click("b1.insert"); tsp.click("b1.insert-design"); tsp.click("b1.delete"); tsp.click("b1.reference.0.refetch"); tsp.click("b1.preview"); await tick();
+		expect(core.calls).toEqual([{ method: "setDone", args: [template, "b1", true] }, { method: "insertBlock", args: [template, "b1", "task"] }, { method: "insertBlock", args: [template, "b1", "design"] }, { method: "deleteBlock", args: [template, "b1"] }, { method: "refetch", args: [template, "file:context.md"] }, { method: "preview", args: [template, ["b1"]] }]); expect(tsp.node("b1.compiled.text").p?.text).toBe("Compiled text"); expect(tsp.node("b1.compiled.length").p?.text).toBe("13 字符");
 		tsp.event({ ev: "other", body: { ev: "select", id: "tabs", item: "r1" } });
 		tsp.event({ ev: "change", id: "b2.selected", checked: true }); tsp.event({ ev: "change", id: "b1.selected", checked: true }); tsp.click("b2.launch"); tsp.click("b2.check"); tsp.click("b1.launch.l1.close");
 		expect(core.calls.slice(-3)).toEqual([{ method: "requestLaunch", args: ["r1", ["b1", "b2"]] }, { method: "requestCheck", args: [runRef, ["b1", "b2"]] }, { method: "closeLaunch", args: ["l1"] }]);
@@ -174,5 +194,129 @@ describe("K4 form UI", () => {
 		const themed = tsp.nextFrame(); tsp.event({ ev: "theme", dark: false }); await themed;
 		expect(tsp.order.filter(value => value.startsWith("blob:")).at(-1)).not.toBe(beforeTheme);
 		tsp.event({ ev: "error", msg: "Rejected SVG" }); expect(tsp.node("error.0").p?.text).toBe("Rejected SVG");
+	});
+	test("design cards render real components and a Markdown table, with only the requirement human-editable", async () => {
+		const core = new FakeCore();
+		core.template = { ...core.template, blocks: [designItem()] };
+		const { tsp } = await fixture(core);
+		expect(tsp.node("b1.requirement.view")).toMatchObject({ k: "md", p: { text: requirement } });
+		expect(tsp.node("b1.requirement.pencil").p?.actions).toEqual({ click: "invoke" });
+		expect(() => tsp.node("b1.design.pencil")).toThrow();
+		expect(() => tsp.node("b1.body.pencil")).toThrow();
+		const nodes = descendants(tsp.node("b1.design"));
+		expect(nodes.find(node => node.k === "kv")?.p).toMatchObject({ items: [{ k: "Owner", v: [{ t: "Platform" }] }] });
+		expect(nodes.find(node => node.k === "card" && node.p?.head === "Review")).toBeDefined();
+		expect(nodes.find(node => node.k === "md" && node.p?.text === "Keep writes atomic.")).toBeDefined();
+		const table = nodes.find(node => node.k === "table");
+		expect(table).toBeDefined();
+		expect(JSON.stringify(table?.p)).toContain("Journal");
+		expect(JSON.stringify(table?.p)).toContain("Durable");
+		expect(core.statuses.at(-1)?.status).toMatchObject({ draftErrors: 0, chartNodes: 0 });
+
+		tsp.click("b1.requirement.pencil"); await tick();
+		expect(core.calls).toContainEqual({ method: "pencil", args: [template, "b1", "requirement"] });
+		expect(tsp.node("b1.requirement")).toMatchObject({ k: "editor", p: { text: requirement } });
+		tsp.keys(" Also retain history.");
+		tsp.click("b1.requirement.commit"); await tick();
+		expect(core.calls.filter(call => call.method !== "revisions")).toEqual([
+			{ method: "pencil", args: [template, "b1", "requirement"] },
+			{ method: "setDraft", args: [template, "b1", `${requirement} Also retain history.`] },
+			{ method: "commit", args: [template, "b1"] },
+		]);
+		expect(core.template.blocks[0]?.block.content).toEqual({ kind: "design", requirement: `${requirement} Also retain history.`, design });
+		expect(tsp.node("b1.requirement.view").p?.text).toBe(`${requirement} Also retain history.`);
+	});
+	test("an unclosed design fence shows line diagnostics and reports draftErrors through render status", async () => {
+		const core = new FakeCore();
+		core.template = { ...core.template, blocks: [designItem("b1", "## A Broken\n\n```callout info Review\nKeep writes atomic.")] };
+		const { tsp } = await fixture(core);
+		expect(tsp.node("b1.diagnostics").k).toBe("section");
+		expect(tsp.node("b1.diagnostic.0").p?.tone).toBe("error");
+		expect(tsp.node("b1.diagnostic.0").p?.text).toContain("第 3 行");
+		expect(tsp.node("b1.diagnostic.0").p?.text).toContain("draft");
+		expect(core.statuses.at(-1)).toMatchObject({ ref: template, block: "b1", status: { draftErrors: 1, chartNodes: 0 } });
+		tsp.facts = { blockError: false, documentError: false, pendingOverdue: true };
+		tsp.statusListener(["b1"]);
+		expect(core.statuses.at(-1)?.status).toMatchObject({ draftErrors: 1, pendingOverdue: true });
+		core.change(template, "b1", () => designItem());
+		core.listener(template); await tick();
+		expect(() => tsp.node("b1.diagnostics")).toThrow();
+		expect(core.statuses.at(-1)?.status.draftErrors).toBe(0);
+	});
+	test.each(["submit", "discard"] as const)("prompt %s is an explicit Core action, never a direct design edit", async action => {
+		const core = new FakeCore();
+		core.connected = true;
+		core.template = { ...core.template, blocks: [designItem()] };
+		const { tsp } = await fixture(core);
+		expect(tsp.node("b1.prompt.pencil").p?.text).toBe("写修改 prompt");
+		tsp.click("b1.prompt.pencil"); await tick();
+		expect(tsp.node("b1.prompt")).toMatchObject({ k: "editor", p: { text: "" } });
+		expect(tsp.node("b1.prompt.submit").p?.text).toBe("提交修改");
+		expect(tsp.node("b1.prompt.discard").p?.text).toBe("放弃");
+		tsp.keys("Explain failure recovery.");
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "human", field: "prompt", draft: "Explain failure recovery." });
+		tsp.click(`b1.prompt.${action}`); await tick();
+		expect(core.calls.filter(call => call.method !== "revisions")).toEqual([
+			{ method: "pencil", args: [template, "b1", "prompt"] },
+			{ method: "setDraft", args: [template, "b1", "Explain failure recovery."] },
+			{ method: action === "submit" ? "commit" : "discard", args: [template, "b1"] },
+		]);
+		expect(core.template.blocks[0]?.block.content).toEqual({ kind: "design", requirement, design });
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "none" });
+		expect(() => tsp.node("b1.prompt")).toThrow();
+		expect(tsp.node("b1.prompt.pencil").p?.actions).toEqual({ click: "invoke" });
+	});
+	test("Esc retains a prompt draft and does not submit or discard it", async () => {
+		const core = new FakeCore();
+		core.template = { ...core.template, blocks: [designItem()] };
+		const { tsp } = await fixture(core);
+		tsp.click("b1.prompt.pencil"); await tick();
+		tsp.keys("Keep this request");
+		tsp.keys("\x1b"); tsp.keys("\x1b[27u"); await tick();
+		expect(core.calls.filter(call => call.method !== "revisions")).toEqual([
+			{ method: "pencil", args: [template, "b1", "prompt"] },
+			{ method: "setDraft", args: [template, "b1", "Keep this request"] },
+		]);
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "human", field: "prompt", draft: "Keep this request" });
+		expect(tsp.node("b1.prompt").k).toBe("editor");
+		tsp.keys(" for review.");
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "human", field: "prompt", draft: "Keep this request for review." });
+	});
+	test("revision history is fetched from Core and listed in a collapsed section", async () => {
+		const core = new FakeCore();
+		core.run = { ...core.run, blocks: [designItem()] };
+		core.history = [
+			{ seq: 2, at: 1000, block: "b1", prompt: "Include recovery steps." },
+			{ seq: 4, at: 2000, block: "b1", prompt: "Explain retention." },
+			{ seq: 5, at: 3000, block: "b2", prompt: "Different block." },
+		];
+		const { tsp } = await fixture(core);
+		tsp.click("run.r1.open");
+		expect(core.calls).toContainEqual({ method: "revisions", args: [runRef, "b1"] });
+		expect(tsp.node("b1.revisions")).toMatchObject({ k: "section", p: { collapsed: true, collapsible: true } });
+		expect(tsp.node("b1.revision.2.text")).toMatchObject({ k: "md", p: { text: "Include recovery steps." } });
+		expect(tsp.node("b1.revision.4.text").p?.text).toBe("Explain retention.");
+		expect(tsp.node("b1.revision.2.meta").p?.text).toContain("#2");
+		expect(tsp.node("b1.revision.4.meta").p?.text).toContain("1970-01-01T00:00:02.000Z");
+		expect(descendants(tsp.node("b1.revisions")).filter(node => node.k === "md").map(node => node.p?.text)).toEqual(["Include recovery steps.", "Explain retention."]);
+		expect(() => tsp.node("b1.revision.5.text")).toThrow();
+	});
+	test("a selected design block disables launches even from a task card", async () => {
+		const core = new FakeCore();
+		core.run = { ...core.run, blocks: [item(), designItem("b2")] };
+		const { tsp } = await fixture(core);
+		tsp.click("run.r1.open");
+		expect(tsp.node("b1.launch").p?.actions).toEqual({ click: "invoke" });
+		expect(tsp.node("b2.launch").p?.actions).toBeUndefined();
+		tsp.event({ ev: "change", id: "b1.selected", checked: true });
+		tsp.event({ ev: "change", id: "b2.selected", checked: true });
+		expect(tsp.node("b1.launch").p).toMatchObject({ attrs: { "aria-disabled": true } });
+		expect(tsp.node("b1.launch").p?.actions).toBeUndefined();
+		expect(tsp.node("b2.launch").p?.actions).toBeUndefined();
+		tsp.click("b1.launch"); tsp.click("b2.launch");
+		expect(core.calls.filter(call => call.method === "requestLaunch")).toHaveLength(0);
+		tsp.event({ ev: "change", id: "b2.selected", checked: false });
+		tsp.click("b1.launch");
+		expect(core.calls.filter(call => call.method === "requestLaunch")).toEqual([{ method: "requestLaunch", args: ["r1", ["b1"]] }]);
 	});
 });

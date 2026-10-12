@@ -1,5 +1,6 @@
 import { parseBlockId } from "../domain/model";
-import type { BlockId, CompileInput, CompileResult, ErrorSite, ExternalTarget, IssueValue, Reference, Selector, Source, Target } from "../domain/model";
+import type { BlockContent, BlockId, CompileInput, CompileResult, ErrorSite, ExternalTarget, IssueValue, Reference, Selector, Source, Target } from "../domain/model";
+import { panelText, replacePanel } from "./draft/document";
 import type { ReferencesModule } from "../domain/ports";
 
 type Span = { start: number; end: number };
@@ -169,7 +170,9 @@ function parseExpression(expression: string | null): ParsedExpression {
 	tokens.push(expression.slice(start).trim());
 	const selectors: Selector[] = [];
 	for (const token of tokens) {
-		if (token === "title" || token === "body" || token === "comments") { selectors.push({ kind: token }); continue; }
+		if (token === "title" || token === "body" || token === "comments" || token === "requirement" || token === "design") { selectors.push({ kind: token }); continue; }
+		const panel = /^panel\(\s*"?([A-Z][0-9]*)"?\s*\)$/.exec(token);
+		if (panel) { selectors.push({ kind: "panel", id: panel[1]! }); continue; }
 		const range = /^(lines|comments)\(\s*([1-9][0-9]*)\s*\.\.\s*([1-9][0-9]*)\s*\)$/.exec(token);
 		if (range) {
 			const from = Number(range[2]);
@@ -241,7 +244,7 @@ function selectText(text: string, selectors: readonly Selector[]): Selection {
 				selected.push(section.text);
 				break;
 			}
-			case "title": case "body": case "comments": case "commentsLast": case "commentsRange":
+			case "title": case "body": case "comments": case "commentsLast": case "commentsRange": case "requirement": case "design": case "panel":
 				return { ok: false, reason: `Selector ${selector.kind} is invalid for text targets` };
 		}
 	}
@@ -266,31 +269,34 @@ function selectIssue(issue: IssueValue, selectors: readonly Selector[]): Selecti
 				if (selector.to > comments.length) return { ok: false, reason: "Comment range out of bounds" };
 				selected.push(format(comments.slice(selector.from - 1, selector.to)));
 				break;
-			case "lines": case "section": return { ok: false, reason: `Selector ${selector.kind} is invalid for issue targets` };
+			case "lines": case "section": case "requirement": case "design": case "panel": return { ok: false, reason: `Selector ${selector.kind} is invalid for issue targets` };
 		}
 	}
 	return { ok: true, text: selected.join("\n\n") };
 }
 
-function closure(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): Set<BlockId> {
+/** References a block's content takes part in: a task body's; a design is an opaque leaf. */
+function referencesOf(content: BlockContent | undefined): Reference[] {
+	return content?.kind === "task" ? parseReferences(content.body) : [];
+}
+
+function closure(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): Set<BlockId> {
 	const reached = new Set<BlockId>();
 	const pending = [...roots].reverse();
 	while (pending.length > 0) {
 		const block = pending.pop()!;
 		if (reached.has(block)) continue;
 		reached.add(block);
-		const body = bodies.get(block);
-		if (body === undefined) continue;
-		const children = parseReferences(body).map(reference => parseTarget(reference.targetText)).filter((target): target is Extract<Target, { kind: "block" }> => target?.kind === "block");
+		const children = referencesOf(contents.get(block)).map(reference => parseTarget(reference.targetText)).filter((target): target is Extract<Target, { kind: "block" }> => target?.kind === "block");
 		for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]!.block);
 	}
 	return reached;
 }
 
-function externalTargets(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): ExternalTarget[] {
+function externalTargets(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): ExternalTarget[] {
 	const targets = new Map<string, ExternalTarget>();
-	for (const block of closure(roots, bodies)) {
-		for (const reference of parseReferences(bodies.get(block) ?? "")) {
+	for (const block of closure(roots, contents)) {
+		for (const reference of referencesOf(contents.get(block))) {
 			const target = parseTarget(reference.targetText);
 			if (target && (target.kind === "file" || target.kind === "issue" || target.kind === "pull")) targets.set(targetKey(target), target);
 		}
@@ -298,15 +304,36 @@ function externalTargets(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId,
 	return [...targets.values()];
 }
 
-function resultTargets(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): BlockId[] {
+function resultTargets(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): BlockId[] {
 	const targets = new Set<BlockId>();
-	for (const block of closure(roots, bodies)) {
-		for (const reference of parseReferences(bodies.get(block) ?? "")) {
+	for (const block of closure(roots, contents)) {
+		for (const reference of referencesOf(contents.get(block))) {
 			const target = parseTarget(reference.targetText);
 			if (target?.kind === "result") targets.add(target.block);
 		}
 	}
 	return [...targets];
+}
+
+/** A design block as prompt text: both parts by default, or what `selectors` pick (requirement, design, panels). */
+function selectDesign(content: Extract<BlockContent, { kind: "design" }>, selectors: readonly Selector[]): Selection {
+	if (selectors.length === 0) return { ok: true, text: `<requirement>\n${content.requirement}\n</requirement>\n\n<design>\n${content.design}\n</design>` };
+	const selected: string[] = [];
+	for (const selector of selectors) {
+		switch (selector.kind) {
+			case "requirement": selected.push(content.requirement); break;
+			case "design": selected.push(content.design); break;
+			case "panel": {
+				const panel = panelText(content.design, selector.id);
+				if (!panel.ok) return panel;
+				selected.push(panel.text);
+				break;
+			}
+			case "lines": case "section": case "title": case "body": case "comments": case "commentsLast": case "commentsRange":
+				return { ok: false, reason: `Selector ${selector.kind} is invalid for design blocks` };
+		}
+	}
+	return { ok: true, text: selected.join("\n\n") };
 }
 
 function xmlAttribute(value: string): string {
@@ -327,9 +354,15 @@ function compiler(input: CompileInput) {
 			case "block": {
 				if (path.includes(target.block)) return { kind: "Err", error: { kind: "Cycle", path: [...path, target.block], at } };
 				if (path.length >= 8) return { kind: "Err", error: { kind: "TooDeep", at } };
-				const body = input.blocks.get(target.block);
-				if (body === undefined) return { kind: "Err", error: { kind: "UnknownBlock", block: target.block, at } };
-				const selected = selectText(body, expression.selectors);
+				const content = input.blocks.get(target.block);
+				if (content === undefined) return { kind: "Err", error: { kind: "UnknownBlock", block: target.block, at } };
+				if (content.kind === "design") {
+					const selected = selectDesign(content, expression.selectors);
+					if (!selected.ok) return badExpression(at, selected.reason);
+					sources.push({ kind: "block", target: key, expression: reference.expressionText });
+					return { kind: "Ok", text: selected.text, sources };
+				}
+				const selected = selectText(content.body, expression.selectors);
 				if (!selected.ok) return badExpression(at, selected.reason);
 				sources.push({ kind: "block", target: key, expression: reference.expressionText });
 				return compileText(target.block, selected.text, [...path, target.block]);
@@ -373,9 +406,15 @@ function compile(order: readonly BlockId[], input: CompileInput): CompileResult 
 	const context = compiler(input);
 	const parts: string[] = [];
 	for (const block of order) {
-		const body = input.blocks.get(block);
-		if (body === undefined) return { kind: "Err", error: { kind: "UnknownBlock", block, at: { block, reference: "" } } };
-		const compiled = context.compileText(block, body, [block]);
+		const content = input.blocks.get(block);
+		if (content === undefined) return { kind: "Err", error: { kind: "UnknownBlock", block, at: { block, reference: "" } } };
+		if (content.kind === "design") {
+			const selected = selectDesign(content, []);
+			if (!selected.ok) return { kind: "Err", error: { kind: "BadExpression", reason: selected.reason, at: { block, reference: "" } } };
+			parts.push(selected.text);
+			continue;
+		}
+		const compiled = context.compileText(block, content.body, [block]);
 		if (compiled.kind === "Err") return compiled;
 		parts.push(compiled.text);
 	}
@@ -474,4 +513,4 @@ function unifiedDiff(before: string, after: string): string {
 	return `${output.join("\n")}\n`;
 }
 
-export const references: ReferencesModule = { parseReferences, parseTarget, targetKey, closure, externalTargets, resultTargets, compile, expandOne, unifiedDiff };
+export const references: ReferencesModule = { parseReferences, parseTarget, targetKey, closure, externalTargets, resultTargets, compile, expandOne, unifiedDiff, replacePanel };

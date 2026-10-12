@@ -15,7 +15,8 @@ import { K1Client } from "../src/extension/client";
 import { ensureTernPlugin } from "../src/extension/tern-setup";
 
 const summary = { id: "r1", name: "Run", status: "running", started_at: 1, finished_at: null, done: 0, total: 1, update_due: null, update_overdue: false, retrospective: false };
-const block = { id: "b1", title: "Block", body: "Body", done: false };
+const block = { id: "b1", kind: "task", title: "Block", body: "Body", done: false };
+const designBlock = { id: "b3", kind: "design", title: "Design", requirement: "Human requirement", design: "```js\nreturn 42;\n```", done: false };
 type Frame = Request & { readonly id: string };
 type Cleanup = () => void | Promise<void>;
 const cleanup: Cleanup[] = [];
@@ -193,6 +194,8 @@ for (const [op, fields, mutation, args] of [
 	["title", { value: "Renamed" }, "set", { field: "title", value: "Renamed" }],
 	["done", { value: true }, "set", { field: "done", value: true }],
 	["replace", { find: "Body", replace: "New" }, "edit", { find: "Body", replace: "New" }],
+	["write", { text: "New design" }, "write", { text: "New design" }],
+	["panel", { panel: "A", text: "## A Revised\nNew design" }, "panel", { panel: "A", text: "## A Revised\nNew design" }],
 	["delete", {}, "delete", {}],
 ] as const) {
 	test(`edit ${op} locks, changes and releases only its own lock`, async () => {
@@ -253,6 +256,45 @@ test("event aside precedes block_changed ack; unrelated interruption is ignored"
 	s.push({ event: "interrupted", data: { block: "b1", request: "old" } } as EventPayload);
 	await h.execute("playbook_run", { doc: s.doc, op: "list" }); expect(h.aborted).toBe(0); expect(h.messages).toHaveLength(1);
 });
+
+for (const run of [undefined, "r1"] as const) {
+	test(`revision_requested fetches the submitted ${run === undefined ? "template" : "Run"} prompt before asking the coordinator to revise only the design`, async () => {
+		const s = await service(); const h = await harness();
+		await h.execute("playbook_open", { doc: s.doc });
+		s.handler = () => {};
+		const requested = s.nextFrame("revisions");
+		const scope = run === undefined ? {} : { run };
+		s.push({ event: "revision_requested", data: { ...scope, block: "b3", revision: 5 } } as EventPayload);
+		const frame = await requested;
+		expect(frame.args).toEqual({ ...scope, block: "b3", after: 4 });
+		expect(h.messages).toEqual([]);
+		const prompt = "Keep the requirement intact.\nRevise the failure path and label it clearly.";
+		respond(s.sockets.at(-1)!, frame, { revisions: [
+			{ seq: 6, at: 20, block: "b3", prompt: "A newer request, not the one submitted" },
+			{ seq: 5, at: 10, block: "b3", prompt },
+		] });
+		await h.messageSent;
+		expect(s.frames.map(item => item.op)).toEqual(["hello", "revisions"]);
+		expect(h.messages).toHaveLength(1);
+		const { message, options } = h.messages[0]!;
+		expect(message.customType).toBe("playbook-event");
+		expect(message.display).toBe(true);
+		expect(options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		const lines = message.content.split("\n");
+		expect(lines[0]).toBe("这是 Playbook 文档服务的通知，不是用户消息");
+		expect(message.content).toContain(prompt);
+		expect(message.content).not.toContain("A newer request");
+		const instruction = lines.slice(1, -1).join("\n");
+		expect(instruction).toContain("playbook_read");
+		expect(instruction).toContain('block: "b3"');
+		expect(instruction).toContain("修订设计");
+		expect(instruction).toContain("playbook_edit");
+		for (const op of ["write", "replace", "panel"]) expect(instruction).toContain(op);
+		expect(instruction).toMatch(/不要改\s+requirement/);
+		expect(instruction).not.toContain("playbook.run");
+		expect(JSON.parse(lines.at(-1)!)).toEqual({ doc: await realpath(s.doc), event: "revision_requested", data: { ...scope, block: "b3", revision: 5 } });
+	});
+}
 
 test("add writes full text, quote and human origin; cancelling any message/run/kind/block menu suppresses post", async () => {
 	const s = await service(); const h = await harness(); h.choices.push("assistant-1: FULL FIRST FULL SECOND");
@@ -410,7 +452,11 @@ test("tool calls require an unambiguous connected document when doc is omitted",
 });
 
 for (const [tool, params, request] of [
-	["playbook_edit", { op: "insert", run: "r1", after: "b1", title: "New", body: "Text" }, { op: "insert", args: { run: "r1", after: "b1", title: "New", body: "Text" } }],
+	["playbook_edit", { op: "insert", run: "r1", after: "b1", title: "New", body: "Text" }, { op: "insert", args: { run: "r1", after: "b1", title: "New", content: { kind: "task", body: "Text" } } }],
+	["playbook_edit", { op: "insert_design", run: "r1", after: "b1", title: "New design", design: "## A Overview\nDraft" }, { op: "insert", args: { run: "r1", after: "b1", title: "New design", content: { kind: "design", design: "## A Overview\nDraft" } } }],
+	["playbook_edit", { op: "insert_design", title: "Template design", design: "Draft" }, { op: "insert", args: { title: "Template design", content: { kind: "design", design: "Draft" } } }],
+	["playbook_read", { op: "revisions" }, { op: "revisions", args: {} }],
+	["playbook_read", { op: "revisions", run: "r1", block: "b3", after: 0 }, { op: "revisions", args: { run: "r1", block: "b3", after: 0 } }],
 	["playbook_compile", { op: "compile", run: "r1", blocks: ["b1"] }, { op: "compile", args: { run: "r1", blocks: ["b1"] } }],
 	["playbook_compile", { op: "refetch", targets: ["file:book.md"] }, { op: "refetch", args: { targets: ["file:book.md"] } }],
 	["playbook_check", { op: "inspect", blocks: ["b1"] }, { op: "inspect", args: { blocks: ["b1"] } }],
@@ -445,6 +491,7 @@ for (const orchestration of [false, true]) {
 			title: "Run copy", blocks: [
 				{ ...block, body: orchestration ? "```js\nreturn 42;\n```" : "Prompt" },
 				{ ...block, id: "b2", body: "```py\nprint(42)\n```" },
+				designBlock,
 			],
 		});
 		s.push({ event: "launch_requested", data: { run: "r1", blocks: ["b1"] } } as EventPayload);
@@ -460,6 +507,23 @@ for (const orchestration of [false, true]) {
 		expect(h.messages[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
 	});
 }
+
+test("launch_requested does not treat a requested design block as orchestration", async () => {
+	const s = await service(); const h = await harness();
+	await h.execute("playbook_open", { doc: s.doc });
+	s.handler = (frame, socket) => respond(socket, frame, {
+		title: "Run copy", blocks: [designBlock, { ...block, body: "```py\nprint(42)\n```" }],
+	});
+	s.push({ event: "launch_requested", data: { run: "r1", blocks: ["b3"] } } as EventPayload);
+	await h.messageSent;
+	expect(s.frames.at(-1)).toMatchObject({ op: "read", args: { run: "r1" } });
+	const lines = h.messages[0]!.message.content.split("\n");
+	expect(lines[1]).toContain("await playbook.run(");
+	expect(lines[1]).not.toContain("playbook_launch");
+	expect(lines[1]).not.toContain("playbook.exec");
+	expect(JSON.parse(lines[2]!)).toEqual({ doc: await realpath(s.doc), event: "launch_requested", data: { run: "r1", blocks: ["b3"] } });
+	expect(h.messages[0]!.options).toEqual({ deliverAs: "aside", triggerTurn: true });
+});
 
 for (const language of ["js", "py"] as const) {
 	test(`whole exec rewrites ${language} orchestration from its frozen Launch snapshot`, async () => {

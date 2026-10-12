@@ -20,18 +20,19 @@ const compileErrors: readonly CompileError[] = [
 const input: Parameters<ChecksModule["findings"]>[0] = {
 	compiled: ok,
 	expansions: [],
-	body: "A complete prompt without tables.",
-	render: { blockError: false, documentError: false, pendingOverdue: false, chartNodes: 0, view: { md: [], images: [] } },
+	content: { kind: "task", body: "A complete prompt without tables." },
+	render: { blockError: false, documentError: false, pendingOverdue: false, chartNodes: 0, draftErrors: 0, view: { md: [], images: [] } },
 };
 
 describe("deterministic findings", () => {
-	test("a complete rendered prompt passes all five checks", () => {
+	test("a complete rendered prompt passes all six checks", () => {
 		expect(checks.findings(input)).toEqual({
 			compile: false,
 			empty_expansion: false,
 			render_error: false,
 			render_pending: false,
 			chart: false,
+			draft: false,
 		});
 	});
 
@@ -75,7 +76,7 @@ describe("deterministic findings", () => {
 	for (const chartNodes of [0, 1, 2, 3]) {
 		test(`two chartable tables versus ${chartNodes} images`, () => {
 			const body = `${numericTable}\n\nBetween tables.\n\n${numericTable}`;
-			expect(checks.findings({ ...input, body, render: { ...input.render, chartNodes } }).chart).toBe(chartNodes < 2);
+			expect(checks.findings({ ...input, content: { kind: "task", body }, render: { ...input.render, chartNodes } }).chart).toBe(chartNodes < 2);
 		});
 	}
 
@@ -84,10 +85,65 @@ describe("deterministic findings", () => {
 			checks.findings({
 				compiled: { kind: "Err", error: { kind: "UnknownTarget", at: site } },
 				expansions: [{ ...ok, text: "\n" }],
-				body: numericTable,
-				render: { blockError: true, documentError: false, pendingOverdue: true, chartNodes: 0, view: { md: [], images: [] } },
+				content: { kind: "task", body: numericTable },
+				render: { blockError: true, documentError: false, pendingOverdue: true, chartNodes: 0, draftErrors: 2, view: { md: [], images: [] } },
 			}),
-		).toEqual({ compile: true, empty_expansion: true, render_error: true, render_pending: true, chart: true });
+		).toEqual({ compile: true, empty_expansion: true, render_error: true, render_pending: true, chart: true, draft: false });
+	});
+});
+
+describe("design draft findings", () => {
+	const cleanDesign = "Design overview.\n\n## A Architecture\nA complete design.\n\n## B Execution\nImplement the plan.";
+	const designContent = { kind: "design", requirement: "A user requirement.", design: cleanDesign } as const;
+
+	test("design content skips empty expansion and chart checks", () => {
+		const findings = checks.findings({
+			...input,
+			content: { ...designContent, requirement: numericTable, design: `## A Metrics\n${numericTable}` },
+			expansions: [{ ...ok, text: " \n\t " }],
+			render: { ...input.render, chartNodes: 0 },
+		});
+		expect(findings.empty_expansion).toBe(false);
+		expect(findings.chart).toBe(false);
+		expect(findings.draft).toBe(false);
+	});
+
+	for (const [name, design] of [
+		["unclosed fence", "## A Implementation\n```typescript\nconst value = 1;"],
+		["duplicate panel ID", "## A First\nFirst panel.\n\n## A Second\nSecond panel."],
+	] as const) {
+		test(`draft fails for ${name} without render-reported errors`, () => {
+			expect(checks.findings({ ...input, content: { ...designContent, design } }).draft).toBe(true);
+		});
+	}
+
+	test("a clean design passes all six checks", () => {
+		expect(checks.findings({ ...input, content: designContent })).toEqual({
+			compile: false,
+			empty_expansion: false,
+			render_error: false,
+			render_pending: false,
+			chart: false,
+			draft: false,
+		});
+	});
+
+	for (const draftErrors of [0, 1, 2]) {
+		test(`a clean design reflects ${draftErrors} render-reported draft errors`, () => {
+			expect(checks.findings({
+				...input,
+				content: designContent,
+				render: { ...input.render, draftErrors },
+			}).draft).toBe(draftErrors > 0);
+		});
+	}
+
+	test("task content does not run draft diagnostics or inherit render-reported draft errors", () => {
+		expect(checks.findings({
+			...input,
+			content: { kind: "task", body: "## A First\nFirst panel.\n\n## A Second\n```typescript\nconst value = 1;" },
+			render: { ...input.render, draftErrors: 2 },
+		}).draft).toBe(false);
 	});
 });
 

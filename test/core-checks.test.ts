@@ -10,7 +10,7 @@ import { references } from "../src/service/references";
 import { createStore } from "../src/service/store";
 
 const template: DocRef = { kind: "template" };
-const noFindings: Findings = { compile: false, empty_expansion: false, render_error: false, render_pending: false, chart: false };
+const noFindings: Findings = { compile: false, empty_expansion: false, render_error: false, render_pending: false, chart: false, draft: false };
 const answers: JudgeReport = { kind: "answers", answers: { missing: 0.75 } };
 const fetched: FetchOutcome = { ok: true, at: 1_000, value: { kind: "file", text: "fixed external material" } };
 const panes: PaneControl = {
@@ -31,7 +31,11 @@ interface Fixture {
 }
 
 function block(id: BlockId, body: string): Block {
-	return { id, title: `Block ${id}`, body, done: false };
+	return { id, title: `Block ${id}`, content: { kind: "task", body }, done: false };
+}
+
+function designBlock(id: BlockId, requirement: string, design: string): Block {
+	return { id, title: `Block ${id}`, content: { kind: "design", requirement, design }, done: false };
 }
 
 function fixture(blocks: readonly Block[] = [block("b1", "Review ((b2))"), block("b2", "dependency material"), block("b3", "unrelated material")]): Fixture {
@@ -130,7 +134,7 @@ describe("Core checks: inspect (checks.md §1; K1)", () => {
 		const f = fixture();
 		await f.connect();
 		const render: RenderStatus = {
-			blockError: false, documentError: false, pendingOverdue: false, chartNodes: 1,
+			blockError: false, documentError: false, pendingOverdue: false, chartNodes: 1, draftErrors: 0,
 			view: { md: ["rendered review", "second md node"], images: ["chart alt"] },
 		};
 		f.core.setRenderStatus(template, "b1", render);
@@ -152,6 +156,52 @@ describe("Core checks: inspect (checks.md §1; K1)", () => {
 		editBody(f, template, "b2", "new dependency material");
 		await settle(f.core);
 		expect((await inspect(f)).version).not.toBe(first.version);
+	});
+
+	test("returns structured requirement and design source for a design block alongside a task string", async () => {
+		const requirement = "Keep customer records private.";
+		const design = "## A Access control\nUse scoped permissions.";
+		const f = fixture([block("b1", "Implement ((b2))"), designBlock("b2", requirement, design)]);
+		await f.connect();
+		const first = await inspect(f, ["b1", "b2"]);
+		expect(first.state).toHaveProperty("source", { b1: "Implement ((b2))", b2: { requirement, design } });
+		expect(first.state).toMatchObject({ findings: { b1: noFindings, b2: noFindings } });
+		expect((await inspect(f, ["b1", "b2"])).state).toEqual(first.state);
+	});
+
+	test("versions a task by both referenced design fields, not unrelated designs or titles", async () => {
+		const f = fixture([
+			block("b1", "Implement ((b2))"),
+			designBlock("b2", "Keep records private.", "## A Access control\nUse scoped permissions."),
+			designBlock("b3", "Unrelated requirement.", "## A Other feature\nKeep it unchanged."),
+		]);
+		await f.connect();
+		const initial = await inspect(f);
+		success(await f.request({ op: "lock", args: { block: "b3" } }));
+		success(await f.request({ op: "write", args: { block: "b3", text: "## A Other feature\nUnrelated change." } }));
+		expect(f.core.pencil(template, "b2", "title")).toBeNull();
+		expect(f.core.setDraft(template, "b2", "Renamed design")).toBeNull();
+		expect(f.core.commit(template, "b2")).toBeNull();
+		await settle(f.core);
+		expect((await inspect(f)).version).toBe(initial.version);
+
+		expect(f.core.pencil(template, "b2", "requirement")).toBeNull();
+		expect(f.core.setDraft(template, "b2", "Keep all records private.")).toBeNull();
+		expect(f.core.commit(template, "b2")).toBeNull();
+		await settle(f.core);
+		const revisedRequirement = await inspect(f);
+		expect(revisedRequirement.version).not.toBe(initial.version);
+
+		success(await f.request({ op: "lock", args: { block: "b2" } }));
+		success(await f.request({ op: "write", args: { block: "b2", text: "## A Access control\nUse audited scoped permissions." } }));
+		await settle(f.core);
+		const revisedDesign = await inspect(f);
+		expect(revisedDesign.version).not.toBe(revisedRequirement.version);
+		expect(revisedDesign.version).not.toBe(initial.version);
+		expect(revisedDesign.state).toMatchObject({ compiled: {
+			kind: "Ok",
+			text: "Implement <requirement>\nKeep all records private.\n</requirement>\n\n<design>\n## A Access control\nUse audited scoped permissions.\n</design>",
+		} });
 	});
 
 	test("returns CompileResult.Err inside successful inspect and marks compile finding", async () => {
@@ -274,6 +324,60 @@ describe("Core checks: report invalidation (checks.md §4–§5)", () => {
 		editBody(f, template, "b3", "changed deep dependency");
 		await settle(f.core);
 		expect(shownReport(f.core, template)).toBeNull();
+	});
+
+	test("a coordinator design edit clears a dependent task report and requires a fresh inspection", async () => {
+		const f = fixture([
+			block("b1", "Implement ((b2))"),
+			designBlock("b2", "Keep records private.", "## A Access control\nUse scoped permissions."),
+		]);
+		await f.connect();
+		const run = await startRun(f);
+		const ref: DocRef = { kind: "run", run };
+		const previous = await inspect(f, ["b1"], run);
+		expect(await report(f, previous.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(shownReport(f.core, ref)).toEqual({ version: previous.version, result: answers });
+
+		success(await f.request({ op: "lock", args: { run, block: "b2" } }));
+		success(await f.request({ op: "write", args: { run, block: "b2", text: "## A Access control\nUse audited scoped permissions." } }));
+		await settle(f.core, ref);
+		expect(shownReport(f.core, ref)).toBeNull();
+		expect(await report(f, previous.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(shownReport(f.core, ref)).toBeNull();
+		expect(reportEntries(f, run)).toHaveLength(1);
+
+		const current = await inspect(f, ["b1"], run);
+		expect(current.version).not.toBe(previous.version);
+		expect(await report(f, current.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(shownReport(f.core, ref)).toEqual({ version: current.version, result: answers });
+		expect(reportEntries(f, run)).toHaveLength(2);
+	});
+
+	test("restoring a coordinator-edited design does not revive a dependent task inspection", async () => {
+		const design = "## A Access control\nUse scoped permissions.";
+		const f = fixture([block("b1", "Implement ((b2))"), designBlock("b2", "Keep records private.", design)]);
+		await f.connect();
+		const run = await startRun(f);
+		const ref: DocRef = { kind: "run", run };
+		const previous = await inspect(f, ["b1"], run);
+
+		success(await f.request({ op: "lock", args: { run, block: "b2" } }));
+		success(await f.request({ op: "write", args: { run, block: "b2", text: "## A Access control\nUse audited scoped permissions." } }));
+		await settle(f.core, ref);
+		expect(await report(f, previous.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(reportEntries(f, run)).toHaveLength(0);
+
+		success(await f.request({ op: "write", args: { run, block: "b2", text: design } }));
+		await settle(f.core, ref);
+		expect(await report(f, previous.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(shownReport(f.core, ref)).toBeNull();
+		expect(reportEntries(f, run)).toHaveLength(0);
+
+		const fresh = await inspect(f, ["b1"], run);
+		expect(fresh.version).toBe(previous.version);
+		expect(await report(f, fresh.version, answers, run)).toEqual({ ok: true, result: null });
+		expect(shownReport(f.core, ref)).toEqual({ version: fresh.version, result: answers });
+		expect(reportEntries(f, run)).toHaveLength(1);
 	});
 
 	test("an edit followed by restoring the old body does not revive the old inspection", async () => {

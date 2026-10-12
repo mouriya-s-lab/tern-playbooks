@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, openSync, closeSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { CompileError, EntryData, Launch, PlaybookDoc, RunMeta, TimelineEntry } from "../src/domain/model";
+import type { BlockContent, CompileError, DocRef, EntryData, Launch, PlaybookDoc, Revision, RunMeta, TimelineEntry } from "../src/domain/model";
 import { createStore } from "../src/service/store";
 
 const directories: string[] = [];
@@ -12,7 +12,7 @@ function fixture() {
 	return { directory, path, store: createStore(path) };
 }
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
-const doc: PlaybookDoc = { title: "Incident: #237", blocks: [{ id: "b1", title: "First step", body: "alpha\nbeta\ngamma\n", done: false }] };
+const doc: PlaybookDoc = { title: "Incident: #237", blocks: [{ id: "b1", title: "First step", content: { kind: "task", body: "alpha\nbeta\ngamma\n" }, done: false }] };
 const run: RunMeta = { id: "r1", name: "Night shift", status: "running", startedAt: Date.parse("2026-10-11T00:00:00.123Z"), finishedAt: null, updateEvery: 60, updateDue: Date.parse("2026-10-11T00:01:00.123Z") };
 const launch: Launch = {
 	id: "l1", run: "r1", session: "session-1", blocks: ["b1"], kind: "prompt",
@@ -32,7 +32,7 @@ describe("YAML persistence", () => {
 	for (const body of ["", "plain", "one\ntwo\nthree", "```ts\nconst x = 1;\n```\n", "  first\n    nested\n last ", "\n\n  leading\n", "one\n", "one\n\n", "one\n\n\n\n", "\n", "\n\n", " \n \n", "\tfirst\n\tsecond", "中文 😀 café", "---\n# comment\n: colon\n", "  \n \n   "]) {
 		test(`literal body roundtrip ${JSON.stringify(body)}`, () => {
 			const { store } = fixture();
-			const value = { ...doc, blocks: [{ ...doc.blocks[0]!, body }] };
+			const value: PlaybookDoc = { ...doc, blocks: [{ ...doc.blocks[0]!, content: { kind: "task", body } }] };
 			const text = store.serialize(value, null);
 			expect(text).toContain("body: |2");
 			expect(store.parse(text, false)).toEqual({ ok: true, doc: value, run: null });
@@ -41,7 +41,7 @@ describe("YAML persistence", () => {
 	for (const body of ["a\r\nb", "a\rb", "a\0b", "a\u0007b", "a\u0085b", "a\u2028b", "a\u2029b", "a\uFFFEb", "a\uFFFFb"]) {
 		test(`escaped body roundtrip ${JSON.stringify(body)}`, () => {
 			const { store } = fixture();
-			const value = { ...doc, blocks: [{ ...doc.blocks[0]!, body }] };
+			const value: PlaybookDoc = { ...doc, blocks: [{ ...doc.blocks[0]!, content: { kind: "task", body } }] };
 			const text = store.serialize(value, null);
 			expect(text).toContain('body: "');
 			expect(store.parse(text, false)).toEqual({ ok: true, doc: value, run: null });
@@ -50,9 +50,49 @@ describe("YAML persistence", () => {
 	test("all byte-valued code points roundtrip through the escaped fallback", () => {
 		const { store } = fixture();
 		const body = Array.from({ length: 256 }, (_, code) => String.fromCharCode(code)).join("");
-		const value = { ...doc, blocks: [{ ...doc.blocks[0]!, body }] };
+		const value: PlaybookDoc = { ...doc, blocks: [{ ...doc.blocks[0]!, content: { kind: "task", body } }] };
 		expect(store.parse(store.serialize(value, null), false)).toEqual({ ok: true, doc: value, run: null });
 	});
+	for (const requirement of ["", "First requirement\n  indented detail\n\n"]) {
+		for (const design of ["", "## A Plan\n\n```code\nconst value = 1;\n```\n"]) {
+			test(`design YAML roundtrip ${JSON.stringify({ requirement, design })}`, () => {
+				const { path, store } = fixture();
+				const value: PlaybookDoc = { ...doc, blocks: [...doc.blocks, { id: "b2", title: "Design", done: true, content: { kind: "design", requirement, design } }] };
+				const text = store.serialize(value, null);
+				expect(Bun.YAML.parse(text)).toEqual({
+					title: doc.title,
+					blocks: [
+						{ id: "b1", title: "First step", body: "alpha\nbeta\ngamma\n", done: false },
+						{ id: "b2", title: "Design", requirement, design, done: true },
+					],
+				});
+				expect(store.parse(text, false)).toEqual({ ok: true, doc: value, run: null });
+				store.write({ kind: "template" }, text);
+				expect(createStore(path).readTemplate()).toEqual({ ok: true, doc: value, run: null });
+			});
+		}
+	}
+	test("legacy body-only YAML still decodes as a task block", () => {
+		const { path } = fixture();
+		writeFileSync(path, 'title: "Incident: #237"\nblocks:\n  - id: b1\n    title: First step\n    body: |\n      alpha\n      beta\n      gamma\n    done: false\n');
+		expect(createStore(path).readTemplate()).toEqual({ ok: true, doc, run: null });
+	});
+	for (const content of [
+		{ body: "", design: "" },
+		{ body: "", requirement: "" },
+		{ body: "", requirement: "", design: "" },
+		{},
+		{ requirement: "" },
+		{ design: "" },
+	]) {
+		test(`mixed or missing content keys reject ${JSON.stringify(content)}`, () => {
+			const { store } = fixture();
+			const text = JSON.stringify({ title: "Invalid content", blocks: [{ id: "b1", title: "Block", done: false, ...content }] });
+			const result = store.parse(text, false);
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.error.length).toBeGreaterThan(0);
+		});
+	}
 	test("malformed Unicode is rejected before filesystem mutation", () => {
 		const { directory, path, store } = fixture();
 		const original = store.serialize(doc, null);
@@ -61,8 +101,8 @@ describe("YAML persistence", () => {
 			for (const invalid of [
 				{ ...doc, title: text },
 				{ ...doc, blocks: [{ ...doc.blocks[0]!, title: text }] },
-				{ ...doc, blocks: [{ ...doc.blocks[0]!, body: text }] },
-			]) {
+				{ ...doc, blocks: [{ ...doc.blocks[0]!, content: { kind: "task", body: text } }] },
+			] satisfies PlaybookDoc[]) {
 				expect(() => store.write({ kind: "template" }, store.serialize(invalid, null))).toThrow(RangeError);
 				expect(readFileSync(path, "utf8")).toBe(original);
 			}
@@ -146,7 +186,7 @@ describe("filesystem persistence", () => {
 	test("changing one body line produces just that removed and added physical line", () => {
 		const { store } = fixture();
 		const before = store.serialize(doc, null).split("\n");
-		const after = store.serialize({ ...doc, blocks: [{ ...doc.blocks[0]!, body: "alpha\nBETA\ngamma\n" }] }, null).split("\n");
+		const after = store.serialize({ ...doc, blocks: [{ ...doc.blocks[0]!, content: { kind: "task", body: "alpha\nBETA\ngamma\n" } }] }, null).split("\n");
 		expect(before.length).toBe(after.length);
 		expect(before.filter((line, i) => line !== after[i])).toEqual(["      beta"]);
 		expect(after.filter((line, i) => line !== before[i])).toEqual(["      BETA"]);
@@ -171,8 +211,8 @@ describe("append-only facts", () => {
 		const payloads: EntryData[] = [
 			{ type: "run_started", name: "Shift" }, { type: "run_finished" },
 			{ type: "block_edited", block: "b1", field: "body", text: "\nnew\n", edit: 1 },
-			{ type: "block_added", block: "b2", title: "New", body: "body" },
-			{ type: "block_deleted", block: "b2", title: "New", body: "body" },
+			{ type: "block_added", block: "b2", title: "New", content: { kind: "task", body: "body" } },
+			{ type: "block_deleted", block: "b2", title: "New", content: { kind: "task", body: "body" } },
 			{ type: "blocks_reordered", order: ["b2", "b1"] }, { type: "done_changed", block: "b1", done: true },
 			{ type: "launch_created", launch: "l1", kind: "prompt", blocks: ["b1"] },
 			{ type: "agent_bound", launch: "l1", agent: "agent-1" }, { type: "launch_closed", launch: "l1" },
@@ -193,6 +233,45 @@ describe("append-only facts", () => {
 		expect(readFileSync(path, "utf8").startsWith(prefix)).toBe(true);
 		expect(readFileSync(path, "utf8").split("\n").length).toBe(entries.length + 1);
 		expect(store.readRunLog("r1").entries).toEqual(entries);
+	});
+	for (const type of ["block_added", "block_deleted", "content_replaced"] as const) {
+		for (const { content, flattened } of [
+			{ content: { kind: "task", body: "task\nbody\n" }, flattened: { body: "task\nbody\n" } },
+			{ content: { kind: "design", requirement: "human\nrequirement\n", design: "## A Plan\n\nDesign\n" }, flattened: { requirement: "human\nrequirement\n", design: "## A Plan\n\nDesign\n" } },
+		] satisfies { content: BlockContent; flattened: { body: string } | { requirement: string; design: string } }[]) {
+			test(`${type} stores flattened ${content.kind} content and reopens it`, () => {
+				const { directory, path, store } = fixture();
+				const data: EntryData = type === "content_replaced"
+					? { type, block: "b2", content }
+					: { type, block: "b2", title: "Block title", content };
+				const entry: TimelineEntry = { seq: 1, at: 100, origin: "disk", data };
+				store.appendEntry("r1", entry);
+				const text = readFileSync(join(directory, "incident.runs/r1.jsonl"), "utf8");
+				expect(JSON.parse(text)).toEqual({
+					entry: {
+						seq: 1, at: 100, origin: "disk", type,
+						data: { block: "b2", ...(type === "content_replaced" ? {} : { title: "Block title" }), ...flattened },
+					},
+				});
+				expect(createStore(path).readRunLog("r1")).toEqual({ entries: [entry], launches: new Map() });
+			});
+		}
+	}
+	test("legacy timeline title and body payloads decode as task content", () => {
+		const { directory, path } = fixture();
+		mkdirSync(join(directory, "incident.runs"));
+		writeFileSync(join(directory, "incident.runs/r1.jsonl"), [
+			'{"entry":{"seq":1,"at":100,"type":"block_added","origin":"coordinator","data":{"block":"b2","title":"Old block","body":"old body"}}}',
+			'{"entry":{"seq":2,"at":101,"type":"block_deleted","origin":"disk","data":{"block":"b2","title":"Old block","body":"old body"}}}',
+			"",
+		].join("\n"));
+		expect(createStore(path).readRunLog("r1")).toEqual({
+			entries: [
+				{ seq: 1, at: 100, origin: "coordinator", data: { type: "block_added", block: "b2", title: "Old block", content: { kind: "task", body: "old body" } } },
+				{ seq: 2, at: 101, origin: "disk", data: { type: "block_deleted", block: "b2", title: "Old block", content: { kind: "task", body: "old body" } } },
+			],
+			launches: new Map(),
+		});
 	});
 	test("Launch keeps its full nested state; the last line for each Launch wins", () => {
 		const { store } = fixture();
@@ -229,4 +308,43 @@ describe("append-only facts", () => {
 			expect(() => store.readRunLog("r1")).toThrow(`${path}:2:`);
 		}
 	});
+});
+
+describe("revision journals", () => {
+	test("template and Run requests append to independent files and reopen in order", () => {
+		const { directory, path, store } = fixture();
+		const journals = [
+			{ ref: { kind: "template" }, path: `${path}.revisions.jsonl` },
+			{ ref: { kind: "run", run: "r1" }, path: join(directory, "incident.runs/r1.revisions.jsonl") },
+			{ ref: { kind: "run", run: "r2" }, path: join(directory, "incident.runs/r2.revisions.jsonl") },
+		] satisfies { ref: DocRef; path: string }[];
+		const histories: Revision[][] = [];
+		for (const [index, journal] of journals.entries()) {
+			expect(store.readRevisions(journal.ref)).toEqual([]);
+			const first: Revision = { seq: 1, at: 100 + index, block: "b1", prompt: `Request ${index}\nwith details\n` };
+			const second: Revision = { seq: 4, at: 200 + index, block: "b2", prompt: `Next request ${index}` };
+			histories.push([first, second]);
+			store.appendRevision(journal.ref, first);
+			const prefix = readFileSync(journal.path, "utf8");
+			expect(prefix).toBe(`${JSON.stringify(first)}\n`);
+			store.appendRevision(journal.ref, second);
+			expect(readFileSync(journal.path, "utf8")).toBe(`${prefix}${JSON.stringify(second)}\n`);
+		}
+		const reopened = createStore(path);
+		for (const [index, journal] of journals.entries()) expect(reopened.readRevisions(journal.ref)).toEqual(histories[index]!);
+		expect(reopened.readRevisions({ kind: "run", run: "r3" })).toEqual([]);
+		expect(reopened.readRunLog("r1")).toEqual({ entries: [], launches: new Map() });
+	});
+	for (const kind of ["template", "run"] as const) {
+		for (const seq of [2, 1]) {
+			test(`${kind} revision journal rejects ${seq === 2 ? "duplicate" : "decreasing"} sequences`, () => {
+				const { directory, path, store } = fixture();
+				const ref: DocRef = kind === "template" ? { kind } : { kind, run: "r1" };
+				const journalPath = kind === "template" ? `${path}.revisions.jsonl` : join(directory, "incident.runs/r1.revisions.jsonl");
+				store.appendRevision(ref, { seq: 2, at: 100, block: "b1", prompt: "First" });
+				store.appendRevision(ref, { seq, at: 101, block: "b2", prompt: "Out of order" });
+				expect(() => createStore(path).readRevisions(ref)).toThrow(journalPath);
+			});
+		}
+	}
 });
