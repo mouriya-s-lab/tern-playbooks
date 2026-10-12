@@ -56,7 +56,7 @@ blocks:
 
 工具与命令只出现在 omp 的主会话中，subagent 看不到它们。
 
-在 Tern 中也可以直接打开 Playbook：聚焦 Playbook 的 YAML 文件块，在命令面板中选"Playbook: 打开"（聚焦的不是文件时会让你输入路径）。该文件已有文档服务时，它的 pane 会被显示出来；没有时，会在旁边开一个文档服务 pane。这个命令不会启动 omp，协调者仍是之后对这个文件调用 `open` 的 omp 会话。
+在 Tern 中也可以直接打开 Playbook：聚焦 Playbook 的 YAML 文件块，按 Ctrl+Shift+P 打开命令面板，选"Playbook: 打开"。只有聚焦的是 `.yaml` 或 `.yml` 文件块时，这个命令才会出现在面板里。该文件已有文档服务时，它的 pane 会被显示出来；没有时，会在旁边开一个文档服务 pane。这个命令不会启动 omp，协调者仍是之后对这个文件调用 `open` 的 omp 会话。
 
 ## 编排块
 

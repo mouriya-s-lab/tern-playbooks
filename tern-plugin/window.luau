@@ -45,33 +45,37 @@ local function show(path: string)
 	end)
 end
 
-local function absolute(path: string, cwd: string?): string
-	if string.sub(path, 1, 1) == "/" or cwd == nil then
-		return path
+-- The focused file pane's YAML path, or nil. `available` runs under the palette's 4 ms
+-- budget, so this stays to table lookups and never reads the file.
+local function focused_yaml(cx): string?
+	local id = cx.session:focused()
+	local pane = if id == nil then nil else cx.session:pane(id)
+	if pane == nil or pane.kind ~= "file" or pane.path == nil then
+		return nil
 	end
-	return cwd .. "/" .. path
+	local path = pane.path
+	if string.match(path, "%.ya?ml$") == nil then
+		return nil
+	end
+	return path
 end
 
 tern.command({
 	id = "open",
 	title = "Playbook: 打开",
 	icon = "file",
+	available = function(cx)
+		return focused_yaml(cx) ~= nil
+	end,
 	run = function(cx)
+		local path = focused_yaml(cx)
+		if path == nil then
+			return
+		end
 		if not tern.fs.exists(MAIN) then
 			cx:toast("error", "找不到文档服务入口；请用 tern plugin link 安装", MAIN)
 			return
 		end
-		local id = cx.session:focused()
-		local pane = if id == nil then nil else cx.session:pane(id)
-		if pane ~= nil and pane.kind == "file" and pane.path ~= nil then
-			show(pane.path)
-			return
-		end
-		local cwd = if pane == nil then nil else pane.cwd
-		cx:prompt({ placeholder = "Playbook YAML 路径", icon = "file", action = "open" }):next(function(text, _err, _cx)
-			if text ~= nil and text ~= "" then
-				show(absolute(text, cwd))
-			end
-		end)
+		show(path)
 	end,
 })

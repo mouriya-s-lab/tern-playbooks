@@ -109,10 +109,10 @@
 | 项 | 内容 |
 |---|---|
 | 参与方 | 提供方：文档服务入口 `main.ts` 与 Tern 的 window 插件接口（D1.12，外部）。使用方：Tern 插件（根节点设计） |
-| 交换 | 插件包 `tern-plugin/`（`plugin.toml` 与 `window.luau`），以 `tern plugin link <仓库>/tern-plugin` 安装；文档服务入口为 `<插件目录>/../src/service/main.ts`。命令面板命令 `plugin.tern-playbooks.open`，标题"Playbook: 打开"：聚焦的 pane 为文件 pane（`kind == "file"`）时取它的 `path`；否则以 `cx:prompt` 请人输入路径，相对路径相对于聚焦 pane 的 `cwd`。然后以 `tern.process.run({$SHELL, "-lc", "exec bun <入口> --reveal <路径>"})` 运行显示请求：`main.ts --reveal` 向该文档的 socket 发送 K1 `reveal`，退出码 0 表示已显示，4 表示没有文档服务在监听，5 表示 `reveal` 失败（标准错误输出给出原因）。退出码 4 时，插件以 `cx.layout:split(<聚焦的 pane>, "right", {cwd = <文件所在目录>, command = "exec bun <入口> <路径>"})` 建立文档服务 pane |
+| 交换 | 插件包 `tern-plugin/`（`plugin.toml` 与 `window.luau`），以 `tern plugin link <仓库>/tern-plugin` 安装；文档服务入口为 `<插件目录>/../src/service/main.ts`。命令面板命令 `plugin.tern-playbooks.open`，标题"Playbook: 打开"。它的 `available` 只在聚焦的 pane 是文件 pane（`kind == "file"`）且 `path` 以 `.yaml` 或 `.yml` 结尾时为真，所以命令只在这时出现在命令面板中；`available` 只读 `cx.session`，不读文件（D1.12 的 4 ms 预算）。执行时作用于该 `path`：以 `tern.process.run({$SHELL, "-lc", "exec bun <入口> --reveal <路径>"})` 运行显示请求：`main.ts --reveal` 向该文档的 socket 发送 K1 `reveal`，退出码 0 表示已显示，4 表示没有文档服务在监听，5 表示 `reveal` 失败（标准错误输出给出原因）。退出码 4 时，插件以 `cx.layout:split(<聚焦的 pane>, "right", {cwd = <文件所在目录>, command = "exec bun <入口> <路径>"})` 建立文档服务 pane |
 | 前置条件 | 插件以 `link` 安装，入口文件存在；`bun` 能在用户的登录 shell 中找到。显示请求要求文档服务运行在 session daemon 托管的 pane 中（K1 `reveal`） |
 | 保证 | 插件不启动协调者，也不启动任何 agent；它只请求显示或启动文档服务。每份文档至多一个文档服务（K1 交换），插件不自行判断文档服务是否存在，只按 `--reveal` 的退出码行事。建立的 pane 由 Tern daemon 托管，插件不持有它 |
-| 错误 | 入口文件不存在：toast"找不到文档服务入口；请用 tern plugin link 安装"，不运行子进程。`--reveal` 退出码不是 0 或 4：toast"Playbook 无法显示"并附标准错误输出。`cx.layout:split` 返回 `nil`：toast"无法建立 Playbook pane" |
+| 错误 | 入口文件不存在：toast"找不到文档服务入口；请用 tern plugin link 安装"，不运行子进程。经快捷键或 `keybinds` 执行而聚焦的不是 YAML 文件 pane：什么也不做。`--reveal` 退出码不是 0 或 4：toast"Playbook 无法显示"并附标准错误输出。`cx.layout:split` 返回 `nil`：toast"无法建立 Playbook pane" |
 | 失败语义 | 不重试。退出码 4 之后、建立 pane 之前另一入口已启动该文档的文档服务时，新 pane 中的进程按 K1 交换的启动规则显示已有文档服务的 pane 后退出，它的 pane 随之关闭 |
 | 生命周期 | `--reveal` 子进程：开始于人选择命令，结束于子进程退出（插件确认）。建立的文档服务 pane 同 K5：由 Tern daemon 托管，结束于其中的程序退出或人关闭它 |
 | 质量 | 无 |
