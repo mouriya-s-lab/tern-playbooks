@@ -70,7 +70,7 @@ async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"),
 		const result = await success({ op: "launch", args: { run, blocks: ids } });
 		const record = [...store.readRunLog(run).launches.values()].at(-1);
 		if (!record) throw new Error("launch did not persist a record");
-		expect(result).toEqual({ launch: record.id, text: record.snapshot.result.text });
+		expect(result).toEqual({ launch: record.id, kind: record.kind, text: record.snapshot.result.text });
 		return record.id;
 	}
 	return {

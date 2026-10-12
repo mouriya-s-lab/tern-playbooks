@@ -1021,7 +1021,7 @@ export class Core implements CoreApi, K1Handler {
 		this.#store.appendLaunch(run, record);
 		this.#append(run, "coordinator", { type: "launch_created", launch: id, kind: record.kind, blocks: record.blocks });
 		this.#emit(docState.ref);
-		return ok({ launch: id, text: result.text });
+		return ok({ launch: id, kind: record.kind, text: result.text });
 	}
 
 	async #rebase(session: string, id: LaunchId): Promise<Outcome<unknown>> {
