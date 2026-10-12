@@ -7,11 +7,13 @@ import { parseBlockId, parseLaunchId, parseRunId, type BlockId, type LaunchId, t
 import { socketPath, type EventPayload, type Request, type ServerFrame } from "../domain/protocol";
 import { K1Client, type Reply } from "./client";
 import { splitPane } from "../service/panes";
+import { ensureTernPlugin } from "./tern-setup";
 
 /** A block body that is one fenced js/py code block is an orchestration block (launch-events.md §1). */
 const ORCHESTRATION = /^\s*```(js|py)\s*\n([\s\S]*)\n```\s*$/;
 
-export default function (pi: ExtensionAPI): void {
+export default async function (pi: ExtensionAPI): Promise<void> {
+	await ensureTernPlugin();
 	const z = pi.zod;
 	const block = z.string().regex(/^b[1-9][0-9]*$/).transform(value => {
 		const id = parseBlockId(value); if (id === null) throw new Error("Invalid block id"); return id;
