@@ -23,7 +23,6 @@ const activeCores = new Set<Core>();
 
 const panes: PaneControl = {
 	ownPane: () => "service-pane",
-	async splitCoordinator() { return { ok: true, pane: "coordinator-pane" }; },
 	async focusPane() { return { ok: true }; },
 };
 
@@ -49,11 +48,11 @@ interface CoreHarness {
 	stop(): void;
 }
 
-function startCore(store: Store): CoreHarness {
+function startCore(store: Store, paneControl: PaneControl = panes): CoreHarness {
 	let fetchCount = 0;
 	const fetched: FetchOutcome = { ok: true, at: 123, value: { kind: "file", text: "fixed external content" } };
 	const fetcher: Fetcher = { async fetch() { fetchCount++; return fetched; } };
-	const core = new Core({ store, references, checks, fetcher, panes, extensionEntry: "/tmp/tern-locks-extension.ts", now: () => 123_000 });
+	const core = new Core({ store, references, checks, fetcher, panes: paneControl, now: () => 123_000 });
 	activeCores.add(core);
 	expect(core.load()).toBeNull();
 	const api: CoreApi = core;
@@ -69,12 +68,12 @@ function startCore(store: Store): CoreHarness {
 	};
 }
 
-function fixture() {
+function fixture(paneControl: PaneControl = panes) {
 	const directory = mkdtempSync("/tmp/tern-core-locks-");
 	directories.push(directory);
 	const store = createStore(join(directory, "playbook.yaml"));
 	store.write(template, store.serialize(original, null));
-	return startCore(store);
+	return startCore(store, paneControl);
 }
 
 function expectError(outcome: Outcome<unknown>, code: ErrorCode) {
@@ -114,7 +113,85 @@ afterEach(() => {
 });
 
 describe("K1 hello and lock ownership", () => {
-	test("non-hello first request is NotHello; hello establishes status and allows unlocked reads", async () => {
+	test("reveal before hello focuses its own pane without taking the coordinator slot", async () => {
+		const focused: string[] = [];
+		let ownPaneCalls = 0;
+		const paneControl: PaneControl = {
+			ownPane() { ownPaneCalls++; return "reveal-pane"; },
+			async focusPane(pane) { focused.push(pane); return { ok: true }; },
+		};
+		const h = fixture(paneControl);
+		expect(await h.request({ op: "reveal", args: {} })).toEqual({ ok: true, result: null });
+		expect(ownPaneCalls).toBe(1);
+		expect(focused).toEqual(["reveal-pane"]);
+		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
+		const second = connection(2);
+		h.handler.connected(second.conn);
+		expect(await h.handler.handle(second.conn, "hello-two", { op: "hello", args: { session: "session-two", pane: "pane-two" } })).toEqual({
+			ok: true,
+			result: { blocks: ["b1", "b2", "b3"], runs: [], pane: "reveal-pane" },
+		});
+		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-two", pane: "pane-two" });
+	});
+
+	test("another connection can reveal while a coordinator is connected without replacing it or releasing its locks", async () => {
+		const focused: string[] = [];
+		let ownPaneCalls = 0;
+		const paneControl: PaneControl = {
+			ownPane() { ownPaneCalls++; return "service-pane"; },
+			async focusPane(pane) { focused.push(pane); return { ok: true }; },
+		};
+		const h = fixture(paneControl);
+		await hello(h);
+		expect(await h.request({ op: "lock", args: { block: "b1" } }, "first-lock")).toEqual({
+			ok: true,
+			result: { block: original.blocks[0] },
+		});
+		const callsBeforeReveal = ownPaneCalls;
+		const second = connection(2);
+		h.handler.connected(second.conn);
+		expect(await h.handler.handle(second.conn, "reveal-two", { op: "reveal", args: {} })).toEqual({ ok: true, result: null });
+		expect(ownPaneCalls).toBe(callsBeforeReveal + 1);
+		expect(focused).toEqual(["service-pane"]);
+		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-one", pane: "coordinator-pane" });
+		expect(visible(h, template, "b1").lock).toEqual({ kind: "coordinator", request: "first-lock" });
+	});
+
+	test("reveal without an own pane returns RevealFailed without attempting focus", async () => {
+		const focused: string[] = [];
+		let ownPaneCalls = 0;
+		const paneControl: PaneControl = {
+			ownPane() { ownPaneCalls++; return null; },
+			async focusPane(pane) { focused.push(pane); return { ok: true }; },
+		};
+		const h = fixture(paneControl);
+		expect(await h.request({ op: "reveal", args: {} })).toEqual({
+			ok: false,
+			error: { code: "RevealFailed", message: "文档服务不在 session daemon 托管的 pane 中" },
+		});
+		expect(ownPaneCalls).toBe(1);
+		expect(focused).toEqual([]);
+		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
+	});
+
+	test("reveal propagates focusPane failure as RevealFailed", async () => {
+		const focused: string[] = [];
+		let ownPaneCalls = 0;
+		const paneControl: PaneControl = {
+			ownPane() { ownPaneCalls++; return "unfocusable-pane"; },
+			async focusPane(pane) { focused.push(pane); return { ok: false, error: "pane focus was rejected" }; },
+		};
+		const h = fixture(paneControl);
+		expect(await h.request({ op: "reveal", args: {} })).toEqual({
+			ok: false,
+			error: { code: "RevealFailed", message: "pane focus was rejected" },
+		});
+		expect(ownPaneCalls).toBe(1);
+		expect(focused).toEqual(["unfocusable-pane"]);
+		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
+	});
+
+	test("read before hello is NotHello; hello establishes status and allows unlocked reads", async () => {
 		const h = fixture();
 		expectError(await h.request({ op: "read", args: {} }), "NotHello");
 		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
@@ -123,6 +200,29 @@ describe("K1 hello and lock ownership", () => {
 		expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: original });
 		expect(await h.request({ op: "read", args: { block: "b2" } })).toEqual({ ok: true, result: original.blocks[1] });
 		expect(h.fetchCount()).toBe(0);
+	});
+
+	test("an idle connection does not block hello, gets Busy after another coordinator joins, and allows replacement after disconnect", async () => {
+		const h = fixture();
+		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
+		const second = connection(2);
+		h.handler.connected(second.conn);
+		expect(await h.handler.handle(second.conn, "hello-two", { op: "hello", args: { session: "session-two", pane: "pane-two" } })).toEqual({
+			ok: true,
+			result: { blocks: ["b1", "b2", "b3"], runs: [], pane: "service-pane" },
+		});
+		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-two", pane: "pane-two" });
+		expectError(await h.request({ op: "read", args: {} }), "Busy");
+		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-two", pane: "pane-two" });
+		h.handler.disconnected(second.conn);
+		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
+		const third = connection(3);
+		h.handler.connected(third.conn);
+		expect(await h.handler.handle(third.conn, "hello-three", { op: "hello", args: { session: "session-three", pane: "pane-three" } })).toEqual({
+			ok: true,
+			result: { blocks: ["b1", "b2", "b3"], runs: [], pane: "service-pane" },
+		});
+		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-three", pane: "pane-three" });
 	});
 
 	test("second connection gets Busy without replacing or unlocking the first coordinator", async () => {

@@ -1,4 +1,6 @@
-import { lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { createConnection } from "node:net";
 import { dirname } from "node:path";
 import { parseBlockId, parseLaunchId, parseRunId, type BlockId, type JudgeReport } from "../domain/model";
 import type { Connection, K1Handler } from "../domain/ports";
@@ -114,6 +116,7 @@ export function parseRequest(op: string, args: unknown): Request | ProtocolError
 			}
 			case "snooze": return { op, args: { run: run(a.run), after: integer(a.after, "after") } };
 			case "ack": return { op, args: { event: string(a.event, "event") } };
+			case "reveal": return { op, args: {} };
 			default: throw new BadInput(`Unknown operation: ${op}`);
 		}
 	} catch (error) {
@@ -132,14 +135,83 @@ interface SocketState {
 	offset: number;
 }
 
-/** A newline JSON adapter. Core owns hello admission and all document state. */
-export function serveK1(path: string, handler: K1Handler): { close(): void } {
+/** Another document service already listens for this document (design/README.md I1). */
+export class ServiceRunning extends Error {}
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+function listening(path: string): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const probe = createConnection(path);
+	probe.once("connect", () => { probe.destroy(); resolve(true); });
+	probe.once("error", () => resolve(false));
+	return promise;
+}
+
+/**
+ * Claims the document's socket path for this process. The bind itself arbitrates: a live
+ * listener makes this process refuse; a socket file nobody listens on is moved aside by an
+ * atomic rename of exactly that inode, so concurrent starters cannot both win (I1).
+ */
+async function claim(path: string, listen: () => { close(): void }): Promise<{ close(): void }> {
 	mkdirSync(dirname(path), { recursive: true });
-	const existing = lstatSync(path, { throwIfNoEntry: false });
-	if (existing) {
-		if (!existing.isSocket()) throw new Error(`Refusing to remove a non-socket file: ${path}`);
-		unlinkSync(path);
+	for (;;) {
+		const existing = lstatSync(path, { throwIfNoEntry: false });
+		if (existing) {
+			if (!existing.isSocket()) throw new Error(`Refusing to remove a non-socket file: ${path}`);
+			if (await listening(path)) throw new ServiceRunning(`A document service is already listening at ${path}`);
+			const aside = `${path}.stale-${randomUUID()}`;
+			try { renameSync(path, aside); } catch (error) { if (errorCode(error) === "ENOENT") continue; throw error; }
+			if (lstatSync(aside).ino !== existing.ino) { renameSync(aside, path); continue; }
+			unlinkSync(aside);
+			continue;
+		}
+		try { return listen(); } catch (error) { if (errorCode(error) === "EADDRINUSE") continue; throw error; }
 	}
+}
+
+/** A newline JSON adapter. Core owns hello admission and all document state. */
+export function serveK1(path: string, handler: K1Handler): Promise<{ close(): void }> {
+	return claim(path, () => listenK1(path, handler));
+}
+
+/** Result of asking the document's service to show its pane (contracts.md K1 `reveal`). */
+export type RevealOutcome = { readonly kind: "revealed" } | { readonly kind: "absent" } | { readonly kind: "failed"; readonly message: string };
+
+/** One-shot K1 client: `reveal` needs no hello and never becomes the coordinator. */
+export function revealService(path: string): Promise<RevealOutcome> {
+	const { promise, resolve } = Promise.withResolvers<RevealOutcome>();
+	const socket = createConnection(path);
+	let buffer = "";
+	let connected = false;
+	socket.setEncoding("utf8");
+	socket.once("connect", () => {
+		connected = true;
+		socket.write(`${JSON.stringify({ id: "reveal", op: "reveal", args: {} })}\n`);
+	});
+	socket.on("data", (chunk: string) => {
+		buffer += chunk;
+		const end = buffer.indexOf("\n");
+		if (end < 0) return;
+		socket.destroy();
+		try {
+			const reply: unknown = JSON.parse(buffer.slice(0, end));
+			const frame = object(reply, "reply");
+			if (frame.ok === true) { resolve({ kind: "revealed" }); return; }
+			const error = object(frame.error, "error");
+			resolve({ kind: "failed", message: `${string(error.code, "code")}: ${string(error.message, "message")}` });
+		} catch (error) {
+			resolve({ kind: "failed", message: error instanceof Error ? error.message : String(error) });
+		}
+	});
+	socket.once("error", error => resolve(connected ? { kind: "failed", message: error.message } : { kind: "absent" }));
+	socket.once("close", () => resolve(connected ? { kind: "failed", message: "connection closed before a reply" } : { kind: "absent" }));
+	return promise;
+}
+
+function listenK1(path: string, handler: K1Handler): { close(): void } {
 	let nextConnection = 1;
 	const connections = new Set<Bun.Socket<SocketState>>();
 	const encoder = new TextEncoder();

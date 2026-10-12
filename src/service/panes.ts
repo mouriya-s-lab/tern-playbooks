@@ -41,8 +41,8 @@ async function invokeTern(args: readonly string[]): Promise<PaneResult> {
 	}
 }
 
-/** The daemon, not the caller, owns the new pane and its program. */
-export function splitCoordinator(
+/** The daemon, not the caller, owns the new pane and its program (contracts.md K5). */
+export function splitPane(
 	pane: string,
 	cwd: string,
 	command: readonly string[],

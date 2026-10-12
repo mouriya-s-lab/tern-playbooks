@@ -1,0 +1,77 @@
+--!strict
+-- Tern-side entry for Tern Playbooks (design/README.md S14, contracts.md K6).
+-- It shows a Playbook's document service, starting the service beside the focused pane
+-- when none runs. It never starts omp or any agent: the coordinator is the omp main
+-- session that calls the `playbook` tool.
+
+-- The package is linked from the repository (`tern plugin link <repo>/tern-plugin`), so the
+-- document service entry sits next to it in the same checkout.
+local MAIN = tern.plugin.dir .. "/../src/service/main.ts"
+-- `main.ts --reveal` exits 4 when no service listens for the document (contracts.md K6).
+local ABSENT = 4
+
+local function quote(text: string): string
+	return "'" .. (string.gsub(text, "'", "'\\''")) .. "'"
+end
+
+local function dirname(path: string): string
+	return string.match(path, "^(.*)/[^/]*$") or "/"
+end
+
+-- Tern windows started from the GUI may not have the user's PATH, so `bun` resolves
+-- through the login shell, as pane launches do.
+local function shell_command(args: string): { string }
+	return { tern.getenv("SHELL") or "/bin/zsh", "-lc", "exec bun " .. quote(MAIN) .. " " .. args }
+end
+
+local function show(path: string)
+	tern.process.run(shell_command("--reveal " .. quote(path)), function(result, cx)
+		if cx == nil or result.status == 0 then
+			return
+		end
+		if result.status ~= ABSENT then
+			cx:toast("error", "Playbook 无法显示", result.stderr)
+			return
+		end
+		local target = cx.session:focused()
+		if target == nil then
+			cx:toast("error", "没有可以在旁边打开 Playbook 的 pane")
+			return
+		end
+		local launch = { cwd = dirname(path), command = "exec bun " .. quote(MAIN) .. " " .. quote(path) }
+		if cx.layout:split(target, "right", launch) == nil then
+			cx:toast("error", "无法建立 Playbook pane", path)
+		end
+	end)
+end
+
+local function absolute(path: string, cwd: string?): string
+	if string.sub(path, 1, 1) == "/" or cwd == nil then
+		return path
+	end
+	return cwd .. "/" .. path
+end
+
+tern.command({
+	id = "open",
+	title = "Playbook: 打开",
+	icon = "file",
+	run = function(cx)
+		if not tern.fs.exists(MAIN) then
+			cx:toast("error", "找不到文档服务入口；请用 tern plugin link 安装", MAIN)
+			return
+		end
+		local id = cx.session:focused()
+		local pane = if id == nil then nil else cx.session:pane(id)
+		if pane ~= nil and pane.kind == "file" and pane.path ~= nil then
+			show(pane.path)
+			return
+		end
+		local cwd = if pane == nil then nil else pane.cwd
+		cx:prompt({ placeholder = "Playbook YAML 路径", icon = "file", action = "open" }):next(function(text, _err, _cx)
+			if text ~= nil and text ~= "" then
+				show(absolute(text, cwd))
+			end
+		end)
+	end,
+})
