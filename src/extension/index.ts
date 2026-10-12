@@ -336,7 +336,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const execCall = /^\s*(?:await\s+)?playbook\.exec\(\s*["'](l[1-9][0-9]*)["']\s*(?:,\s*(["'])(.+?)\2\s*)?\)\s*;?\s*$/;
 	// Code text for the eval kernel, not an import of this module: the kernel loads the helper
 	// from this installation's path, which is known only at run time.
-	const importLine = (context: Record<string, string>): string => `var playbook = (await import(${JSON.stringify(preludeEntry)})).createPlaybook({ tool, agent, ...${JSON.stringify(context)} });\n`;
+	const importLine = (context: Record<string, string>): string => `// Added by the tern-playbooks extension, not written by the model.\nvar playbook = (await import(${JSON.stringify(preludeEntry)})).createPlaybook({ tool, agent, ...${JSON.stringify(context)} });\n`;
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (ctx.agent.kind !== "main" || event.toolName !== "eval") return;
@@ -358,8 +358,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			if (!fence) return { block: true, reason: `${launchId} has no fenced js/py code in its snapshot` };
 			const context = { doc: absolute, run: record.run, launch: launchId };
 			const code = fence[1] === "js"
-				? importLine(context) + fence[2]!
-				: `PLAYBOOK_DOC = ${JSON.stringify(absolute)}\nPLAYBOOK_RUN = ${JSON.stringify(record.run)}\nPLAYBOOK_LAUNCH = ${JSON.stringify(launchId)}\n${fence[2]!}`;
+				? `// playbook.exec("${launchId}") replaced by the Launch's frozen orchestration code.\n` + importLine(context) + fence[2]!
+				: `# Added by the tern-playbooks extension: playbook.exec("${launchId}") replaced by the Launch's frozen orchestration code.\nPLAYBOOK_DOC = ${JSON.stringify(absolute)}\nPLAYBOOK_RUN = ${JSON.stringify(record.run)}\nPLAYBOOK_LAUNCH = ${JSON.stringify(launchId)}\n${fence[2]!}`;
 			return { input: { ...input, language: fence[1], code, timeout: 0, title: input.title ?? `Playbook ${launchId}` } };
 		}
 		if (/\bplaybook\.exec\s*\(/.test(input.code)) {

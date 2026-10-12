@@ -11,14 +11,17 @@ Tern Playbooks 是一个 omp 扩展。它在每个 omp 主会话中注册 `playb
 
 ## 安装
 
+在 omp 中安装插件：
+
 ```sh
-bun install
-ln -s "$PWD" ~/.omp/agent/extensions/tern-playbooks
-tern plugin link "$PWD/tern-plugin"
+omp plugin install git@github.com:mouriya-s-lab/tern-playbooks.git
 ```
 
-- omp 扩展：`package.json` 的 `omp.extensions` 声明了扩展入口，omp 每次启动会话时都会加载它，不需要 `-e`。已经在运行的 omp 会话要重启后才有 `playbook_*` 工具。
-- Tern 插件：`tern-plugin/` 在 Tern 的命令面板中提供"Playbook: 打开"。它从本仓库加载文档服务入口，所以要用 `link` 安装，不能用 `tern plugin install` 复制。
+- 安装时 omp 会运行一次扩展。扩展先检查 `PATH` 中有没有 `tern`：没有时安装失败，omp 回滚，什么都不留下。
+- 有 Tern 时，扩展把插件包里的 `tern-plugin/` 用 `tern plugin link` 装到 Tern，Tern 的命令面板随即有"Playbook: 打开"。已经装好时不重复操作。
+- 之后每个 omp 主会话都有 `playbook_*` 工具；已经在运行的 omp 会话要重启后才有。
+- omp 只对 git 或 npm 来源运行这次安装检查；从本地路径安装（`omp plugin install ./tern-playbooks`）只建立符号链接，Tern 侧在第一次启动 omp 会话时才装上。
+- `omp plugin uninstall tern-playbooks` 不会通知 Tern；卸载后用 `tern plugin unlink tern-playbooks` 移除 Tern 侧。
 
 ## Playbook 文件
 

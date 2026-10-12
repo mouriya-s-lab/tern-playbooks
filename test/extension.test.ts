@@ -477,7 +477,7 @@ for (const language of ["js", "py"] as const) {
 			const execute = new (Object.getPrototypeOf(async function () {}).constructor)("tool", "agent", rewritten.input.code) as (tool: Record<string, never>, agent: () => Promise<never>) => Promise<unknown>;
 			expect(await execute({}, async () => { throw new Error("orchestration only reads context"); })).toEqual({ doc, run: "r1", launch: "l1" });
 		} else {
-			expect(rewritten.input.code).toBe(`PLAYBOOK_DOC = ${JSON.stringify(doc)}\nPLAYBOOK_RUN = "r1"\nPLAYBOOK_LAUNCH = "l1"\n${source}`);
+			expect(rewritten.input.code.endsWith(`PLAYBOOK_DOC = ${JSON.stringify(doc)}\nPLAYBOOK_RUN = "r1"\nPLAYBOOK_LAUNCH = "l1"\n${source}`)).toBe(true);
 		}
 	});
 }
