@@ -72,11 +72,11 @@ export class K1Client {
 		return ready.promise;
 	}
 
-	async request(request: Request, id = randomUUID(), onReply?: (reply: Reply) => void): Promise<Reply> {
+	async request(request: Request, id = randomUUID()): Promise<Reply> {
 		const ready = await this.connect();
 		if (!ready.ok) return { ...ready, id };
 		if (this.state.kind !== "connected") return this.failure(id, "Disconnected");
-		return this.sendOn(this.state.link, request, id, onReply);
+		return this.sendOn(this.state.link, request, id);
 	}
 
 	close(): void {
@@ -92,10 +92,10 @@ export class K1Client {
 	private failure(id: string, code: "NoService" | "Disconnected"): Reply {
 		return { id, ok: false, error: { code, message: code === "NoService" ? "No Playbook document service is listening at this socket" : "Connection ended before a response; the operation may have been applied" } };
 	}
-	private sendOn(link: Link, request: Request, id = randomUUID(), onReply?: (reply: Reply) => void): Promise<Reply> {
+	private sendOn(link: Link, request: Request, id = randomUUID()): Promise<Reply> {
 		if (!this.owns(link) || link.socket.destroyed) return Promise.resolve(this.failure(id, "Disconnected"));
 		const pending = Promise.withResolvers<Reply>();
-		link.pending.set(id, { resolve: reply => { onReply?.(reply); pending.resolve(reply); } });
+		link.pending.set(id, { resolve: pending.resolve });
 		link.socket.write(JSON.stringify({ id, op: request.op, args: request.args }) + "\n");
 		return pending.promise;
 	}
