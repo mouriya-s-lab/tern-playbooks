@@ -18,6 +18,7 @@
 | D1.8 | [Text and Code §md](https://docs.stencil.so/tern/elements/text.md)、[Transport §Blobs](https://docs.stencil.so/tern/protocol/transport.md)、[Data §image](https://docs.stencil.so/tern/elements/data.md)、[Theme](https://docs.stencil.so/tern/protocol/theme.md) 与 E1.3 | "Mermaid … the diagram at natural size"；"`b` sends binary data, an image an `image` node shows"；"An SVG blob (`image/svg+xml`, at most 256 KiB) is mounted as real SVG elements"；"reports the appearance as `dark` in the `hello` reply and sends `{"ev":"theme","dark":bool}` when it changes" |
 | S1 的替代 | [Window API §Documents cx](https://docs.stencil.so/tern/reference/api-window.md)、[Events](https://docs.stencil.so/tern/reference/events.md) 与 E1.4 | "Desktop `cx.docs` works at document level, not editor-widget level."；`cx.docs` 只有打开、读、大纲、写、编辑、追加、保存、新建笔记与搜索，没有只读、锁或按钮接口；window 事件只有 `window_start`、`focus`、`pane_created`、`pane_closed`、`tab_created`、`tab_closed`、`command_started`、`command_finished`、`cwd`、`title`、`canvas_action`，"Any other name raises `tern.on: unknown window event <name>`"，没有文档变化事件 |
 | S3、S4 的替代 | [Window API §Agent cx](https://docs.stencil.so/tern/reference/api-window.md) | "`start({prompt, cwd, command?, how?}) -> pane`: opens like New agent block"；"`ask(agent, text)`: pastes one prompt and presses Enter; requires ready input."；"`wait(agent, {timeout?})` … waits until idle, returning the last assistant text" |
+| D1.12 | [Packages and Manifests](https://docs.stencil.so/tern/concepts/packages.md)、[Command Line §plugin](https://docs.stencil.so/tern/reference/cli.md)、[Commands, Keys, and Overrides](https://docs.stencil.so/tern/guides/commands.md)、[Window API](https://docs.stencil.so/tern/reference/api-window.md) 与 E1.8 | "A plugin is a directory holding a `plugin.toml` manifest, up to two Luau entry files…"；`link`："Uses a package where it is: writes `<plugins>/<id>.path` … Tern loads the package from that directory and watches it"；`tern plugin types` 写出的 `tern.d.luau`（tern 0.8.2）：`tern.command(def)` 的 `CommandDef = {id, title, icon?, group?, keys?, available?, run}`；`SessionCx:pane(pane)`、`focused()`，`PaneInfo` 有 `kind`（含 `"file"`）、`path`、`title`、`program`、`cwd`，没有 argv；`WindowCx:prompt(opts) -> Awaitable<string?>`；`tern.process.run(argv, opts?, cb)`，回调得到 `{status, stdout, stderr, timed_out}` 与新的 `cx`；`LayoutCx:split(target, dir, launch?, reveal?) -> number?`，`Launch = {cwd?, command?}`，`command` 为 shell 命令行；`tern.plugin.dir` 为插件目录的绝对路径；没有 socket 接口 |
 
 ### E1.1 TSP 编辑输入
 
@@ -114,6 +115,14 @@ Native composer editing 关闭（在设置页点击开关，截图确认已关�
 - 连续输入 190 个字符期间，`done` 勾选引发全量重绘，此时草稿长度为 176，其余 14 个字符在重绘之后到达；Esc 提交并写回完整的 190 个字符。
 - 在真实协调者用 `eval` 的 `agent()` 编排、subagent 工作并不断写时间线的负载下，对一个编排块的正文执行"铅笔、⌘A、输入 776 个字符、Esc"共 67 轮（ecd136d 37 轮、75c52da 30 轮）：67 轮全部在 Esc 之前收到完整文字，提交内容与写回文件一致；没有一轮提交旧正文。其中 2 轮因 ⌘A 先于编辑框出现而得到追加（`/tmp/pb-oldbody/`）。
 
+### E1.8 插件入口
+
+条件：`tern 0.8.2 (44c7f76)`，2026-10-12；调研记录在 `local://tern-plugin-entry.md`。
+
+- pane 标题：文档服务以 TSP `o` 帧设置界面标题"Tern Playbooks"时，`tern inspect --json` 中它的 pane `title` 为空字符串（pane 28896539967489）。一个 pane 中的程序输出 OSC 0 `\033]0;Playbook · /tmp/pb-title-probe.yaml\007` 后，该 pane 的 `title` 为 `Playbook · /tmp/pb-title-probe.yaml`（tab 29489245454337，`shown: false`）。
+- `tern plugin link /Users/mouriya/Ext/code/tern-playbooks/tern-plugin --json` 输出 `{"id": "tern-playbooks", "version": "0.1.0", "dir": "…/tern-plugin"}`；`tern plugin list --json` 中该插件 `"window": true, "status": "ready"`，`problems` 为空。
+- 无头验收（`local://accept-tern-entry.md`；`tern serve` 加 loopback session daemon，以 `plugins fixtures` 加载 `.path` 指向本仓库 `tern-plugin` 的插件）：聚焦 `playbook.yaml` 文件块执行 `plugin.tern-playbooks.open`，旁边出现文档服务 pane，界面显示标题与"没有协调者连接"，进程中只有一个 `bun` 文档服务，没有 omp（截图 `scenario1-valid.png`）；再次执行时没有新 pane，焦点移到已有的文档服务 pane；在新 pane 中再运行一次 `bun …/main.ts <yaml>`，该进程以退出码 0 退出、它的 pane 关闭，原文档服务 pane 获得焦点；`main.ts --reveal <另一个没有服务的 yaml>` 退出码为 4；在 shell pane 上执行命令时出现"Playbook YAML 路径"输入框，输入路径后显示已有的文档服务 pane。
+
 ## E2 omp
 
 条件：本机 `omp/18.8.8`（Tern 自带，路径 `~/Library/Application Support/Tern/omp/versions/18.8.8`）；源码对照 `@oh-my-pi/pi-coding-agent` 18.8.7。
@@ -193,7 +202,7 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
   | good | 0.21 | 0.08 |
   | missing | 0.97 | 0.07 |
   | empty_ref | 0.91 | 0.91 |
-- 产品启动路径（omp 18.8.9，K5 的启动命令 `env PLAYBOOK_DOC=<模板> omp -e <扩展入口>`，记录在 `/tmp/jev-routing/product-fresh.rpc.log`）：协调者在 `eval` 中调用 `judge` 与 `judge_batch`，`status()` 报告 `commandcode/typesafe/jev`，用量记录为 `api typesafe`。`judge` 角色的 jev 由用户安装的 commandcode provider 插件注册；以 `--no-extensions` 启动 omp 时该插件不加载，`judge` 退回内置的候选模型（实测为 `openai-codex/gpt-6-astra`）。
+- 协调者会话中的路由（omp 18.8.9，该次实验以 `env PLAYBOOK_DOC=<模板> omp -e <扩展入口>` 启动协调者会话，记录在 `/tmp/jev-routing/product-fresh.rpc.log`）：协调者在 `eval` 中调用 `judge` 与 `judge_batch`，`status()` 报告 `commandcode/typesafe/jev`，用量记录为 `api typesafe`。`judge` 角色的 jev 由用户安装的 commandcode provider 插件注册；以 `--no-extensions` 启动 omp 时该插件不加载，`judge` 退回内置的候选模型（实测为 `openai-codex/gpt-6-astra`）。
 
 ### E2.7 扩展中止协调者的 agent 操作
 
@@ -254,6 +263,24 @@ rpc 输出中，`session_settled` 之后出现 `role: "custom"`、`customType: "
 - 源码（`@oh-my-pi/pi-coding-agent` 18.8.7）：`src/task/structured-subagent.ts:597-600` 把父会话准备好的扩展转交给子会话，`src/sdk.ts:2652-2663` 为子会话重新调用扩展工厂；`src/extensibility/extensions/types.ts:466-483` 上下文的 `agent` 字段为 `{kind: "main" | "sub", id, name, depth, parentId?}`，`src/sdk.ts:3299-3305` 由宿主创建并冻结；`src/sdk.ts:4740-4743` 支持在 `session_start` 之后注册工具。omp 18.8.9 的可执行文件中有相同的实现。
 - 探针（omp 18.8.9，`omp -p --no-session --auto-approve -e /tmp/tern-subagent-probe.ts`，模型在 JS `eval` 中 `await agent(prompt, {agent: "task:low"})`，记录在 `/tmp/tern-subagent-probe-final.jsonl`）：扩展工厂运行两次；父会话 `ctx.agent` 为 `{kind: "main", depth: 0}`，子会话为 `{kind: "sub", depth: 1, parentId: "Main"}`；两者进程 id 与 `PLAYBOOK_DOC` 相同。只在 `kind` 为 `main` 的 `session_start` 中注册的工具出现在父会话的模型请求中，不出现在子会话的工具列表与模型请求中。
 - 端到端验收（`local://e2e-u4.md`）观察到修复前的后果：文档服务重启后，一个已结束的 subagent 的会话 id 成为文档服务的连接，协调者的请求得到 `Busy`。
+
+### E2.11 全局扩展与模型自发使用
+
+对应 D2.11 与 S13。
+
+- 源码（`@oh-my-pi/pi-coding-agent`，本仓库 `node_modules`）：`src/discovery/builtin.ts:500-512` 对每个配置目录调用 `discoverExtensionModulePaths(<配置目录>/extensions)`；`src/discovery/helpers.ts:826-902` 的发现规则为 `extensions/*.ts`、`extensions/<名>/index.ts`，以及 `extensions/<名>/package.json` 中 `omp`（或 `pi`）字段的 `extensions` 列出的路径，符号链接的目录按真实目录处理（`:853-870`）；`src/extensibility/extensions/types.ts:686-687` 扩展工具的 `loadMode` 默认为 `discoverable`；`src/session/session-tools.ts:1131-1135` 把 `discoverable` 工具挂到工具设备列表，注释为 "Demoted tools stay reachable through the eval bridge"。
+- 安装：`~/.omp/agent/extensions/tern-playbooks` 是指向本仓库的符号链接，仓库 `package.json` 声明 `"omp": {"extensions": ["./src/extension/index.ts"]}`。
+- 运行（`omp/18.10.1`、`tern 0.8.2 (44c7f76)`，2026-10-12）：在 Tern pane 中以 `tern split <pane> right --cwd /tmp/pb-run2 -- omp` 启动不带参数的 omp，输入"帮我在这个目录建一个 playbook：第一块引用 notes.txt 的前两行，第二块让 agent 根据第一块写一句维护通知。建好后在 Tern 里打开给我看，然后告诉我第二块编译出来的 prompt。不要启动 agent。"，没有提到工具名。模型先读 `xd://playbook`，写出 `/tmp/pb-run2/maintenance.yaml`，调用 `open`；扩展在 omp 的 pane 右侧建立文档服务 pane，该 pane 头部显示"协调者会话 01a12f1c-…"。模型再调用 `compile` 并贴出 prompt，其中 `<external source="file:notes.txt">` 只含 `notes.txt` 的前两行。
+- 同一会话中，模型在 JS `eval` 中执行 `await tool.playbook({doc, op: "read", args: {block: "b1"}})`，返回 `{"id":"b1","title":"部署背景","body":"((file:notes.txt | lines(1..2)))\n","done":false}`。
+- 焦点：在窗口当前显示的标签页中，一次 `open`（omp pane 28965259444225）之后，`tern inspect --json` 显示新建的文档服务 pane 29033978920961 为 `focused: true`，omp pane 为 `false`；扩展与验收程序都没有调用 `tern focus`，但人在运行期间切换过标签页，人的操作是否参与其中没有排除（`local://accept-a.md`）。在没有显示的标签页中（tab 29257317220353），`open` 之后协调者 pane 29257317220354 仍为 `focused: true`，新建的文档服务 pane 29278792056833 为 `false`；在该标签页中直接执行 `tern split` 结果相同（`local://accept-lifecycle.md`）。
+- `eval` 中经 `tool.playbook` 调用 `runs` 与 `read` 返回文档服务的 JSON：`{"runs":[]}` 与模板的 `title`、`blocks`（`local://accept-d.md`）。
+- 没有 `TERN_PANE` 的 omp 主会话（`env -u TERN_PANE omp`）仍有 `playbook` 工具；对没有运行文档服务的文件调用 `open` 返回 `StartFailed`，没有建立 pane（`local://accept-f.md`）。
+- 协调者 `launch` 一个 Run 中的块之后，修改该 Run 文件中被依赖块的正文，约 2 s 后协调者会话收到含 Launch id 与差异的 `block_changed` 通知（`local://accept-c.md`）。
+- 生命周期（`local://accept-lifecycle.md`，单独的标签页，同一时刻只有一个 omp 会话）：
+  - 协调者在 `eval` 中以 `agent()` 启动 `task:low` subagent，标签页中始终只有一个 omp pane 与一个文档服务 pane；`bind` 与结果的 `post` 写入 `lifecycle.runs/r1.jsonl`（`agent_bound` seq 3 与 6，`post` seq 4 与 7）。
+  - 协调者会话 `/exit` 之后，文档服务 pane 29278792056833 保留，头部显示"没有协调者连接"。
+  - 新启动的 omp 会话对同一文件调用 `open`：没有建立新 pane，原 pane 头部变为新会话 id，回答列出之前的 Run r1。
+  - 人在 pane 中手动运行 `bun …/src/service/main.ts <yaml>`：头部只显示"没有协调者连接"；随后 omp 会话对该文件调用 `open`，没有建立新 pane，头部变为该会话 id。
 
 ## E3 GitHub
 

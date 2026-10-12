@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
-// Document service entry: `tern-playbook <playbook.yaml>` run inside a Tern pane.
+// Document service entry, run inside a Tern pane:
+//   tern-playbook <playbook.yaml>           serve the document (one live service per document)
+//   tern-playbook --reveal <playbook.yaml>  show the running service's pane; exit 4 when none runs
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -7,33 +9,53 @@ import { socketPath } from "../domain/protocol";
 import { checks } from "./checks";
 import { Core } from "./core";
 import { fetcher } from "./fetch";
-import { focusPane, ownPane, splitCoordinator } from "./panes";
+import { focusPane, ownPane } from "./panes";
 import { references } from "./references";
-import { serveK1 } from "./socket";
+import { revealService, serveK1, ServiceRunning } from "./socket";
 import { createStore } from "./store";
 import { createTspSession } from "./tsp";
 import { startUi } from "./ui";
 
-const file = process.argv[2];
+const reveal = process.argv[2] === "--reveal";
+const file = reveal ? process.argv[3] : process.argv[2];
 if (!file) {
-	process.stderr.write("用法：tern-playbook <playbook.yaml>\n");
+	process.stderr.write("用法：tern-playbook [--reveal] <playbook.yaml>\n");
 	process.exit(2);
 }
 const templatePath = realpathSync(resolve(file));
+const endpoint = socketPath(tmpdir(), templatePath);
+if (reveal) {
+	const outcome = await revealService(endpoint);
+	switch (outcome.kind) {
+		case "revealed": process.exit(0);
+		case "absent": process.exit(4);
+		case "failed": process.stderr.write(`${outcome.message}\n`); process.exit(5);
+	}
+}
 const core = new Core({
 	store: createStore(templatePath),
 	references,
 	fetcher,
 	checks,
-	panes: { ownPane, splitCoordinator, focusPane },
-	extensionEntry: resolve(import.meta.dir, "../extension/index.ts"),
+	panes: { ownPane, focusPane },
 });
 const loadError = core.load();
 if (loadError !== null) {
 	process.stderr.write(`Playbook 文件不能解析：${loadError}\n`);
 	process.exit(1);
 }
-const server = serveK1(socketPath(tmpdir(), templatePath), core);
+let server: { close(): void };
+try {
+	server = await serveK1(endpoint, core);
+} catch (error) {
+	core.stop();
+	if (!(error instanceof ServiceRunning)) throw error;
+	// The document already has its service: show that pane and leave, so this pane closes.
+	const outcome = await revealService(endpoint);
+	if (outcome.kind === "revealed") process.exit(0);
+	process.stderr.write(`这个 Playbook 的文档服务已在运行：${templatePath}\n${outcome.kind === "failed" ? `${outcome.message}\n` : ""}`);
+	process.exit(3);
+}
 startUi(core, createTspSession());
 
 const shutdown = (): void => {

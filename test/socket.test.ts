@@ -6,7 +6,7 @@ import { setImmediate } from "node:timers/promises";
 import { dirname } from "node:path";
 import type { Connection, K1Handler } from "../src/domain/ports";
 import type { Outcome, Request } from "../src/domain/protocol";
-import { parseRequest, serveK1 } from "../src/service/socket";
+import { parseRequest, revealService, serveK1, ServiceRunning } from "../src/service/socket";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -49,14 +49,15 @@ async function client(path: string): Promise<{ socket: Socket; next(): Promise<u
 	};
 }
 
-function start(path: string, handle: K1Handler["handle"], disconnected: K1Handler["disconnected"] = () => {}, connected: K1Handler["connected"] = () => {}) {
-	const server = serveK1(path, { connected, disconnected, handle });
+async function start(path: string, handle: K1Handler["handle"], disconnected: K1Handler["disconnected"] = () => {}, connected: K1Handler["connected"] = () => {}) {
+	const server = await serveK1(path, { connected, disconnected, handle });
 	cleanups.push(() => server.close());
 	return server;
 }
 
 const valid: readonly [string, unknown][] = [
 	["hello", { session: "session", pane: "pane" }],
+	["reveal", {}],
 	["lock", { run: "r1", block: "b2" }],
 	["unlock", { block: "b2", request: "lock-id" }],
 	["read", { run: "r1", block: "b2" }],
@@ -162,7 +163,7 @@ describe("serveK1 real Unix sockets", () => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const calls: string[] = [];
-		start(path, async (_conn, id) => {
+		await start(path, async (_conn, id) => {
 			calls.push(id);
 			if (id === "first") { entered.resolve(); await release.promise; }
 			return { ok: true, result: id };
@@ -181,7 +182,7 @@ describe("serveK1 real Unix sockets", () => {
 
 	test("pushes events and preserves success-without-result and error frames", async () => {
 		const path = tempPath();
-		start(path, async (conn, id): Promise<Outcome<unknown>> => {
+		await start(path, async (conn, id): Promise<Outcome<unknown>> => {
 			conn.send({ event: "run_started", data: { run: "r1", name: "Run" } });
 			return id === "empty" ? { ok: true, result: undefined } : { ok: false, error: { code: "NotHello", message: "hello required" } };
 		});
@@ -197,7 +198,7 @@ describe("serveK1 real Unix sockets", () => {
 	test("joins partial lines and split UTF-8 code points without premature handling", async () => {
 		const path = tempPath();
 		const requests: Request[] = [];
-		start(path, async (_conn, _id, request) => { requests.push(request); return { ok: true, result: request.args }; });
+		await start(path, async (_conn, _id, request) => { requests.push(request); return { ok: true, result: request.args }; });
 		const c = await client(path);
 		const bytes = Buffer.from('{"id":"unicode","op":"hello","args":{"session":"你好🌟"}}\n');
 		const split = bytes.indexOf(Buffer.from("好")) + 1;
@@ -220,7 +221,7 @@ describe("serveK1 real Unix sockets", () => {
 		const disconnected = Promise.withResolvers<Connection>();
 		const calls: string[] = [];
 		const closed: Connection[] = [];
-		start(path, async (_conn, id) => {
+		await start(path, async (_conn, id) => {
 			calls.push(id); entered.resolve(); await release.promise; finished.resolve();
 			return { ok: true, result: id };
 		}, conn => { closed.push(conn); disconnected.resolve(conn); });
@@ -241,7 +242,7 @@ describe("serveK1 real Unix sockets", () => {
 	test("shutdown closes every connection and unlinks the socket", async () => {
 		const path = tempPath();
 		const closed: number[] = [];
-		const server = start(path, async () => ({ ok: true, result: null }), conn => closed.push(conn.id));
+		const server = await start(path, async () => ({ ok: true, result: null }), conn => closed.push(conn.id));
 		const a = await client(path);
 		const b = await client(path);
 		const aClosed = once(a.socket, "close");
@@ -258,7 +259,7 @@ describe("serveK1 real Unix sockets", () => {
 		for (const frame of ['not-json\n', '{"id":1,"op":"runs","args":{}}\n', '{"id":"throw","op":"runs","args":{}}\n']) {
 			const path = tempPath();
 			const disconnected = Promise.withResolvers<void>();
-			start(path, async () => { throw new Error("unexpected failure"); }, () => disconnected.resolve());
+			await start(path, async () => { throw new Error("unexpected failure"); }, () => disconnected.resolve());
 			const c = await client(path);
 			const closed = once(c.socket, "close");
 			c.socket.write(frame);
@@ -268,7 +269,7 @@ describe("serveK1 real Unix sockets", () => {
 
 	test("returns BadValue for identifiable malformed envelopes and continues", async () => {
 		const path = tempPath();
-		start(path, async () => ({ ok: true, result: "continued" }));
+		await start(path, async () => ({ ok: true, result: "continued" }));
 		const c = await client(path);
 		c.socket.write('{"id":"bad","op":3,"args":{}}\n{"id":"good","op":"runs","args":{}}\n');
 		expect(await c.next()).toMatchObject({ id: "bad", ok: false, error: { code: "BadValue" } });
@@ -278,7 +279,7 @@ describe("serveK1 real Unix sockets", () => {
 	test("delivers large event frames without losing bytes under backpressure", async () => {
 		const path = tempPath();
 		const name = "状态".repeat(300_000);
-		start(path, async conn => {
+		await start(path, async conn => {
 			conn.send({ event: "run_started", data: { run: "r1", name } });
 			conn.send({ event: "run_finished", data: { run: "r1" } });
 			return { ok: true, result: "done" };
@@ -302,16 +303,95 @@ describe("serveK1 real Unix sockets", () => {
 		child.kill("SIGKILL");
 		await child.exited;
 		expect(existsSync(path)).toBe(true);
-		start(path, async () => ({ ok: true, result: "replaced" }));
+		await start(path, async () => ({ ok: true, result: "replaced" }));
 		const c = await client(path);
 		c.socket.write('{"id":"stale","op":"runs","args":{}}\n');
 		expect(await c.next()).toEqual({ id: "stale", ok: true, result: "replaced" });
 	});
 
-	test("does not delete non-socket files", () => {
+	test("rejects a second live server without disrupting the first", async () => {
+		const path = tempPath();
+		await start(path, async () => ({ ok: true, result: "original" }));
+		await expect(start(path, async () => ({ ok: true, result: "contender" }))).rejects.toBeInstanceOf(ServiceRunning);
+		const c = await client(path);
+		c.socket.write('{"id":"live","op":"runs","args":{}}\n');
+		expect(await c.next()).toEqual({ id: "live", ok: true, result: "original" });
+	});
+
+	test("elects one live server when two claims race on a residual socket", async () => {
+		const path = tempPath();
+		mkdirSync(dirname(path), { recursive: true });
+		const child = Bun.spawn([process.execPath, "-e", `Bun.listen({unix:${JSON.stringify(path)},socket:{data(){}}});console.log("ready")`], { stdout: "pipe", stderr: "inherit" });
+		cleanups.push(() => child.kill("SIGKILL"));
+		const reader = child.stdout.getReader();
+		const ready = await reader.read();
+		expect(new TextDecoder().decode(ready.value)).toContain("ready");
+		reader.releaseLock();
+		child.kill("SIGKILL");
+		await child.exited;
+		expect(existsSync(path)).toBe(true);
+		const claims = await Promise.allSettled([
+			start(path, async () => ({ ok: true, result: "winner-0" })),
+			start(path, async () => ({ ok: true, result: "winner-1" })),
+		]);
+		expect(claims.filter(claim => claim.status === "fulfilled")).toHaveLength(1);
+		const rejected = claims.filter(claim => claim.status === "rejected");
+		expect(rejected).toHaveLength(1);
+		for (const claim of rejected) expect(claim.reason).toBeInstanceOf(ServiceRunning);
+		const winner = claims.findIndex(claim => claim.status === "fulfilled");
+		const c = await client(path);
+		c.socket.write('{"id":"race","op":"runs","args":{}}\n');
+		expect(await c.next()).toEqual({ id: "race", ok: true, result: `winner-${winner}` });
+	});
+
+	test("does not delete non-socket files", async () => {
 		const path = tempPath().replace("/nested/service.sock", "/ordinary");
 		writeFileSync(path, "keep");
-		expect(() => serveK1(path, { connected() {}, disconnected() {}, async handle() { return { ok: true, result: null }; } })).toThrow("non-socket");
+		await expect(serveK1(path, { connected() {}, disconnected() {}, async handle() { return { ok: true, result: null }; } })).rejects.toThrow(`Refusing to remove a non-socket file: ${path}`);
 		expect(readFileSync(path, "utf8")).toBe("keep");
+	});
+});
+
+describe("revealService real Unix sockets", () => {
+	test("sends reveal and returns revealed for an ok reply", async () => {
+		const path = tempPath();
+		const requests: Request[] = [];
+		await start(path, async (_conn, _id, request) => {
+			requests.push(request);
+			return { ok: true, result: null };
+		});
+
+		expect(await revealService(path)).toEqual({ kind: "revealed" });
+		expect(requests).toEqual([{ op: "reveal", args: {} }]);
+	});
+
+	test("returns failed with the code and message from a RevealFailed reply", async () => {
+		const path = tempPath();
+		await start(path, async () => ({
+			ok: false,
+			error: { code: "RevealFailed", message: "pane could not be focused" },
+		}));
+
+		expect(await revealService(path)).toEqual({
+			kind: "failed",
+			message: "RevealFailed: pane could not be focused",
+		});
+	});
+
+	test("returns absent when no service listens on the path", async () => {
+		expect(await revealService(tempPath())).toEqual({ kind: "absent" });
+	});
+
+	test("returns failed when the service closes without replying", async () => {
+		const path = tempPath();
+		await start(path, async conn => {
+			conn.close();
+			return { ok: true, result: null };
+		});
+
+		expect(await revealService(path)).toEqual({
+			kind: "failed",
+			message: "connection closed before a reply",
+		});
 	});
 });

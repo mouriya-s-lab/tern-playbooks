@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { parseBlockId, parseLaunchId, parseRunId, type BlockId, type RunId } from "../domain/model";
 import { socketPath, type EventPayload, type Request, type ServerFrame } from "../domain/protocol";
 import { K1Client, type Reply } from "./client";
+import { splitPane } from "../service/panes";
 
 type LockRecord = { readonly client: K1Client; readonly run?: RunId; readonly block: BlockId; readonly request: string; readonly abort: () => void };
 type Operation = { readonly locks: Map<string, LockRecord> };
@@ -30,6 +32,7 @@ export default function (pi: ExtensionAPI): void {
 		z.object({ kind: z.literal("judge_unavailable") }).strict(),
 	]);
 	const parameters = z.union([
+		z.object({ doc: z.string(), op: z.literal("open"), args: z.object({}).strict() }).strict(),
 		z.object({ doc: z.string(), op: z.literal("lock"), args: z.object(scopedBlock).strict() }).strict(),
 		z.object({ doc: z.string(), op: z.literal("unlock"), args: z.object(scopedBlock).strict() }).strict(),
 		z.object({ doc: z.string(), op: z.literal("read"), args: z.object({ ...scope, block: block.optional() }).strict() }).strict(),
@@ -85,7 +88,7 @@ export default function (pi: ExtensionAPI): void {
 		z.object({ event: z.literal("update_due"), data: z.object({ run, due: z.number(), last_update: z.number().nullable() }) }),
 		z.object({ event: z.literal("interrupted"), data: z.object({ ...scopedBlock, request: z.string() }) }),
 	]);
-	const error = z.object({ code: z.enum(["Busy", "NotHello", "Locked", "NotLocked", "UnknownBlock", "UnknownRun", "RunFinished", "BadValue", "NotFound", "Ambiguous", "BadLaunch", "CompileError", "UnknownTarget", "BadReport", "UnknownLaunch", "NotOwner", "UnknownEvent"]), message: z.string(), detail: z.unknown().optional() });
+	const error = z.object({ code: z.enum(["Busy", "NotHello", "Locked", "NotLocked", "UnknownBlock", "UnknownRun", "RunFinished", "BadValue", "NotFound", "Ambiguous", "BadLaunch", "CompileError", "UnknownTarget", "BadReport", "UnknownLaunch", "NotOwner", "UnknownEvent", "RevealFailed"]), message: z.string(), detail: z.unknown().optional() });
 	const frames = z.union([events, z.object({ id: z.string(), ok: z.literal(true), result: z.unknown().optional() }).strict().transform(frame => ({ ...frame, result: frame.result })), z.object({ id: z.string(), ok: z.literal(false), error }).strict()]);
 	const summary = z.object({ id: run, name: z.string(), status: z.enum(["running", "finished"]), started_at: z.number(), finished_at: z.number().nullable(), done: z.number(), total: z.number(), update_due: z.number().nullable(), update_overdue: z.boolean(), retrospective: z.boolean() });
 	const runsResult = z.object({ runs: z.array(summary) });
@@ -127,33 +130,71 @@ export default function (pi: ExtensionAPI): void {
 		return client;
 	}
 
+	// K5: the document service shipped beside this extension in the same installation.
+	const serviceEntry = resolve(import.meta.dir, "../service/main.ts");
+	const OPEN_WAIT_MS = 10_000;
+	const startFailed = (message: string): Reply => ({ id: "", ok: false, error: { code: "StartFailed", message } });
+
+	/** K2 `open`: connect to the document's service, starting it in a Tern pane beside this session when none listens. */
+	async function open(doc: string, ctx: ExtensionContext): Promise<Reply> {
+		const client = await clientFor(doc, ctx);
+		const ready = await client.connect();
+		if (ready.ok || ready.error.code !== "NoService") return ready;
+		const pane = process.env.TERN_PANE;
+		if (!pane) return startFailed("omp is not running in a Tern pane hosted by the session daemon (no TERN_PANE), so it cannot open the document service beside this session. Start it yourself in a Tern pane with `bun " + serviceEntry + " <playbook.yaml>`, then call `open` again from this session to connect");
+		const absolute = await realpath(doc);
+		const split = await splitPane(pane, dirname(absolute), ["bun", serviceEntry, absolute]);
+		if (!split.ok) return startFailed(split.error);
+		const deadline = Date.now() + OPEN_WAIT_MS;
+		for (;;) {
+			await Bun.sleep(250);
+			const next = await client.connect();
+			if (next.ok || next.error.code !== "NoService") return next;
+			if (Date.now() >= deadline) return startFailed(`The document service in Tern pane ${split.pane} did not listen within ${OPEN_WAIT_MS / 1000} s; its pane shows why`);
+		}
+	}
+
+	const description = [
+		"Tern Playbooks: a Playbook is a YAML prompt document the user and you edit together; a document service shows it as form cards in a Tern pane beside this session.",
+		"Use this tool when the user wants to write, review, or run multi-step agent work as a Playbook, or points at a Playbook .yaml file.",
+		"File format: `title: <text>` and `blocks:` a list of `{id: b<n>, title, body, done: false}`; write `body` as a YAML block scalar (`|`). A body is Markdown and may reference `((b2))` (another block), `((file:path | lines(1..40)))` (path relative to the Playbook), or `((https://github.com/o/r/issues/1))`.",
+		"Call op `open` (args {}) first: it connects to the Playbook, opening its document service in a new Tern pane when none runs. For a new Playbook, write the YAML file, then `open` it.",
+		"Then: `read` the blocks; `insert` blocks; `lock` a block before `set`/`edit`/`delete` it (your locks end when your turn ends); `compile` blocks to get the exact prompt they produce.",
+		"To run work: `start_run` copies the template into a Run; `launch` {run, blocks} returns the compiled prompt, which you pass to `agent()` in eval, then `bind` the Launch to the agent id and `post` the result. Omit `run` to act on the template.",
+		"The user's edits to launched blocks, launch requests from the form, and Run events arrive in this session as asides.",
+	].join(" ");
+
 	// R4: the document service offers no interface to subagents. omp loads this extension in
-	// every child session too (same process, same environment), so the tool, the commands and
-	// the PLAYBOOK_DOC connection exist only in the main coordinator session.
+	// every child session too (same process, same environment), so the tool and the commands
+	// exist only in the main session, which is the coordinator.
 	const registerPlaybookTool = (): void => pi.registerTool({
-		name: "playbook", label: "Playbook", loadMode: "essential",
-		description: "Operate a running Playbook document service using K1 operations. Omit run to operate on the template. Block writes require lock; locks end when this agent operation ends. hello and ack are managed by the extension. post records coordinator-authored text.",
+		name: "playbook", label: "Playbook",
+		description,
 		parameters,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			let reply: Reply;
 			try {
 				const parsed = parameters.parse(params);
-				const client = await clientFor(parsed.doc, ctx);
-				const current = operation;
-				const id = randomUUID();
-				if (parsed.op === "unlock") {
-					const key = JSON.stringify([client.path, parsed.args.run ?? null, parsed.args.block]);
-					const lock = current.locks.get(key);
-					reply = lock ? await client.request({ op: "unlock", args: { ...parsed.args, request: lock.request } }, id) : { id, ok: true, result: undefined };
-					if (reply.ok && lock) current.locks.delete(key);
+				if (parsed.op === "open") {
+					reply = await open(parsed.doc, ctx);
 				} else {
-					const request: Request = parsed;
-					reply = await client.request(request, id, response => {
-						if (parsed.op === "lock" && response.ok) {
-							const key = JSON.stringify([client.path, parsed.args.run ?? null, parsed.args.block]);
-							current.locks.set(key, { client, ...parsed.args, request: id, abort: () => ctx.abort() });
-						}
-					});
+					const client = await clientFor(parsed.doc, ctx);
+					const current = operation;
+					const id = randomUUID();
+					if (parsed.op === "unlock") {
+						const key = JSON.stringify([client.path, parsed.args.run ?? null, parsed.args.block]);
+						const lock = current.locks.get(key);
+						reply = lock ? await client.request({ op: "unlock", args: { ...parsed.args, request: lock.request } }, id) : { id, ok: true, result: undefined };
+						if (reply.ok && lock) current.locks.delete(key);
+					} else {
+						const request: Request = parsed;
+						reply = await client.request(request, id, response => {
+							if (parsed.op === "lock" && response.ok) {
+								const key = JSON.stringify([client.path, parsed.args.run ?? null, parsed.args.block]);
+								current.locks.set(key, { client, ...parsed.args, request: id, abort: () => ctx.abort() });
+							}
+						});
+					}
 				}
 			} catch (error) {
 				reply = { id: "", ok: false, error: { code: "NoService", message: error instanceof Error ? error.message : String(error) } };
@@ -166,12 +207,6 @@ export default function (pi: ExtensionAPI): void {
 		if (ctx.agent.kind !== "main") return;
 		registerPlaybookTool();
 		registerCommands();
-		if (!process.env.PLAYBOOK_DOC) return;
-		try {
-			const client = await clientFor(process.env.PLAYBOOK_DOC, ctx);
-			const ready = await client.connect();
-			if (!ready.ok) ctx.ui.notify(`${ready.error.code}: ${ready.error.message}`, "error");
-		} catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
 	});
 
 	pi.on("agent_start", () => { operation = { locks: new Map() }; });
@@ -194,8 +229,7 @@ export default function (pi: ExtensionAPI): void {
 			const connected = [...clients.entries()].filter(([, client]) => client.connected);
 			if (connected.length === 1) doc = connected[0]![0];
 			else if (connected.length > 1) { const selected = await ctx.ui.select("Choose Playbook", connected.map(([path]) => path)); if (selected === undefined) return; doc = selected; }
-			else doc = process.env.PLAYBOOK_DOC ?? "";
-			if (!doc) { ctx.ui.notify("请指定 Playbook 文件路径", "error"); return; }
+			else { ctx.ui.notify("请指定 Playbook 文件路径", "error"); return; }
 		}
 		const client = await clientFor(doc, ctx);
 		const ready = await client.connect();

@@ -22,9 +22,6 @@ class FakeCore implements CoreApi {
 	view(ref: DocRef): DocView { return ref.kind === "template" ? this.template : this.run; }
 	runs(): RunSummary[] { return [{ id: "r1", name: "Incident", status: this.run.run!.status, started_at: 1000, finished_at: this.run.run!.finishedAt, done: 0, total: 2, update_due: this.run.run!.updateDue, update_overdue: this.run.run!.updateDue !== null, retrospective: this.run.retrospective }]; }
 	coordinator() { return { connected: this.connected, session: this.connected ? "session-a" : null, pane: this.connected ? "pane-a" : null }; }
-	coordinatorCommand(): string { return "env PLAYBOOK_DOC=/tmp/playbook.yaml omp -e /tmp/extension.ts"; }
-	canStartCoordinator(): boolean { return true; }
-	async startCoordinator() { return this.call("startCoordinator"); }
 	async focusCoordinator() { return this.call("focusCoordinator"); }
 	errors(): readonly string[] { return []; }
 	onChange(listener: (ref: DocRef | null) => void) { this.listener = listener; return () => {}; }
@@ -167,12 +164,12 @@ describe("K4 form UI", () => {
 		const { core, tsp } = await fixture(); core.run = { ...core.run, blocks: [item(), item("b2", "```js\nawait agent('work')\n```")] }; tsp.click("run.r1.open"); tsp.event({ ev: "change", id: "b1.selected", checked: true }); tsp.event({ ev: "change", id: "b2.selected", checked: true });
 		expect(tsp.node("b1.launch").p?.actions).toBeUndefined(); expect(tsp.node("b1.mixed").p?.text).toBe("编排块只能单独启动");
 	});
-	test("coordinator start/focus, graph blobs before frames, stable expansion keys and render status", async () => {
+	test("coordinator focus, graph blobs before frames, stable expansion keys and render status", async () => {
 		const { core, tsp } = await fixture(); expect(tsp.order.indexOf("frame")).toBeGreaterThan(tsp.order.findIndex(value => value.startsWith("blob:"))); expect(tsp.node("b1.reference.0").p).toMatchObject({ collapsed: false, collapsible: true, key: "0:((file:context.md))" });
 		expect(tsp.order.some(value => value.startsWith("blob:"))).toBe(true);
 		expect(core.statuses.find(entry => entry.block === "b1")?.status.chartNodes).toBe(1); expect(core.statuses.find(entry => entry.block === "b1")?.status.view.images).toHaveLength(1);
 		tsp.facts = { blockError: true, documentError: false, pendingOverdue: true }; tsp.statusListener(["b1"]); expect(core.statuses.at(-1)?.status).toMatchObject({ blockError: true, pendingOverdue: true, chartNodes: 1 });
-		tsp.click("coordinator.start"); await tick(); core.connected = true; core.listener(null); await tick(); tsp.click("coordinator.focus"); await tick(); expect(core.calls.map(call => call.method)).toEqual(["startCoordinator", "focusCoordinator"]);
+		core.connected = true; core.listener(null); await tick(); tsp.click("coordinator.focus"); await tick(); expect(core.calls.map(call => call.method)).toEqual(["focusCoordinator"]);
 		const beforeTheme = tsp.order.filter(value => value.startsWith("blob:")).at(-1);
 		const themed = tsp.nextFrame(); tsp.event({ ev: "theme", dark: false }); await themed;
 		expect(tsp.order.filter(value => value.startsWith("blob:")).at(-1)).not.toBe(beforeTheme);

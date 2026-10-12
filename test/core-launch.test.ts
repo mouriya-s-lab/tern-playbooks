@@ -35,10 +35,8 @@ async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"),
 		} },
 		panes: {
 			ownPane: () => null,
-			async splitCoordinator() { return { ok: false, error: "not used by launch tests" }; },
 			async focusPane() { return { ok: false, error: "not used by launch tests" }; },
 		},
-		extensionEntry: join(directory, "extension.ts"),
 	});
 	cleanups.push(() => core.stop());
 	expect(core.load()).toBeNull();
