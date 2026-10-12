@@ -117,14 +117,15 @@ export function renderDraft(design: string, host: DraftHost): DraftRender {
 	if (meta.subtitle !== null) header.push({ id: `${host.id}.subtitle`, k: "text", p: { text: meta.subtitle, tone: "muted" } });
 	if (meta.extra.length > 0) header.push({ id: `${host.id}.meta`, k: "kv", p: { layout: "inline", items: meta.extra.map(item => ({ k: item.key, v: item.value })) } });
 	const lead = segmentNodes(`${host.id}.lead`, document.lead);
-	const panel = (item: Panel): TspNode => {
+	// Node ids follow panel position, not panel ID: a draft may repeat an ID (a diagnostic) and Tern drops frames with duplicate ids.
+	const panel = (item: Panel, index: number): TspNode => {
 		const head = item.bare ? undefined : [item.id, item.title].filter(Boolean).join(" ") + (item.meta ? ` · ${item.meta}` : "");
-		const body = segmentNodes(`${host.id}.p${item.id}`, item.segments);
+		const body = segmentNodes(`${host.id}.p${index}`, item.segments);
 		const sheet = meta.template === "sheet";
 		return {
-			id: `${host.id}.p${item.id}.card`, k: "card",
+			id: `${host.id}.p${index}.card`, k: "card",
 			p: { ...(head === undefined ? { variant: "bare" } : { head }), ...(sheet ? { grow: Math.min(item.span ?? 1, meta.cols), basis: 0 } : {}) },
-			c: [{ id: `${host.id}.p${item.id}.body`, k: "col", p: { gap: "sm" }, c: body }],
+			c: [{ id: `${host.id}.p${index}.body`, k: "col", p: { gap: "sm" }, c: body }],
 		};
 	};
 	// A sheet fills rows of `cols` columns; a panel's span takes that many columns (am's grid).
@@ -137,13 +138,13 @@ export function renderDraft(design: string, host: DraftHost): DraftRender {
 		used += span;
 	}
 	const panels = document.panels.map(panel);
-	const byId = new Map(document.panels.map((item, index) => [item.id, panels[index]!]));
+	const byPanel = new Map(document.panels.map((item, index) => [item, panels[index]!]));
 	const grid: TspNode = meta.template === "sheet"
 		? { id: `${host.id}.panels`, k: "col", p: { gap: "sm" }, c: rows.map((items, index) => {
 			const spans = items.reduce((total, item) => total + Math.min(item.span ?? 1, meta.cols), 0);
 			// A short last row keeps the column width by padding with an empty growing spacer.
 			const pad: TspNode[] = spans < meta.cols ? [{ id: `${host.id}.row${index}.pad`, k: "spacer", p: { grow: meta.cols - spans, basis: 0 } }] : [];
-			return { id: `${host.id}.row${index}`, k: "row", p: { gap: "sm", align: "start" }, c: [...items.map(item => byId.get(item.id)!), ...pad] };
+			return { id: `${host.id}.row${index}`, k: "row", p: { gap: "sm", align: "start" }, c: [...items.map(item => byPanel.get(item)!), ...pad] };
 		}) }
 		: { id: `${host.id}.panels`, k: "col", p: { gap: "sm" }, c: panels };
 	return { nodes: [...header, ...lead, ...(panels.length ? [grid] : [])], diagnostics: diagnostics.sort((a, b) => a.line - b.line) };
