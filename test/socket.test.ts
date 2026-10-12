@@ -64,7 +64,11 @@ const valid: readonly [string, unknown][] = [
 	["set", { block: "b2", field: "title", value: "title" }],
 	["set", { block: "b2", field: "done", value: false }],
 	["edit", { block: "b2", find: "before", replace: "after" }],
-	["insert", { after: "b2", title: "new", body: "body" }],
+	["insert", { after: "b2", title: "new", content: { kind: "task", body: "body" } }],
+	["insert", { title: "design", content: { kind: "design", design: "## A Panel" } }],
+	["write", { block: "b2", text: "whole" }],
+	["panel", { block: "b2", panel: "A", text: "## A Panel" }],
+	["revisions", { block: "b2", after: 0 }],
 	["delete", { block: "b2" }],
 	["refetch", { targets: ["https://example.com", "./file.ts"] }],
 	["compile", { blocks: ["b2"] }],
@@ -108,7 +112,7 @@ describe("parseRequest", () => {
 			if (typeof args !== "object" || args === null) throw new Error("invalid fixture");
 			for (const key of Object.keys(args)) {
 				if (["pane", "run", "after", "update_every", "next", "quote", "origin"].includes(key) && !(["launch", "finish_run", "timeline", "post", "snooze"].includes(op) && key === "run") && !(op === "snooze" && key === "after")) continue;
-				if (key === "block" && (op === "read" || op === "post")) continue;
+				if (key === "block" && (op === "read" || op === "post" || op === "revisions")) continue;
 				if (key === "launch" && op === "post") continue;
 				const incomplete = { ...args };
 				Reflect.deleteProperty(incomplete, key);
@@ -126,7 +130,9 @@ describe("parseRequest", () => {
 			["unlock", { block: "b1", request: 2 }], ["read", { block: null }],
 			["set", { block: "b1", field: "body", value: "x" }], ["set", { block: "b1", field: "title", value: true }], ["set", { block: "b1", field: "done", value: "true" }],
 			["edit", { block: "b1", find: 1, replace: "x" }], ["edit", { block: "b1", find: "x", replace: false }],
-			["insert", { title: "x", body: "x", after: "b0" }], ["insert", { title: 1, body: "x" }], ["insert", { title: "x", body: 1 }],
+			["insert", { title: "x", content: { kind: "task", body: "x" }, after: "b0" }], ["insert", { title: 1, content: { kind: "task", body: "x" } }], ["insert", { title: "x", content: { kind: "task", body: 1 } }],
+			["insert", { title: "x", body: "x" }], ["insert", { title: "x", content: { kind: "design", requirement: "r", design: "d" } }], ["insert", { title: "x", content: { kind: "other" } }],
+			["write", { block: "b1", text: 1 }], ["panel", { block: "b1", panel: "a", text: "x" }], ["revisions", { after: -1 }],
 			["refetch", { targets: "x" }], ["refetch", { targets: [3] }], ["compile", { blocks: "b1" }], ["inspect", { blocks: ["b0"] }],
 			["report", { blocks: [], version: 2, result: { kind: "judge_unavailable" } }], ["report", { blocks: [], version: "v", result: { kind: "answers", answers: { missing: "0" } } }],
 			["report", { blocks: [], version: "v", result: { kind: "answers", answers: [] } }], ["report", { blocks: [], version: "v", result: { kind: "other" } }],

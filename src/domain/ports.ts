@@ -3,10 +3,12 @@
 // front end (TSP UI, K1 socket) that calls the core.
 import type {
 	Block,
-	BlockField,
+	BlockContent,
 	BlockId,
 	BlockLock,
 	BlockResult,
+	HumanField,
+	Revision,
 	CompileInput,
 	CompileResult,
 	DocRef,
@@ -38,18 +40,20 @@ export interface ReferencesModule {
 	parseTarget(text: string): Target | null;
 	/** Canonical key of a target; used for fetch tables. */
 	targetKey(target: Target): TargetKey;
-	/** Dependency closure (launch-events.md §3): the roots plus ids reachable through block references (not result references), including missing ids. */
-	closure(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): Set<BlockId>;
+	/** Dependency closure (launch-events.md §3): the roots plus ids reachable through block references of task bodies (design blocks are leaves), including missing ids. */
+	closure(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): Set<BlockId>;
 	/** External targets referenced anywhere in the closure of `roots`, deduplicated by key. */
-	externalTargets(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): ExternalTarget[];
+	externalTargets(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): ExternalTarget[];
 	/** Block ids whose `.result` is referenced in the closure of `roots`. */
-	resultTargets(roots: readonly BlockId[], bodies: ReadonlyMap<BlockId, string>): BlockId[];
+	resultTargets(roots: readonly BlockId[], contents: ReadonlyMap<BlockId, BlockContent>): BlockId[];
 	/** Pure compile (references.md §4). */
 	compile(order: readonly BlockId[], input: CompileInput): CompileResult;
 	/** Expansion of one reference written in `block` (references.md §5, rendered view). */
 	expandOne(block: BlockId, reference: Reference, input: CompileInput): CompileResult;
 	/** Unified diff from `before` to `after` (launch-events.md §4). */
 	unifiedDiff(before: string, after: string): string;
+	/** A design draft with the panel whose heading writes `id` replaced by `replacement` (itself one panel with that ID). */
+	replacePanel(design: string, id: string, replacement: string): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly code: "NotFound" | "BadValue"; readonly reason: string };
 }
 
 // ---------------------------------------------------------------- fetching (IO) — src/service/fetch.ts
@@ -89,6 +93,9 @@ export interface Store {
 	readRunLog(run: RunId): { readonly entries: TimelineEntry[]; readonly launches: Map<LaunchId, Launch> };
 	appendEntry(run: RunId, entry: TimelineEntry): void;
 	appendLaunch(run: RunId, launch: Launch): void;
+	/** Revision journal of a document (`<file>.revisions.jsonl`, `<runs>/<run>.revisions.jsonl`): every submitted design change request, append-only. */
+	readRevisions(ref: DocRef): Revision[];
+	appendRevision(ref: DocRef, revision: Revision): void;
 }
 
 // ---------------------------------------------------------------- checks (pure) — src/service/checks.ts
@@ -105,14 +112,16 @@ export interface RenderStatus {
 	readonly chartNodes: number;
 	/** Text of `md` nodes and alt of `image` nodes the view holds for this block (checks.md §1 `view`). */
 	readonly view: { readonly md: readonly string[]; readonly images: readonly string[] };
+	/** Error findings a design draft's renderers reported while drawing (a missing file, an oversized image). */
+	readonly draftErrors: number;
 }
 
 export interface ChecksModule {
-	/** Deterministic checks for one block (checks.md §2). `expansions` = each reference's expansion text or error. */
+	/** Deterministic checks for one block (checks.md §2). `expansions` = each reference's expansion text or error (empty for design blocks). */
 	findings(input: {
 		readonly compiled: CompileResult;
 		readonly expansions: readonly CompileResult[];
-		readonly body: string;
+		readonly content: BlockContent;
 		readonly render: RenderStatus;
 	}): Findings;
 	/** Chartable tables in a body, per `splitTableCharts` (`always`). */
@@ -180,13 +189,17 @@ export interface CoordinatorStatus {
 
 /** Human operations from the TSP UI (contracts.md K4). Each returns an error message or null. */
 export interface HumanCommands {
-	pencil(ref: DocRef, block: BlockId, field: BlockField): string | null;
+	/** Start a draft of `field`; `prompt` (design blocks) starts empty and is submitted with `commit`. */
+	pencil(ref: DocRef, block: BlockId, field: HumanField): string | null;
 	/** Replace the draft text (after an `edit` event, key or paste was applied by the UI). */
 	setDraft(ref: DocRef, block: BlockId, text: string): string | null;
+	/** Apply the draft; for `prompt`, submit it as a revision and notify the coordinator (refused without one, keeping the draft). */
 	commit(ref: DocRef, block: BlockId): string | null;
+	/** Drop the draft without applying it. */
+	discard(ref: DocRef, block: BlockId): string | null;
 	interrupt(ref: DocRef, block: BlockId): string | null;
 	setDone(ref: DocRef, block: BlockId, done: boolean): string | null;
-	insertBlock(ref: DocRef, after: BlockId | null): string | null;
+	insertBlock(ref: DocRef, after: BlockId | null, kind: BlockContent["kind"]): string | null;
 	deleteBlock(ref: DocRef, block: BlockId): string | null;
 	requestLaunch(run: RunId, blocks: readonly BlockId[]): string | null;
 	requestCheck(ref: DocRef, blocks: readonly BlockId[]): string | null;
@@ -211,6 +224,8 @@ export interface CoreApi extends HumanCommands {
 	onChange(listener: (ref: DocRef | null) => void): () => void;
 	/** UI reports render status per block so the core can compute findings. */
 	setRenderStatus(ref: DocRef, block: BlockId, status: RenderStatus): void;
+	/** Revisions of one block in a document, oldest first. */
+	revisions(ref: DocRef, block: BlockId): readonly Revision[];
 }
 
 // ---------------------------------------------------------------- K1 transport — src/service/socket.ts

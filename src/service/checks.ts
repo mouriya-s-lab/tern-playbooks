@@ -2,6 +2,7 @@ import { setTableCharts, splitTableCharts } from "@oh-my-pi/pi-tui/chat/table-ch
 import { initThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
 import type { CompileError, CompileResult, Source } from "../domain/model";
 import type { ChecksModule } from "../domain/ports";
+import { draftDiagnostics } from "./draft/components";
 
 // `always` draws charts synchronously. Initialize once, not on each check:
 // setTableCharts also clears the chart library's cache shared with the view.
@@ -82,14 +83,24 @@ const questions: ChecksModule["questions"] = [
 export const checks: ChecksModule = {
 	questions,
 	chartableTables,
-	findings({ compiled, expansions, body, render }) {
-		return {
-			compile: compiled.kind === "Err",
-			empty_expansion: expansions.some(expansion => expansion.kind === "Ok" && expansion.text.trim() === ""),
-			render_error: render.blockError || render.documentError,
-			render_pending: render.pendingOverdue,
-			chart: chartableTables(body) > render.chartNodes,
-		};
+	findings({ compiled, expansions, content, render }) {
+		const common = { compile: compiled.kind === "Err", render_error: render.blockError || render.documentError, render_pending: render.pendingOverdue };
+		switch (content.kind) {
+			case "task":
+				return {
+					...common,
+					empty_expansion: expansions.some(expansion => expansion.kind === "Ok" && expansion.text.trim() === ""),
+					chart: chartableTables(content.body) > render.chartNodes,
+					draft: false,
+				};
+			case "design":
+				return {
+					...common,
+					empty_expansion: false,
+					chart: false,
+					draft: render.draftErrors > 0 || draftDiagnostics(content.design).some(found => found.severity === "error"),
+				};
+		}
 	},
 	version({ closure, results, compiled }) {
 		// Preserve meaningful occurrence/path order, but not Map insertion order

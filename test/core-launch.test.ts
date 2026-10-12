@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Block, BlockId, CompileResult, DocRef, FetchOutcome, LaunchId } from "../src/domain/model";
-import type { Connection } from "../src/domain/ports";
+import type { Connection, Fetcher } from "../src/domain/ports";
 import type { ErrorCode, EventPayload, Outcome, Request } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
 import { Core } from "../src/service/core";
@@ -16,10 +16,14 @@ afterEach(() => {
 });
 
 function block(id: BlockId, body: string): Block {
-	return { id, title: id, body, done: false };
+	return { id, title: id, content: { kind: "task", body }, done: false };
 }
 
-async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"), block("b2", "before")]) {
+function designBlock(id: BlockId, design: string, requirement = "Human requirement"): Block {
+	return { id, title: id, content: { kind: "design", requirement, design }, done: false };
+}
+
+async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"), block("b2", "before")], fetcher?: Fetcher) {
 	const directory = mkdtempSync("/tmp/tern-core-launch-");
 	cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
 	const store = createStore(join(directory, "playbook.yaml"));
@@ -31,7 +35,7 @@ async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"),
 		fetcher: { async fetch(target, baseDir) {
 			expect(baseDir).toBe(directory);
 			fetchCalls.push(references.targetKey(target));
-			return fetchOutcome;
+			return fetcher ? fetcher.fetch(target, baseDir) : fetchOutcome;
 		} },
 		panes: {
 			ownPane: () => null,
@@ -114,7 +118,7 @@ describe("Core Launch integration", () => {
 		const event = await awaitChanges(f.changed, 1);
 		expect(Date.now() - editedAt).toBeGreaterThanOrEqual(1_950);
 		const current = references.compile(["b1"], {
-			blocks: new Map([["b1", "Task:\n((b2))"], ["b2", "after"]]), fetches: new Map(), results: new Map(), inTemplate: false,
+			blocks: new Map([["b1", block("b1", "Task:\n((b2))").content], ["b2", block("b2", "after").content]]), fetches: new Map(), results: new Map(), inTemplate: false,
 		});
 		expect(event.data).toEqual({
 			id: expect.any(String), launch: { id: launch, kind: "prompt", run: f.run },
@@ -145,6 +149,95 @@ describe("Core Launch integration", () => {
 		expect(prompt).toBe("l1");
 		expect(f.core.launchInfo(orchestration)!.kind).toBe("orchestration");
 	});
+
+	test("design blocks cannot launch alone or with a task through either entry point", async () => {
+		const f = await fixture([block("b1", "plain task"), designBlock("b2", "## A Overview\nDesign")]);
+		const selections: readonly (readonly BlockId[])[] = [["b2"], ["b1", "b2"], ["b2", "b1"]];
+		for (const blocks of selections) {
+			error(await f.send({ op: "launch", args: { run: f.run, blocks } }), "BadLaunch");
+			expect(f.core.requestLaunch(f.run, blocks)).not.toBeNull();
+			expect(f.events.filter(event => event.event === "launch_requested")).toEqual([]);
+			expect(f.store.readRunLog(f.run).launches.size).toBe(0);
+		}
+		expect(f.core.requestLaunch(f.run, ["b1"])).toBeNull();
+		expect(f.events.filter(event => event.event === "launch_requested")).toEqual([
+			{ event: "launch_requested", data: { run: f.run, blocks: ["b1"] } },
+		]);
+		expect(await f.launch(["b1"])).toBe("l1");
+	});
+
+	test("launch rechecks task kind after a disk edit while an external fetch is pending", async () => {
+		const fetched = Promise.withResolvers<FetchOutcome>();
+		const started = Promise.withResolvers<void>();
+		const f = await fixture([block("b1", "Task:\n((file:context.txt))")], {
+			fetch() {
+				started.resolve();
+				return fetched.promise;
+			},
+		});
+		let settled = false;
+		const pending = f.send({ op: "launch", args: { run: f.run, blocks: ["b1"] } }).then(outcome => {
+			settled = true;
+			return outcome;
+		});
+		await started.promise;
+		expect(settled).toBe(false);
+		expect(f.fetchCalls).toEqual(["file:context.txt"]);
+
+		const replacement = designBlock("b1", "## A Overview\nDesign after disk edit", "Requirement after disk edit");
+		const before = f.core.view(f.ref);
+		expect(before.blocks[0]!.block.content.kind).toBe("task");
+		f.store.write(f.ref, f.store.serialize({ title: before.title, blocks: [replacement] }, before.run));
+		// Core owns real disk polling with no fake-clock seam; wait for the observed kind change, not a fixed delay.
+		const deadline = Date.now() + 3_000;
+		while (f.core.view(f.ref).blocks[0]!.block.content.kind !== "design" && Date.now() < deadline) await Bun.sleep(10);
+		expect(f.core.view(f.ref).blocks[0]!.block).toEqual(replacement);
+		expect(settled).toBe(false);
+
+		fetched.resolve({ ok: true, at: Date.parse("2026-01-01T00:00:00Z"), value: { kind: "file", text: "external before" } });
+		error(await pending, "BadLaunch");
+		expect(f.fetchCalls).toEqual(["file:context.txt"]);
+		expect(f.store.readRunLog(f.run).launches.size).toBe(0);
+		expect(f.store.readServiceRecords().filter(record => record.kind === "launch")).toEqual([]);
+		const after = f.core.view(f.ref);
+		expect(after.blocks[0]!.launches).toEqual([]);
+		expect(after.timeline.filter(entry => entry.data.type === "launch_created")).toEqual([]);
+	}, 8_000);
+
+	for (const operation of ["write", "panel"] as const) {
+		test(`coordinator ${operation} of a referenced design notifies the running Launch after the judge delay`, async () => {
+			const before = "## A Overview\nbefore\n\n## B Unchanged\nKeep this panel";
+			const after = "## A Overview\nafter\n\n## B Unchanged\nKeep this panel";
+			const f = await fixture([block("b1", 'Task:\n((b2 | panel("A")))'), designBlock("b2", before)]);
+			const launch = await f.launch();
+			const snapshot = f.core.launchInfo(launch)!.snapshot;
+			expect(snapshot.result).toMatchObject({ kind: "Ok", text: "Task:\n## A Overview\nbefore" });
+			await f.success({ op: "bind", args: { launch, agent: "design-worker" } });
+			await f.success({ op: "lock", args: { run: f.run, block: "b2" } });
+			const editedAt = Date.now();
+			if (operation === "write") {
+				await f.success({ op: "write", args: { run: f.run, block: "b2", text: after } });
+			} else {
+				await f.success({ op: "panel", args: { run: f.run, block: "b2", panel: "A", text: "## A Overview\nafter" } });
+			}
+			await Bun.sleep(150);
+			expect(f.changed()).toEqual([]);
+			const event = await awaitChanges(f.changed, 1);
+			expect(Date.now() - editedAt).toBeGreaterThanOrEqual(1_950);
+			expect(event.data.launch).toEqual({ id: launch, kind: "prompt", run: f.run });
+			expect(event.data.agents).toEqual(["design-worker"]);
+			expect(event.data.changed).toEqual(["b2"]);
+			expect(event.data.current).toMatchObject({ kind: "Ok", text: "Task:\n## A Overview\nafter" });
+			expect(event.data.diff).toBe(references.unifiedDiff("Task:\n## A Overview\nbefore", "Task:\n## A Overview\nafter"));
+			const persisted = f.store.readRuns().get(f.run);
+			if (!persisted?.ok) throw new Error("expected persisted Run");
+			expect(persisted.doc.blocks.find(block => block.id === "b2")!.content).toEqual({
+				kind: "design", requirement: "Human requirement", design: after,
+			});
+			expect(f.core.launchInfo(launch)!.snapshot).toEqual(snapshot);
+			expect(f.store.readRunLog(f.run).entries.some(entry => entry.data.type === "event_sent" && entry.data.event === "block_changed")).toBe(true);
+		}, 8_000);
+	}
 
 	test("ordered multi-block snapshot equals compile and is frozen across edits and rebase", async () => {
 		const f = await fixture([block("b1", "first"), block("b2", "second")]);
@@ -209,20 +302,26 @@ describe("Core Launch integration", () => {
 		expect(second.data.current).toEqual(first.data.current);
 	}, 12_000);
 
-	test("coordinator edits and human title/done edits do not trigger changes, including reconnect", async () => {
-		const f = await fixture();
-		const launch = await f.launch();
-		await f.success({ op: "lock", args: { run: f.run, block: "b2" } });
-		await f.success({ op: "edit", args: { run: f.run, block: "b2", find: "before", replace: "coordinator edit" } });
-		f.disconnect(); // Releases the coordinator lock without a human body edit.
-		await f.connect();
-		f.edit("b2", "human title", "title");
-		expect(f.core.setDone(f.ref, "b2", true)).toBeNull();
-		await debounce();
-		expect(f.changed()).toEqual([]);
-		expect(f.core.launchInfo(launch)!.dirty).toEqual([]);
-		expect(await f.core.preview(f.ref, ["b1"])).toMatchObject({ kind: "Ok", text: "Task:\ncoordinator edit" });
-	}, 8_000);
+	for (const operation of ["edit", "write"] as const) {
+		test(`coordinator task ${operation} and human title/done edits do not trigger changes, including reconnect`, async () => {
+			const f = await fixture();
+			const launch = await f.launch();
+			await f.success({ op: "lock", args: { run: f.run, block: "b2" } });
+			if (operation === "edit") {
+				await f.success({ op: "edit", args: { run: f.run, block: "b2", find: "before", replace: "coordinator edit" } });
+			} else {
+				await f.success({ op: "write", args: { run: f.run, block: "b2", text: "coordinator edit" } });
+			}
+			f.disconnect(); // Releases the coordinator lock without a human body edit.
+			await f.connect();
+			f.edit("b2", "human title", "title");
+			expect(f.core.setDone(f.ref, "b2", true)).toBeNull();
+			await debounce();
+			expect(f.changed()).toEqual([]);
+			expect(f.core.launchInfo(launch)!.dirty).toEqual([]);
+			expect(await f.core.preview(f.ref, ["b1"])).toMatchObject({ kind: "Ok", text: "Task:\ncoordinator edit" });
+		}, 8_000);
+	}
 
 	test("deleting a referenced block emits Err with an empty diff; failed rebase preserves state", async () => {
 		const f = await fixture();
@@ -340,7 +439,7 @@ describe("Core Launch integration", () => {
 		f.edit("b1", "Modified task:\n((file:context.txt))");
 		const event = await awaitChanges(f.changed, 1);
 		const frozen: CompileResult = references.compile(["b1"], {
-			blocks: new Map([["b1", "Modified task:\n((file:context.txt))"]]),
+			blocks: new Map([["b1", block("b1", "Modified task:\n((file:context.txt))").content]]),
 			fetches: new Map(snapshot.fetches), results: new Map(snapshot.results), inTemplate: false,
 		});
 		expect(event.data.current).toEqual(frozen);
@@ -357,7 +456,7 @@ describe("Core Launch integration", () => {
 		const second = await awaitChanges(f.changed, 2);
 		const extended = f.core.launchInfo(launch)!;
 		expect(second.data.current).toEqual(references.compile(["b1"], {
-			blocks: new Map([["b1", "Modified task:\n((file:context.txt))\n((file:new.txt))"]]),
+			blocks: new Map([["b1", block("b1", "Modified task:\n((file:context.txt))\n((file:new.txt))").content]]),
 			fetches: new Map(extended.fetches), results: new Map(snapshot.results), inTemplate: false,
 		}));
 		if (second.data.current.kind !== "Ok") throw new Error("expected successful extended compile");

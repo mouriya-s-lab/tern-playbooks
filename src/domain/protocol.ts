@@ -8,8 +8,15 @@ export type Request =
 	| { readonly op: "unlock"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly request: string } }
 	| { readonly op: "read"; readonly args: { readonly run?: RunId; readonly block?: BlockId } }
 	| { readonly op: "set"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly field: "title"; readonly value: string } | { readonly run?: RunId; readonly block: BlockId; readonly field: "done"; readonly value: boolean } }
+	/** Replace the find text, found exactly once, in the block's coordinator field (task body, design draft). */
 	| { readonly op: "edit"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly find: string; readonly replace: string } }
-	| { readonly op: "insert"; readonly args: { readonly run?: RunId; readonly after?: BlockId; readonly title: string; readonly body: string } }
+	/** Replace the block's coordinator field (task body, design draft) whole. */
+	| { readonly op: "write"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly text: string } }
+	/** Replace one panel of a design draft, addressed by the letter ID its heading writes. */
+	| { readonly op: "panel"; readonly args: { readonly run?: RunId; readonly block: BlockId; readonly panel: string; readonly text: string } }
+	/** Insert a block; a design block's requirement belongs to the person and starts empty. */
+	| { readonly op: "insert"; readonly args: { readonly run?: RunId; readonly after?: BlockId; readonly title: string; readonly content: InsertContent } }
+	| { readonly op: "revisions"; readonly args: { readonly run?: RunId; readonly block?: BlockId; readonly after?: number } }
 	| { readonly op: "delete"; readonly args: { readonly run?: RunId; readonly block: BlockId } }
 	| { readonly op: "refetch"; readonly args: { readonly run?: RunId; readonly targets: readonly string[] } }
 	| { readonly op: "compile"; readonly args: { readonly run?: RunId; readonly blocks: readonly BlockId[] } }
@@ -115,7 +122,11 @@ export type EventPayload =
 	| { readonly event: "run_finished"; readonly data: { readonly run: RunId } }
 	| { readonly event: "done_changed"; readonly data: { readonly run: RunId; readonly block: BlockId; readonly done: boolean } }
 	| { readonly event: "update_due"; readonly data: { readonly run: RunId; readonly due: number; readonly last_update: number | null } }
-	| { readonly event: "interrupted"; readonly data: { readonly run?: RunId; readonly block: BlockId; readonly request: string } };
+	| { readonly event: "interrupted"; readonly data: { readonly run?: RunId; readonly block: BlockId; readonly request: string } }
+	/** The person submitted a change request for a design block; read it with `revisions`. */
+	| { readonly event: "revision_requested"; readonly data: { readonly run?: RunId; readonly block: BlockId; readonly revision: number } };
+
+export type InsertContent = { readonly kind: "task"; readonly body: string } | { readonly kind: "design"; readonly design: string };
 
 // Compile-time check that EventPayload covers exactly EventName.
 type _EventsCovered = [EventName] extends [EventPayload["event"]] ? ([EventPayload["event"]] extends [EventName] ? true : never) : never;

@@ -25,15 +25,68 @@ export function idNumber(id: BlockId | RunId | LaunchId): number {
 	return Number(id.slice(1));
 }
 
-/** README §定义 块. */
+/** What a block holds. A task block is a prompt that can run; a design block pairs the person's requirement with the coordinator's design draft. */
+export type BlockContent =
+	| { readonly kind: "task"; readonly body: string }
+	| { readonly kind: "design"; readonly requirement: string; readonly design: string };
+
+/** A block (README §定义 块). */
 export interface Block {
 	readonly id: BlockId;
 	readonly title: string;
-	readonly body: string;
 	readonly done: boolean;
+	readonly content: BlockContent;
 }
 
-export type BlockField = "title" | "body";
+/** Persisted text fields of a block. `body` exists on task blocks, `requirement` and `design` on design blocks. */
+export type BlockField = "title" | "body" | "requirement" | "design";
+/** Fields a person edits through a draft: `prompt` is a design block's change request, never persisted in the block. */
+export type HumanField = "title" | "body" | "requirement" | "prompt";
+
+/** The text of `field` on `block`, or null when the block's kind has no such field. */
+export function fieldText(block: Block, field: BlockField): string | null {
+	if (field === "title") return block.title;
+	const content = block.content;
+	switch (content.kind) {
+		case "task": return field === "body" ? content.body : null;
+		case "design": return field === "requirement" ? content.requirement : field === "design" ? content.design : null;
+	}
+}
+
+/** `block` with `field` set to `text`, or null when the block's kind has no such field. */
+export function withField(block: Block, field: BlockField, text: string): Block | null {
+	if (field === "title") return { ...block, title: text };
+	const content = block.content;
+	switch (content.kind) {
+		case "task": return field === "body" ? { ...block, content: { kind: "task", body: text } } : null;
+		case "design":
+			if (field === "requirement") return { ...block, content: { ...content, requirement: text } };
+			if (field === "design") return { ...block, content: { ...content, design: text } };
+			return null;
+	}
+}
+
+/** The field the coordinator writes as a block's main text: a task's body, a design's draft. */
+export function coordinatorField(content: BlockContent): "body" | "design" {
+	return content.kind === "task" ? "body" : "design";
+}
+
+/** Whether a person may hold a draft of `field` on a block of this kind. */
+export function humanFieldValid(content: BlockContent, field: HumanField): boolean {
+	switch (field) {
+		case "title": return true;
+		case "body": return content.kind === "task";
+		case "requirement": case "prompt": return content.kind === "design";
+	}
+}
+
+/** One submitted change request for a design block (append-only, one journal per document). */
+export interface Revision {
+	readonly seq: number;
+	readonly at: number;
+	readonly block: BlockId;
+	readonly prompt: string;
+}
 
 /** The serialized Playbook document (README §S2). */
 export interface PlaybookDoc {
@@ -66,7 +119,7 @@ export type EntryOrigin = EditOrigin | "service";
 /** Block lock (README §定义 块锁). */
 export type BlockLock =
 	| { readonly kind: "none" }
-	| { readonly kind: "human"; readonly field: BlockField; readonly draft: string }
+	| { readonly kind: "human"; readonly field: HumanField; readonly draft: string }
 	| { readonly kind: "coordinator"; readonly request: string };
 
 // ---------------------------------------------------------------- references
@@ -89,7 +142,11 @@ export type Selector =
 	| { readonly kind: "body" }
 	| { readonly kind: "comments" }
 	| { readonly kind: "commentsLast"; readonly count: number }
-	| { readonly kind: "commentsRange"; readonly from: number; readonly to: number };
+	| { readonly kind: "commentsRange"; readonly from: number; readonly to: number }
+	/** Design blocks only: the person's requirement, the whole draft, or one panel by its written letter ID. */
+	| { readonly kind: "requirement" }
+	| { readonly kind: "design" }
+	| { readonly kind: "panel"; readonly id: string };
 
 /** One `((target))` or `((target | expression))` occurrence in a block body. */
 export interface Reference {
@@ -159,7 +216,7 @@ export type CompileResult =
 
 /** Input the pure compiler reads (references.md §4). */
 export interface CompileInput {
-	readonly blocks: ReadonlyMap<BlockId, string>;
+	readonly blocks: ReadonlyMap<BlockId, BlockContent>;
 	readonly fetches: FetchTable;
 	readonly results: ResultTable;
 	/** True when compiling a template, where block results are `NoResult`. */
@@ -208,8 +265,10 @@ export type EntryData =
 	| { readonly type: "run_started"; readonly name: string }
 	| { readonly type: "run_finished" }
 	| { readonly type: "block_edited"; readonly block: BlockId; readonly field: BlockField; readonly text: string; readonly edit: number }
-	| { readonly type: "block_added"; readonly block: BlockId; readonly title: string; readonly body: string }
-	| { readonly type: "block_deleted"; readonly block: BlockId; readonly title: string; readonly body: string }
+	| { readonly type: "block_added"; readonly block: BlockId; readonly title: string; readonly content: BlockContent }
+	| { readonly type: "block_deleted"; readonly block: BlockId; readonly title: string; readonly content: BlockContent }
+	/** A disk edit switched the block between task and design. */
+	| { readonly type: "content_replaced"; readonly block: BlockId; readonly content: BlockContent }
 	| { readonly type: "blocks_reordered"; readonly order: readonly BlockId[] }
 	| { readonly type: "done_changed"; readonly block: BlockId; readonly done: boolean }
 	| { readonly type: "launch_created"; readonly launch: LaunchId; readonly kind: LaunchKind; readonly blocks: readonly BlockId[] }
@@ -241,9 +300,9 @@ export interface TimelineEntry {
 
 export type JudgeReport = { readonly kind: "answers"; readonly answers: Readonly<Record<string, number>> } | { readonly kind: "judge_unavailable" };
 
-export type FindingName = "compile" | "empty_expansion" | "render_error" | "render_pending" | "chart";
+export type FindingName = "compile" | "empty_expansion" | "render_error" | "render_pending" | "chart" | "draft";
 export type Findings = Readonly<Record<FindingName, boolean>>; // true = fails
 
 // ---------------------------------------------------------------- events (K1)
 
-export type EventName = "block_changed" | "launch_requested" | "check_requested" | "run_started" | "run_finished" | "done_changed" | "update_due" | "interrupted";
+export type EventName = "block_changed" | "launch_requested" | "check_requested" | "run_started" | "run_finished" | "done_changed" | "update_due" | "interrupted" | "revision_requested";

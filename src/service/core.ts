@@ -2,6 +2,7 @@
 // Rules come from design/; section references are given at each rule.
 import type {
 	Block,
+	BlockContent,
 	BlockField,
 	BlockId,
 	BlockLock,
@@ -15,18 +16,20 @@ import type {
 	ExternalTarget,
 	FetchOutcome,
 	Findings,
+	HumanField,
 	JudgeReport,
 	Launch,
 	LaunchCloser,
 	LaunchId,
 	PlaybookDoc,
 	RecordKind,
+	Revision,
 	RunId,
 	RunMeta,
 	TargetKey,
 	TimelineEntry,
 } from "../domain/model";
-import { idNumber } from "../domain/model";
+import { coordinatorField, fieldText, humanFieldValid, idNumber, withField } from "../domain/model";
 import type {
 	BlockView,
 	ChecksModule,
@@ -78,6 +81,8 @@ interface DocState {
 	render: Map<BlockId, RenderStatus>;
 	/** Per block-set key: last inspect version, whether its inputs changed since (checks.md §5), and the accepted report. */
 	inspections: Map<string, { blocks: BlockId[]; version: string; stale: boolean; report: JudgeReport | null }>;
+	/** The document's revision journal (authoritative copy on disk; append-only). */
+	revisions: Revision[];
 }
 
 interface RunLog {
@@ -116,10 +121,19 @@ function sameResult(a: CompileResult | null, b: CompileResult | null): boolean {
 	if (a.kind === "Ok" && b.kind === "Ok") return a.text === b.text;
 	return JSON.stringify(a) === JSON.stringify(b);
 }
-/** Orchestration block: the whole body is one `js` or `py` fenced code block (README §定义). */
-export function isOrchestration(body: string): boolean {
-	const match = /^(`{3,}|~{3,})(js|py)[ \t]*\n[\s\S]*?\n\1[ \t]*\n?$/.exec(body.trim() + "\n");
-	return match !== null;
+/** Orchestration block: a task block whose whole body is one `js` or `py` fenced code block (README §定义). */
+export function isOrchestration(content: BlockContent): boolean {
+	if (content.kind !== "task") return false;
+	return /^(`{3,}|~{3,})(js|py)[ \t]*\n[\s\S]*?\n\1[ \t]*\n?$/.test(content.body.trim() + "\n");
+}
+
+/** A block as K1 sends it: content fields flattened beside `kind`. */
+export function wireBlock(block: Block): Record<string, unknown> {
+	const content = block.content;
+	switch (content.kind) {
+		case "task": return { id: block.id, kind: "task", title: block.title, body: content.body, done: block.done };
+		case "design": return { id: block.id, kind: "design", title: block.title, requirement: content.requirement, design: content.design, done: block.done };
+	}
 }
 
 export class Core implements CoreApi, K1Handler {
@@ -216,6 +230,7 @@ export class Core implements CoreApi, K1Handler {
 			findings: new Map(),
 			render: new Map(),
 			inspections: new Map(),
+			revisions: this.#store.readRevisions(ref),
 		};
 	}
 
@@ -241,8 +256,8 @@ export class Core implements CoreApi, K1Handler {
 	#block(doc: DocState, id: BlockId): Block | null {
 		return doc.blocks.find(block => block.id === id) ?? null;
 	}
-	#bodies(doc: DocState): Map<BlockId, string> {
-		return new Map(doc.blocks.map(block => [block.id, block.body]));
+	#contents(doc: DocState): Map<BlockId, BlockContent> {
+		return new Map(doc.blocks.map(block => [block.id, block.content]));
 	}
 	#isFinished(doc: DocState): boolean {
 		return doc.run !== null && doc.run.status === "finished";
@@ -288,7 +303,7 @@ export class Core implements CoreApi, K1Handler {
 			this.#inflight.delete(key);
 			if (replace) {
 				for (const doc of this.#docs.values()) {
-					this.#invalidateInspections(doc, blocks => this.#refs.externalTargets(blocks, this.#bodies(doc)).some(other => this.#refs.targetKey(other) === key));
+					this.#invalidateInspections(doc, blocks => this.#refs.externalTargets(blocks, this.#contents(doc)).some(other => this.#refs.targetKey(other) === key));
 				}
 			}
 			return outcome;
@@ -300,13 +315,13 @@ export class Core implements CoreApi, K1Handler {
 
 	/** Fetch every external target the closure of `roots` references that is missing from the document table. */
 	async #ensureFetched(doc: DocState, roots: readonly BlockId[]): Promise<void> {
-		const targets = this.#refs.externalTargets(roots, this.#bodies(doc));
+		const targets = this.#refs.externalTargets(roots, this.#contents(doc));
 		await Promise.all(targets.filter(target => !this.#fetches.has(this.#refs.targetKey(target))).map(target => this.#fetchTarget(target, false)));
 	}
 
-	#input(doc: DocState, fetches: ReadonlyMap<TargetKey, FetchOutcome>, bodies?: ReadonlyMap<BlockId, string>, results?: ReadonlyMap<BlockId, BlockResult>): CompileInput {
+	#input(doc: DocState, fetches: ReadonlyMap<TargetKey, FetchOutcome>, contents?: ReadonlyMap<BlockId, BlockContent>, results?: ReadonlyMap<BlockId, BlockResult>): CompileInput {
 		return {
-			blocks: bodies ?? this.#bodies(doc),
+			blocks: contents ?? this.#contents(doc),
 			fetches,
 			results: results ?? this.#results(doc.run?.id ?? null),
 			inTemplate: doc.run === null,
@@ -327,17 +342,30 @@ export class Core implements CoreApi, K1Handler {
 	 */
 	#applyEdit(doc: DocState, origin: EditOrigin, change: EditChange): number {
 		const seq = ++this.#editSeq;
-		const beforeBodies = this.#bodies(doc);
+		const beforeContents = this.#contents(doc);
 		let touched: BlockId | null = null;
-		let bodyOrExistence = false;
+		let contentOrExistence = false;
+		// A coordinator's task edit is its own work and does not notify it back; a design is the input
+		// of the task blocks that reference it, so the coordinator's design edits reach their Launches.
+		let notifies = origin !== "coordinator";
 		switch (change.kind) {
 			case "field": {
 				const index = doc.blocks.findIndex(block => block.id === change.block);
-				const block = doc.blocks[index]!;
-				doc.blocks[index] = change.field === "title" ? { ...block, title: change.text } : { ...block, body: change.text };
+				const next = withField(doc.blocks[index]!, change.field, change.text);
+				if (next === null) throw new Error(`block ${change.block} has no field ${change.field}`);
+				doc.blocks[index] = next;
 				touched = change.block;
-				bodyOrExistence = change.field === "body";
+				contentOrExistence = change.field !== "title";
+				if (change.field === "design") notifies = true;
 				if (doc.run) this.#append(doc.run.id, origin, { type: "block_edited", block: change.block, field: change.field, text: change.text, edit: seq });
+				break;
+			}
+			case "content": {
+				const index = doc.blocks.findIndex(block => block.id === change.block);
+				doc.blocks[index] = { ...doc.blocks[index]!, content: change.content };
+				touched = change.block;
+				contentOrExistence = true;
+				if (doc.run) this.#append(doc.run.id, origin, { type: "content_replaced", block: change.block, content: change.content });
 				break;
 			}
 			case "done": {
@@ -351,8 +379,8 @@ export class Core implements CoreApi, K1Handler {
 				doc.blocks.splice(index, 0, change.block);
 				doc.locks.set(change.block.id, { kind: "none" });
 				touched = change.block.id;
-				bodyOrExistence = true;
-				if (doc.run) this.#append(doc.run.id, origin, { type: "block_added", block: change.block.id, title: change.block.title, body: change.block.body });
+				contentOrExistence = true;
+				if (doc.run) this.#append(doc.run.id, origin, { type: "block_added", block: change.block.id, title: change.block.title, content: change.block.content });
 				break;
 			}
 			case "delete": {
@@ -360,8 +388,8 @@ export class Core implements CoreApi, K1Handler {
 				const [removed] = doc.blocks.splice(index, 1);
 				doc.locks.delete(change.block);
 				touched = change.block;
-				bodyOrExistence = true;
-				if (doc.run && removed) this.#append(doc.run.id, origin, { type: "block_deleted", block: removed.id, title: removed.title, body: removed.body });
+				contentOrExistence = true;
+				if (doc.run && removed) this.#append(doc.run.id, origin, { type: "block_deleted", block: removed.id, title: removed.title, content: removed.content });
 				break;
 			}
 			case "reorder": {
@@ -374,12 +402,12 @@ export class Core implements CoreApi, K1Handler {
 				break;
 			}
 		}
-		if (touched !== null && bodyOrExistence) {
+		if (touched !== null && contentOrExistence) {
 			const changed = touched;
-			const afterBodies = this.#bodies(doc);
-			this.#invalidateInspections(doc, blocks => this.#refs.closure(blocks, beforeBodies).has(changed) || this.#refs.closure(blocks, afterBodies).has(changed));
+			const afterContents = this.#contents(doc);
+			this.#invalidateInspections(doc, blocks => this.#refs.closure(blocks, beforeContents).has(changed) || this.#refs.closure(blocks, afterContents).has(changed));
 		}
-		if (doc.run && touched !== null && bodyOrExistence && origin !== "coordinator") this.#markDirty(doc, touched, seq, beforeBodies);
+		if (doc.run && touched !== null && contentOrExistence && notifies) this.#markDirty(doc, touched, seq, beforeContents);
 		this.#scheduleWrite(doc);
 		this.#afterChange(doc);
 		return seq;
@@ -394,12 +422,12 @@ export class Core implements CoreApi, K1Handler {
 	}
 
 	/** launch-events.md §3: human and disk edits of body or existence enter `dirty`. */
-	#markDirty(doc: DocState, block: BlockId, seq: number, beforeBodies: ReadonlyMap<BlockId, string>): void {
+	#markDirty(doc: DocState, block: BlockId, seq: number, beforeContents: ReadonlyMap<BlockId, BlockContent>): void {
 		const run = doc.run!.id;
-		const afterBodies = this.#bodies(doc);
+		const afterBodies = this.#contents(doc);
 		for (const launch of this.#launches.values()) {
 			if (launch.record.run !== run || launch.record.closed !== null) continue;
-			const inBefore = this.#refs.closure(launch.record.blocks, beforeBodies).has(block);
+			const inBefore = this.#refs.closure(launch.record.blocks, beforeContents).has(block);
 			const inAfter = this.#refs.closure(launch.record.blocks, afterBodies).has(block);
 			if (!inBefore && !inAfter) continue;
 			const dirty = new Map(launch.record.dirty);
@@ -498,10 +526,23 @@ export class Core implements CoreApi, K1Handler {
 			// fields on disk must not overwrite edits made since the last write-back.
 			const previous = before.get(block.id) ?? current;
 			const lock = doc.locks.get(block.id);
-			for (const field of ["title", "body"] as const) {
-				if (block[field] === previous[field] || block[field] === current[field]) continue;
-				this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field, text: block[field] });
-				if (lock?.kind === "human" && lock.field === field) this.#notice(doc, block.id, "磁盘文件修改了这个字段");
+			if (block.content.kind !== current.content.kind) {
+				// A kind switch replaces the content whole; a draft of a field the new kind lacks ends.
+				if (block.content.kind === previous.content.kind) return;
+				// End a draft of a field the new kind lacks before the edits below notify, so no view shows it.
+				if (lock?.kind === "human" && !humanFieldValid(block.content, lock.field)) {
+					doc.locks.set(block.id, { kind: "none" });
+					this.#notice(doc, block.id, "磁盘文件改变了块的种类，未提交的编辑已丢弃");
+				}
+				if (block.title !== previous.title && block.title !== current.title) this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field: "title", text: block.title });
+				this.#applyEdit(doc, "disk", { kind: "content", block: block.id, content: block.content });
+			} else {
+				for (const field of ["title", "body", "requirement", "design"] as const) {
+					const text = fieldText(block, field);
+					if (text === null || text === fieldText(previous, field) || text === fieldText(current, field)) continue;
+					this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field, text });
+					if (lock?.kind === "human" && lock.field === field) this.#notice(doc, block.id, "磁盘文件修改了这个字段");
+				}
 			}
 			if (block.done !== previous.done && block.done !== current.done) this.#applyEdit(doc, "disk", { kind: "done", block: block.id, done: block.done });
 		});
@@ -548,7 +589,7 @@ export class Core implements CoreApi, K1Handler {
 		if (launch.record.dirty.length === 0) return;
 		if (launch.deadline !== null && launch.deadline > this.#now()) return;
 		const doc = this.#docs.get(launch.record.run)!;
-		const bodies = this.#bodies(doc);
+		const bodies = this.#contents(doc);
 		const maxSeq = Math.max(...launch.record.dirty.map(([, seq]) => seq));
 		const changed = launch.record.dirty.map(([block]) => block);
 		const generation = launch.generation;
@@ -587,7 +628,7 @@ export class Core implements CoreApi, K1Handler {
 	}
 
 	/** The judgment fetch table of a Launch, extended with newly referenced targets (launch-events.md §3). */
-	async #launchFetches(launch: LaunchState, bodies: ReadonlyMap<BlockId, string>): Promise<Map<TargetKey, FetchOutcome>> {
+	async #launchFetches(launch: LaunchState, bodies: ReadonlyMap<BlockId, BlockContent>): Promise<Map<TargetKey, FetchOutcome>> {
 		const table = new Map(launch.record.fetches);
 		const added: [TargetKey, FetchOutcome][] = [];
 		for (const target of this.#refs.externalTargets(launch.record.blocks, bodies)) {
@@ -682,9 +723,9 @@ export class Core implements CoreApi, K1Handler {
 		let changed = false;
 		for (const block of doc.blocks) {
 			const compiled = this.#refs.compile([block.id], input);
-			const expansions = this.#refs.parseReferences(block.body).map(reference => this.#refs.expandOne(block.id, reference, input));
-			const render = doc.render.get(block.id) ?? { blockError: false, documentError: false, pendingOverdue: false, chartNodes: 0, view: { md: [], images: [] } };
-			const next = this.#checks.findings({ compiled, expansions, body: block.body, render });
+			const expansions = block.content.kind === "task" ? this.#refs.parseReferences(block.content.body).map(reference => this.#refs.expandOne(block.id, reference, input)) : [];
+			const render = doc.render.get(block.id) ?? { blockError: false, documentError: false, pendingOverdue: false, chartNodes: 0, view: { md: [], images: [] }, draftErrors: 0 };
+			const next = this.#checks.findings({ compiled, expansions, content: block.content, render });
 			const lock = doc.locks.get(block.id);
 			const editingBody = lock?.kind === "human" && lock.field === "body";
 			const previous = doc.findings.get(block.id);
@@ -703,10 +744,14 @@ export class Core implements CoreApi, K1Handler {
 	}
 
 	#version(doc: DocState, blocks: readonly BlockId[], input: CompileInput): string {
-		const bodies = this.#bodies(doc);
+		const contents = this.#contents(doc);
 		const closure = new Map<BlockId, string | null>();
-		for (const id of this.#refs.closure(blocks, bodies)) closure.set(id, bodies.get(id) ?? null);
-		const results = this.#refs.resultTargets(blocks, bodies).flatMap(id => {
+		// A task contributes its body (as before design blocks existed); a design its kind and both parts.
+		for (const id of this.#refs.closure(blocks, contents)) {
+			const content = contents.get(id);
+			closure.set(id, content === undefined ? null : content.kind === "task" ? content.body : JSON.stringify(content));
+		}
+		const results = this.#refs.resultTargets(blocks, contents).flatMap(id => {
 			const result = input.results.get(id);
 			return result ? [result] : [];
 		});
@@ -721,7 +766,10 @@ export class Core implements CoreApi, K1Handler {
 		doc.inspections.set(setKey, { blocks: [...blocks], version, stale: false, report: previous?.version === version && !previous.stale ? previous.report : null });
 		return {
 			blocks,
-			source: Object.fromEntries(blocks.map(id => [id, this.#block(doc, id)?.body ?? null])),
+			source: Object.fromEntries(blocks.map(id => {
+				const content = this.#block(doc, id)?.content;
+				return [id, content === undefined ? null : content.kind === "task" ? content.body : { requirement: content.requirement, design: content.design }];
+			})),
 			compiled: this.#refs.compile(blocks, input),
 			view: Object.fromEntries(blocks.map(id => [id, doc.render.get(id)?.view ?? { md: [], images: [] }])),
 			findings: Object.fromEntries(blocks.map(id => [id, doc.findings.get(id) ?? null])),
@@ -786,7 +834,7 @@ export class Core implements CoreApi, K1Handler {
 				if (lock.kind === "human") return fail("Locked", "人正在编辑这个块");
 				doc.locks.set(block.id, { kind: "coordinator", request: requestId });
 				this.#emit(doc.ref);
-				return ok({ block });
+				return ok({ block: wireBlock(block) });
 			}
 			case "unlock": {
 				const doc = this.#docOf(request.args.run);
@@ -803,9 +851,9 @@ export class Core implements CoreApi, K1Handler {
 				if (!doc.ok) return doc;
 				if (request.args.block !== undefined) {
 					const block = this.#block(doc.result, request.args.block);
-					return block ? ok(block) : fail("UnknownBlock", `块 ${request.args.block} 不存在`);
+					return block ? ok(wireBlock(block)) : fail("UnknownBlock", `块 ${request.args.block} 不存在`);
 				}
-				return ok({ title: doc.result.title, blocks: doc.result.blocks, ...(doc.result.run ? { run: doc.result.run } : {}) });
+				return ok({ title: doc.result.title, blocks: doc.result.blocks.map(wireBlock), ...(doc.result.run ? { run: doc.result.run } : {}) });
 			}
 			case "set": {
 				const held = this.#held(request.args.run, request.args.block);
@@ -819,11 +867,30 @@ export class Core implements CoreApi, K1Handler {
 				const held = this.#held(request.args.run, request.args.block);
 				if (!held.ok) return held;
 				const { doc, block } = held.result;
-				const first = block.body.indexOf(request.args.find);
-				if (first < 0) return fail("NotFound", "find 文本不在块正文中");
-				if (block.body.indexOf(request.args.find, first + 1) >= 0) return fail("Ambiguous", "find 文本出现多次");
-				const text = block.body.slice(0, first) + request.args.replace + block.body.slice(first + request.args.find.length);
-				this.#applyEdit(doc, "coordinator", { kind: "field", block: block.id, field: "body", text });
+				const field = coordinatorField(block.content);
+				const current = fieldText(block, field)!;
+				const first = current.indexOf(request.args.find);
+				if (first < 0) return fail("NotFound", field === "body" ? "find 文本不在块正文中" : "find 文本不在设计稿中");
+				if (current.indexOf(request.args.find, first + 1) >= 0) return fail("Ambiguous", "find 文本出现多次");
+				const text = current.slice(0, first) + request.args.replace + current.slice(first + request.args.find.length);
+				this.#applyEdit(doc, "coordinator", { kind: "field", block: block.id, field, text });
+				return ok(null);
+			}
+			case "write": {
+				const held = this.#held(request.args.run, request.args.block);
+				if (!held.ok) return held;
+				const { doc, block } = held.result;
+				this.#applyEdit(doc, "coordinator", { kind: "field", block: block.id, field: coordinatorField(block.content), text: request.args.text });
+				return ok(null);
+			}
+			case "panel": {
+				const held = this.#held(request.args.run, request.args.block);
+				if (!held.ok) return held;
+				const { doc, block } = held.result;
+				if (block.content.kind !== "design") return fail("BadValue", `块 ${block.id} 是执行块，没有设计稿面板`);
+				const replaced = this.#refs.replacePanel(block.content.design, request.args.panel, request.args.text);
+				if (!replaced.ok) return fail(replaced.code, replaced.reason);
+				this.#applyEdit(doc, "coordinator", { kind: "field", block: block.id, field: "design", text: replaced.text });
 				return ok(null);
 			}
 			case "insert": {
@@ -832,8 +899,18 @@ export class Core implements CoreApi, K1Handler {
 				if (this.#isFinished(doc.result)) return fail("RunFinished", "Run 已结束");
 				if (request.args.after !== undefined && !this.#block(doc.result, request.args.after)) return fail("UnknownBlock", `块 ${request.args.after} 不存在`);
 				const id = this.#allocateBlock(doc.result);
-				this.#applyEdit(doc.result, "coordinator", { kind: "insert", after: request.args.after ?? null, block: { id, title: request.args.title, body: request.args.body, done: false } });
+				const given = request.args.content;
+				// A design block's requirement is the person's; the coordinator only drafts the design.
+				const content: BlockContent = given.kind === "task" ? given : { kind: "design", requirement: "", design: given.design };
+				this.#applyEdit(doc.result, "coordinator", { kind: "insert", after: request.args.after ?? null, block: { id, title: request.args.title, done: false, content } });
 				return ok({ block: id });
+			}
+			case "revisions": {
+				const doc = this.#docOf(request.args.run);
+				if (!doc.ok) return doc;
+				const after = request.args.after ?? 0;
+				const block = request.args.block;
+				return ok({ revisions: doc.result.revisions.filter(revision => revision.seq > after && (block === undefined || revision.block === block)) });
 			}
 			case "delete": {
 				const held = this.#held(request.args.run, request.args.block);
@@ -981,12 +1058,22 @@ export class Core implements CoreApi, K1Handler {
 		if (docState.run.status === "finished") return fail("RunFinished", "Run 已结束");
 		if (blocks.length === 0) return fail("BadLaunch", "blocks 为空");
 		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
-		const orchestration = blocks.filter(id => isOrchestration(this.#block(docState, id)!.body));
-		if (orchestration.length > 0 && blocks.length > 1) return fail("BadLaunch", "编排块只能单独启动");
+		const kindError = (): Outcome<never> | null => {
+			const designs = blocks.filter(id => this.#block(docState, id)!.content.kind === "design");
+			if (designs.length > 0) return fail("BadLaunch", `设计块 ${designs.join(", ")} 不能直接启动：在执行块中引用它`);
+			if (blocks.some(id => isOrchestration(this.#block(docState, id)!.content)) && blocks.length > 1) return fail("BadLaunch", "编排块只能单独启动");
+			return null;
+		};
+		const before = kindError();
+		if (before) return before;
 		await this.#ensureFetched(docState, blocks);
 		if (this.#isFinished(docState)) return fail("RunFinished", "Run 已结束");
 		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
-		const bodies = this.#bodies(docState);
+		// A disk edit may have switched a block's kind while fetching.
+		const after = kindError();
+		if (after) return after;
+		const orchestration = blocks.filter(id => isOrchestration(this.#block(docState, id)!.content));
+		const bodies = this.#contents(docState);
 		const results = this.#results(run);
 		const result = this.#refs.compile(blocks, this.#input(docState, this.#fetches, bodies, results));
 		if (result.kind === "Err") return fail("CompileError", "编译失败", result.error);
@@ -1029,7 +1116,7 @@ export class Core implements CoreApi, K1Handler {
 		if (!owned.ok) return owned;
 		const launch = owned.result;
 		const doc = this.#docs.get(launch.record.run)!;
-		const bodies = this.#bodies(doc);
+		const bodies = this.#contents(doc);
 		const fetches = await this.#launchFetches(launch, bodies);
 		const result = this.#refs.compile(launch.record.blocks, this.#input(doc, fetches, bodies, new Map(launch.record.snapshot.results)));
 		if (result.kind === "Err") return fail("CompileError", "编译失败", result.error);
@@ -1138,7 +1225,7 @@ export class Core implements CoreApi, K1Handler {
 			...(session !== null ? { session } : {}),
 		});
 		if (kind === "result" && block !== null) {
-			this.#invalidateInspections(doc, blocks => this.#refs.resultTargets(blocks, this.#bodies(doc)).includes(block));
+			this.#invalidateInspections(doc, blocks => this.#refs.resultTargets(blocks, this.#contents(doc)).includes(block));
 			void this.#recomputeChecks(run);
 		}
 		this.#emit(doc.ref);
@@ -1164,7 +1251,7 @@ export class Core implements CoreApi, K1Handler {
 		const input = this.#input(doc, this.#fetches);
 		const entries = doc.run ? (this.#logs.get(doc.run.id)?.entries ?? []) : [];
 		const blocks: BlockView[] = doc.blocks.map(block => {
-			const references: ReferenceView[] = this.#refs.parseReferences(block.body).map((reference, index) => {
+			const references: ReferenceView[] = (block.content.kind === "task" ? this.#refs.parseReferences(block.content.body) : []).map((reference, index) => {
 				const target = this.#refs.parseTarget(reference.targetText);
 				const external = target !== null && target.kind !== "block" && target.kind !== "result";
 				const key = target ? this.#refs.targetKey(target) : reference.targetText;
@@ -1278,13 +1365,14 @@ export class Core implements CoreApi, K1Handler {
 		return false;
 	}
 
-	pencil(ref: DocRef, id: BlockId, field: BlockField): string | null {
+	pencil(ref: DocRef, id: BlockId, field: HumanField): string | null {
 		const target = this.#humanTarget(ref, id);
 		if (typeof target === "string") return target;
+		if (!humanFieldValid(target.block.content, field)) return target.block.content.kind === "task" ? "执行块没有这个字段" : "设计块的设计稿由协调者修改：请写修改 prompt";
 		const lock = target.doc.locks.get(id);
 		if (lock?.kind !== "none") return lock?.kind === "coordinator" ? "协调者正在编辑" : "已在编辑";
 		if (this.#hasHumanDraft()) return "请先提交正在编辑的字段";
-		target.doc.locks.set(id, { kind: "human", field, draft: target.block[field] });
+		target.doc.locks.set(id, { kind: "human", field, draft: field === "prompt" ? "" : fieldText(target.block, field)! });
 		target.doc.notices.delete(id);
 		this.#emit(ref);
 		return null;
@@ -1303,10 +1391,36 @@ export class Core implements CoreApi, K1Handler {
 		const lock = doc?.locks.get(id);
 		if (!doc || lock?.kind !== "human") return "没有正在编辑的字段";
 		const block = this.#block(doc, id);
+		if (lock.field === "prompt") return this.#submitRevision(doc, id, lock.draft);
 		doc.locks.set(id, { kind: "none" });
-		if (block && lock.draft !== block[lock.field]) this.#applyEdit(doc, "human", { kind: "field", block: id, field: lock.field, text: lock.draft });
+		if (block && lock.draft !== fieldText(block, lock.field)) this.#applyEdit(doc, "human", { kind: "field", block: id, field: lock.field, text: lock.draft });
 		else this.#afterChange(doc);
 		return null;
+	}
+
+	/** Submit a design change request: journal it, then notify the coordinator. Refused (draft kept) without a coordinator or text. */
+	#submitRevision(doc: DocState, id: BlockId, prompt: string): string | null {
+		if (prompt.trim() === "") return "修改 prompt 是空的";
+		if (!this.#conn || this.#conn.session === null) return "没有协调者连接：修改 prompt 仍保留，协调者连接后再提交";
+		const revision: Revision = { seq: (doc.revisions.at(-1)?.seq ?? 0) + 1, at: this.#now(), block: id, prompt };
+		this.#store.appendRevision(doc.ref, revision);
+		doc.revisions.push(revision);
+		doc.locks.set(id, { kind: "none" });
+		this.#send({ event: "revision_requested", data: { ...(doc.run ? { run: doc.run.id } : {}), block: id, revision: revision.seq } });
+		this.#emit(doc.ref);
+		return null;
+	}
+
+	discard(ref: DocRef, id: BlockId): string | null {
+		const doc = this.#doc(ref);
+		if (!doc || doc.locks.get(id)?.kind !== "human") return "没有正在编辑的字段";
+		doc.locks.set(id, { kind: "none" });
+		this.#emit(ref);
+		return null;
+	}
+
+	revisions(ref: DocRef, id: BlockId): readonly Revision[] {
+		return this.#doc(ref)?.revisions.filter(revision => revision.block === id) ?? [];
 	}
 
 	interrupt(ref: DocRef, id: BlockId): string | null {
@@ -1331,12 +1445,13 @@ export class Core implements CoreApi, K1Handler {
 		return null;
 	}
 
-	insertBlock(ref: DocRef, after: BlockId | null): string | null {
+	insertBlock(ref: DocRef, after: BlockId | null, kind: BlockContent["kind"]): string | null {
 		const doc = this.#doc(ref);
 		if (!doc) return "文档不存在";
 		if (this.#isFinished(doc)) return "Run 已结束";
 		const id = this.#allocateBlock(doc);
-		this.#applyEdit(doc, "human", { kind: "insert", after, block: { id, title: "", body: "", done: false } });
+		const content: BlockContent = kind === "task" ? { kind, body: "" } : { kind, requirement: "", design: "" };
+		this.#applyEdit(doc, "human", { kind: "insert", after, block: { id, title: "", done: false, content } });
 		return null;
 	}
 
@@ -1351,7 +1466,8 @@ export class Core implements CoreApi, K1Handler {
 	requestLaunch(run: RunId, blocks: readonly BlockId[]): string | null {
 		const doc = this.#docs.get(run);
 		if (!doc?.run || doc.run.status !== "running") return "Run 不在进行中";
-		if (blocks.some(id => isOrchestration(this.#block(doc, id)?.body ?? "")) && blocks.length > 1) return "编排块只能单独启动";
+		if (blocks.some(id => this.#block(doc, id)?.content.kind === "design")) return "设计块不能直接启动：在执行块中引用它";
+		if (blocks.some(id => isOrchestration(this.#block(doc, id)?.content ?? { kind: "task", body: "" })) && blocks.length > 1) return "编排块只能单独启动";
 		return this.#send({ event: "launch_requested", data: { run, blocks: [...blocks] } }) ? null : "没有协调者连接";
 	}
 
@@ -1413,6 +1529,8 @@ export class Core implements CoreApi, K1Handler {
 
 type EditChange =
 	| { readonly kind: "field"; readonly block: BlockId; readonly field: BlockField; readonly text: string }
+	/** A disk edit switched the block's kind: the content is replaced whole. */
+	| { readonly kind: "content"; readonly block: BlockId; readonly content: BlockContent }
 	| { readonly kind: "done"; readonly block: BlockId; readonly done: boolean }
 	| { readonly kind: "insert"; readonly after: BlockId | null; readonly block: Block }
 	| { readonly kind: "delete"; readonly block: BlockId }

@@ -90,7 +90,23 @@ export function parseRequest(op: string, args: unknown): Request | ProtocolError
 				}
 			}
 			case "edit": return { op, args: { run: optional(a.run, run), block: block(a.block), find: string(a.find, "find"), replace: string(a.replace, "replace") } };
-			case "insert": return { op, args: { run: optional(a.run, run), after: optional(a.after, block), title: string(a.title, "title"), body: string(a.body, "body") } };
+			case "write": return { op, args: { run: optional(a.run, run), block: block(a.block), text: string(a.text, "text") } };
+			case "panel": {
+				const panel = string(a.panel, "panel");
+				if (!/^[A-Z][0-9]*$/.test(panel)) throw new BadInput("panel must be a panel letter ID such as A");
+				return { op, args: { run: optional(a.run, run), block: block(a.block), panel, text: string(a.text, "text") } };
+			}
+			case "insert": {
+				const content = object(a.content, "content");
+				switch (content.kind) {
+					case "task": return { op, args: { run: optional(a.run, run), after: optional(a.after, block), title: string(a.title, "title"), content: { kind: "task", body: string(content.body, "body") } } };
+					case "design":
+						if (content.requirement !== undefined) throw new BadInput("a design block's requirement belongs to the person; insert it with an empty requirement");
+						return { op, args: { run: optional(a.run, run), after: optional(a.after, block), title: string(a.title, "title"), content: { kind: "design", design: string(content.design, "design") } } };
+					default: throw new BadInput("content kind must be task or design");
+				}
+			}
+			case "revisions": return { op, args: { run: optional(a.run, run), block: optional(a.block, block), after: optional(a.after, v => integer(v, "after", 0)) } };
 			case "refetch": return { op, args: { run: optional(a.run, run), targets: array(a.targets, "targets", v => string(v, "target")) } };
 			case "compile":
 			case "inspect": return { op, args: { run: optional(a.run, run), blocks: array(a.blocks, "blocks", block) } };

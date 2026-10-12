@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { DocRef, FetchOutcome, PlaybookDoc, RunId, RunMeta, TimelineEntry } from "../src/domain/model";
+import type { BlockContent, DocRef, FetchOutcome, PlaybookDoc, Revision, RunId, RunMeta, TimelineEntry } from "../src/domain/model";
 import type { Connection } from "../src/domain/ports";
 import type { ErrorCode, EventPayload, Outcome, Request, RunSummary } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
@@ -13,8 +13,18 @@ const BASE_TIME = Date.parse("2026-10-11T00:00:00.000Z");
 const template: PlaybookDoc = {
 	title: "Night operations",
 	blocks: [
-		{ id: "b1", title: "Prepare", body: "First line\nSecond line\n", done: true },
-		{ id: "b2", title: "Execute", body: "Review ((b1))", done: false },
+		{ id: "b1", title: "Prepare", content: { kind: "task", body: "First line\nSecond line\n" }, done: true },
+		{ id: "b2", title: "Execute", content: { kind: "task", body: "Review ((b1))" }, done: false },
+	],
+};
+const designTemplate: PlaybookDoc = {
+	...template,
+	blocks: [
+		...template.blocks,
+		{
+			id: "b3", title: "Deployment design", done: true,
+			content: { kind: "design", requirement: "Keep the service available.\n", design: "## A Rollout\n\nDeploy one instance at a time.\n" },
+		},
 	],
 };
 const templateRef: DocRef = { kind: "template" };
@@ -112,14 +122,106 @@ describe("Run creation and independent copies (runs.md §§1–2)", () => {
 		expect(f.core.pencil(templateRef, "b1", "body")).toBeNull();
 		expect(f.core.setDraft(templateRef, "b1", "Changed template")).toBeNull();
 		expect(f.core.commit(templateRef, "b1")).toBeNull();
-		expect(f.core.view(runRef).blocks[0]!.block.body).toBe(template.blocks[0]!.body);
+		expect(f.core.view(runRef).blocks[0]!.block.content).toEqual(template.blocks[0]!.content);
 		expect(f.core.pencil(runRef, "b2", "title")).toBeNull();
 		expect(f.core.setDraft(runRef, "b2", "Changed run")).toBeNull();
 		expect(f.core.commit(runRef, "b2")).toBeNull();
 		expect(f.core.view(templateRef).blocks[1]!.block.title).toBe("Execute");
 		expect(expectOk(await f.request({ op: "start_run", args: { name: "Second run" } }))).toEqual({ run: "r2" });
-		expect(f.core.view({ kind: "run", run: "r2" }).blocks[0]!.block.body).toBe("Changed template");
+		expect(f.core.view({ kind: "run", run: "r2" }).blocks[0]!.block.content).toEqual({ kind: "task", body: "Changed template" });
 		expect(f.core.view({ kind: "run", run: "r2" }).blocks[1]!.block.title).toBe("Execute");
+	});
+
+	test("start_run copies design requirement and design, resets done and keeps later edits independent", async () => {
+		const f = fixture(designTemplate);
+		await f.connect();
+		expectOk(await f.request({ op: "start_run", args: { name: "Design snapshot" } }));
+		const copied = designTemplate.blocks.map(block => ({ ...block, done: false }));
+		expect(f.core.view(runRef).blocks.map(view => view.block)).toEqual(copied);
+		expect(f.persisted().doc).toEqual({ ...designTemplate, blocks: copied });
+		expect(f.persisted().doc.blocks[2]!.done).toBe(false);
+
+		expect(f.core.pencil(templateRef, "b3", "requirement")).toBeNull();
+		expect(f.core.setDraft(templateRef, "b3", "Keep the service and database available.\n")).toBeNull();
+		expect(f.core.commit(templateRef, "b3")).toBeNull();
+		expect(f.core.view(runRef).blocks[2]!.block.content).toEqual(designTemplate.blocks[2]!.content);
+		expectOk(await f.request({ op: "lock", args: { run: "r1", block: "b3" } }));
+		expectOk(await f.request({ op: "write", args: { run: "r1", block: "b3", text: "## A Rollout\n\nDeploy the canary first.\n" } }));
+		const templateContent: BlockContent = {
+			kind: "design", requirement: "Keep the service and database available.\n", design: "## A Rollout\n\nDeploy one instance at a time.\n",
+		};
+		const runContent: BlockContent = {
+			kind: "design", requirement: "Keep the service available.\n", design: "## A Rollout\n\nDeploy the canary first.\n",
+		};
+		expect(f.core.view(templateRef).blocks[2]!.block.content).toEqual(templateContent);
+		expect(f.core.view(runRef).blocks[2]!.block.content).toEqual(runContent);
+		f.core.stop();
+		expect(f.persisted().doc.blocks[2]!.content).toEqual(runContent);
+		const parsedTemplate = f.store.readTemplate();
+		expect(parsedTemplate.ok).toBe(true);
+		if (!parsedTemplate.ok) throw new Error(parsedTemplate.error);
+		expect(parsedTemplate.doc.blocks[2]!.content).toEqual(templateContent);
+		expect(parsedTemplate.doc.blocks[2]!.done).toBe(true);
+		const restarted = f.newCore();
+		expect(restarted.view(templateRef).blocks[2]!.block.content).toEqual(templateContent);
+		expect(restarted.view(runRef).blocks[2]!.block.content).toEqual(runContent);
+		expect(restarted.view(runRef).blocks[2]!.block.done).toBe(false);
+	});
+
+	test("Run revision history starts empty and remains separate from queryable template history after restart", async () => {
+		const f = fixture(designTemplate);
+		await f.connect();
+		expect(f.core.pencil(templateRef, "b3", "prompt")).toBeNull();
+		expect(f.core.setDraft(templateRef, "b3", "Explain the rollback plan.")).toBeNull();
+		expect(f.core.commit(templateRef, "b3")).toBeNull();
+		const templateRevisions: Revision[] = [{ seq: 1, at: BASE_TIME, block: "b3", prompt: "Explain the rollback plan." }];
+		expect(expectOk(await f.request({ op: "revisions", args: { block: "b3" } }))).toEqual({ revisions: templateRevisions });
+		expectOk(await f.request({ op: "start_run", args: { name: "Fresh revisions" } }));
+		expect(expectOk(await f.request({ op: "revisions", args: { run: "r1" } }))).toEqual({ revisions: [] });
+		expect(f.core.revisions(runRef, "b3")).toEqual([]);
+		expect(f.store.readRevisions(runRef)).toEqual([]);
+		expect(expectOk(await f.request({ op: "revisions", args: {} }))).toEqual({ revisions: templateRevisions });
+
+		f.setTime(BASE_TIME + 1_000);
+		expect(f.core.pencil(runRef, "b3", "prompt")).toBeNull();
+		expect(f.core.setDraft(runRef, "b3", "Add a canary health check.")).toBeNull();
+		expect(f.core.commit(runRef, "b3")).toBeNull();
+		const runRevisions: Revision[] = [{ seq: 1, at: BASE_TIME + 1_000, block: "b3", prompt: "Add a canary health check." }];
+		expect(expectOk(await f.request({ op: "revisions", args: { run: "r1", block: "b3" } }))).toEqual({ revisions: runRevisions });
+		expect(f.core.revisions(templateRef, "b3")).toEqual(templateRevisions);
+		expect(f.store.readRevisions(templateRef)).toEqual(templateRevisions);
+		expect(f.store.readRevisions(runRef)).toEqual(runRevisions);
+		expectOk(await f.request({ op: "start_run", args: { name: "Another fresh revision stream" } }));
+		expect(expectOk(await f.request({ op: "revisions", args: { run: "r2" } }))).toEqual({ revisions: [] });
+		f.core.stop();
+		const restarted = f.newCore();
+		await f.connect(restarted, "session-restarted");
+		expect(expectOk(await f.request({ op: "revisions", args: { block: "b3" } }, restarted))).toEqual({ revisions: templateRevisions });
+		expect(expectOk(await f.request({ op: "revisions", args: { run: "r1", block: "b3" } }, restarted))).toEqual({ revisions: runRevisions });
+		expect(expectOk(await f.request({ op: "revisions", args: { run: "r2" } }, restarted))).toEqual({ revisions: [] });
+	});
+
+	test("read returns flattened task and design wire blocks with kind, without revision history", async () => {
+		const f = fixture(designTemplate);
+		await f.connect();
+		expect(f.core.pencil(templateRef, "b3", "prompt")).toBeNull();
+		expect(f.core.setDraft(templateRef, "b3", "Describe deployment risks.")).toBeNull();
+		expect(f.core.commit(templateRef, "b3")).toBeNull();
+		const task = { id: "b1", kind: "task", title: "Prepare", body: "First line\nSecond line\n", done: true };
+		const design = {
+			id: "b3", kind: "design", title: "Deployment design", done: true,
+			requirement: "Keep the service available.\n", design: "## A Rollout\n\nDeploy one instance at a time.\n",
+		};
+		const wireBlocks = [task, { id: "b2", kind: "task", title: "Execute", body: "Review ((b1))", done: false }, design];
+		expect(expectOk(await f.request({ op: "read", args: {} }))).toEqual({ title: designTemplate.title, blocks: wireBlocks });
+		expect(expectOk(await f.request({ op: "read", args: { block: "b1" } }))).toEqual(task);
+		expect(expectOk(await f.request({ op: "read", args: { block: "b3" } }))).toEqual(design);
+		expectOk(await f.request({ op: "start_run", args: { name: "Wire snapshot" } }));
+		expect(expectOk(await f.request({ op: "read", args: { run: "r1" } }))).toEqual({
+			title: designTemplate.title, blocks: wireBlocks.map(block => ({ ...block, done: false })), run: f.persisted().run,
+		});
+		expect(expectOk(await f.request({ op: "read", args: { run: "r1", block: "b1" } }))).toEqual({ ...task, done: false });
+		expect(expectOk(await f.request({ op: "read", args: { run: "r1", block: "b3" } }))).toEqual({ ...design, done: false });
 	});
 
 	test("human start emits run_started and persists its full event record", async () => {
@@ -160,7 +262,7 @@ describe("Run creation and independent copies (runs.md §§1–2)", () => {
 
 describe("Run finish and late records (runs.md §§2,4,6)", () => {
 	test("finish_run closes all open launches as service, releases locks and discards drafts", async () => {
-		const f = fixture({ ...template, blocks: [{ ...template.blocks[0]!, body: "Read ((file:instructions.txt))" }, template.blocks[1]!] });
+		const f = fixture({ ...template, blocks: [{ ...template.blocks[0]!, content: { kind: "task", body: "Read ((file:instructions.txt))" } }, template.blocks[1]!] });
 		await f.connect();
 		expectOk(await f.request({ op: "start_run", args: { name: "Finish", update_every: 30 } }));
 		expectOk(await f.request({ op: "launch", args: { run: "r1", blocks: ["b1"] } }));
@@ -183,7 +285,7 @@ describe("Run finish and late records (runs.md §§2,4,6)", () => {
 		]);
 		expect(f.core.view(runRef).blocks.map(block => block.lock)).toEqual([{ kind: "none" }, { kind: "none" }]);
 		expect(f.core.view(runRef).blocks[0]!.notices).toContain("Run 已结束，未提交的修改已丢弃");
-		expect(f.core.view(runRef).blocks[0]!.block.body).toBe("Read ((file:instructions.txt))");
+		expect(f.core.view(runRef).blocks[0]!.block.content).toEqual({ kind: "task", body: "Read ((file:instructions.txt))" });
 		expect(f.core.commit(runRef, "b1")).not.toBeNull();
 		expect(f.events).toEqual([]);
 	});
@@ -199,7 +301,7 @@ describe("Run finish and late records (runs.md §§2,4,6)", () => {
 			{ op: "set", args: { run: "r1", block: "b1", field: "title", value: "Changed" } },
 			{ op: "set", args: { run: "r1", block: "b1", field: "done", value: true } },
 			{ op: "edit", args: { run: "r1", block: "b1", find: "First", replace: "Other" } },
-			{ op: "insert", args: { run: "r1", title: "New", body: "New" } },
+			{ op: "insert", args: { run: "r1", title: "New", content: { kind: "task", body: "New" } } },
 			{ op: "delete", args: { run: "r1", block: "b1" } },
 			{ op: "launch", args: { run: "r1", blocks: ["b1"] } },
 			{ op: "finish_run", args: { run: "r1" } },
@@ -208,7 +310,7 @@ describe("Run finish and late records (runs.md §§2,4,6)", () => {
 		expect(f.core.pencil(runRef, "b1", "title")).toBe("Run 已结束");
 		expect(f.core.setDone(runRef, "b1", true)).toBe("Run 已结束");
 		expect(f.core.deleteBlock(runRef, "b1")).toBe("Run 已结束");
-		expect(f.core.insertBlock(runRef, null)).toBe("Run 已结束");
+		expect(f.core.insertBlock(runRef, null, "task")).toBe("Run 已结束");
 		expectOk(await f.request({ op: "post", args: { run: "r1", kind: "result", text: "Late subagent result", block: "b1" } }));
 		expect(f.core.post("r1", "failure", "Human follow-up", null, null)).toBeNull();
 		expect(f.core.view(runRef).blocks[0]!.latestRecord!.data).toMatchObject({ type: "post", kind: "result", text: "Late subagent result" });

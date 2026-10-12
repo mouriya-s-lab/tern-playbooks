@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { BlockField, BlockId, DocRef, FetchOutcome, PlaybookDoc, RunId } from "../src/domain/model";
+import { fieldText, withField, type Block, type BlockContent, type BlockField, type BlockId, type DocRef, type FetchOutcome, type PlaybookDoc, type Revision, type RunId } from "../src/domain/model";
 import type { Connection, CoreApi, Fetcher, K1Handler, Store } from "../src/domain/ports";
 import type { ErrorCode, EventPayload, Outcome, Request } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
@@ -13,11 +13,26 @@ const template: DocRef = { kind: "template" };
 const original: PlaybookDoc = {
 	title: "Lock integration",
 	blocks: [
-		{ id: "b1", title: "First", body: "alpha unique repeated repeated aaa", done: false },
-		{ id: "b2", title: "Second", body: "second committed body", done: true },
-		{ id: "b3", title: "Third", body: "third committed body", done: false },
+		{ id: "b1", title: "First", content: { kind: "task", body: "alpha unique repeated repeated aaa" }, done: false },
+		{ id: "b2", title: "Second", content: { kind: "task", body: "second committed body" }, done: true },
+		{ id: "b3", title: "Third", content: { kind: "task", body: "third committed body" }, done: false },
 	],
 };
+
+function wire(block: Block) {
+	return { id: block.id, title: block.title, ...block.content, done: block.done };
+}
+
+const originalWire = { title: original.title, blocks: original.blocks.map(wire) };
+const designText = "Introduction.\n\n## A First panel\nshared unique design text\n\n## B Second panel\nuntouched panel\n\n## Unaddressed\nassigned ID only\n";
+const designDoc = {
+	title: original.title,
+	blocks: [
+		{ id: "b1", title: "First design", done: false, content: { kind: "design", requirement: "shared unique human requirement", design: designText } },
+		{ id: "b2", title: "Second design", done: false, content: { kind: "design", requirement: "second requirement", design: "## A Other\nother design" } },
+		original.blocks[2]!,
+	] satisfies [Block, Block, Block],
+} satisfies PlaybookDoc;
 const directories: string[] = [];
 const activeCores = new Set<Core>();
 
@@ -68,11 +83,11 @@ function startCore(store: Store, paneControl: PaneControl = panes): CoreHarness 
 	};
 }
 
-function fixture(paneControl: PaneControl = panes) {
+function fixture(paneControl: PaneControl = panes, doc: PlaybookDoc = original) {
 	const directory = mkdtempSync("/tmp/tern-core-locks-");
 	directories.push(directory);
 	const store = createStore(join(directory, "playbook.yaml"));
-	store.write(template, store.serialize(original, null));
+	store.write(template, store.serialize(doc, null));
 	return startCore(store, paneControl);
 }
 
@@ -145,7 +160,7 @@ describe("K1 hello and lock ownership", () => {
 		await hello(h);
 		expect(await h.request({ op: "lock", args: { block: "b1" } }, "first-lock")).toEqual({
 			ok: true,
-			result: { block: original.blocks[0] },
+			result: { block: originalWire.blocks[0] },
 		});
 		const callsBeforeReveal = ownPaneCalls;
 		const second = connection(2);
@@ -197,8 +212,8 @@ describe("K1 hello and lock ownership", () => {
 		expect(h.api.coordinator()).toEqual({ connected: false, session: null, pane: null });
 		await hello(h);
 		expect(h.api.coordinator()).toEqual({ connected: true, session: "session-one", pane: "coordinator-pane" });
-		expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: original });
-		expect(await h.request({ op: "read", args: { block: "b2" } })).toEqual({ ok: true, result: original.blocks[1] });
+		expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: originalWire });
+		expect(await h.request({ op: "read", args: { block: "b2" } })).toEqual({ ok: true, result: originalWire.blocks[1] });
 		expect(h.fetchCount()).toBe(0);
 	});
 
@@ -244,13 +259,15 @@ describe("K1 hello and lock ownership", () => {
 		{ op: "set", args: { block: "b1", field: "title", value: "unowned title" } },
 		{ op: "set", args: { block: "b1", field: "done", value: true } },
 		{ op: "edit", args: { block: "b1", find: "unique", replace: "unowned body" } },
+		{ op: "write", args: { block: "b1", text: "unowned body" } },
+		{ op: "panel", args: { block: "b1", panel: "A", text: "## A Unowned" } },
 		{ op: "delete", args: { block: "b1" } },
 	] satisfies Request[]) {
 		test(`${request.op} without a held lock returns NotLocked and leaves committed content unchanged (${JSON.stringify(request.args)})`, async () => {
 			const h = fixture();
 			await hello(h);
 			expectError(await h.request(request), "NotLocked");
-			expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: original });
+			expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: originalWire });
 			expect(visible(h, template, "b1").lock).toEqual({ kind: "none" });
 			expect(persistedTemplate(h.store)).toEqual(original);
 		});
@@ -263,9 +280,9 @@ describe("K1 hello and lock ownership", () => {
 		expect(h.api.setDraft(template, "b1", "human committed title")).toBeNull();
 		expect(h.api.commit(template, "b1")).toBeNull();
 		const committed = { ...original.blocks[0]!, title: "human committed title" };
-		expect(await h.request({ op: "lock", args: { block: "b1" } }, "old-lock")).toEqual({ ok: true, result: { block: committed } });
+		expect(await h.request({ op: "lock", args: { block: "b1" } }, "old-lock")).toEqual({ ok: true, result: { block: wire(committed) } });
 		expect(await h.request({ op: "set", args: { block: "b1", field: "done", value: true } })).toEqual({ ok: true, result: null });
-		expect(await h.request({ op: "lock", args: { block: "b1" } }, "new-lock")).toEqual({ ok: true, result: { block: { ...committed, done: true } } });
+		expect(await h.request({ op: "lock", args: { block: "b1" } }, "new-lock")).toEqual({ ok: true, result: { block: wire({ ...committed, done: true }) } });
 		await h.request({ op: "lock", args: { block: "b2" } }, "other-block-lock");
 		for (const request of ["old-lock", "other-block-lock", "never-issued"]) {
 			expect(await h.request({ op: "unlock", args: { block: "b1", request } })).toEqual({ ok: true, result: null });
@@ -283,14 +300,14 @@ describe("K1 hello and lock ownership", () => {
 		await h.request({ op: "lock", args: { block: "b1" } }, "edit-lock");
 		for (const [find, code] of [["absent", "NotFound"], ["repeated", "Ambiguous"], ["aa", "Ambiguous"]] as const) {
 			expectError(await h.request({ op: "edit", args: { block: "b1", find, replace: "replacement" } }), code);
-			expect(await h.request({ op: "read", args: { block: "b1" } })).toEqual({ ok: true, result: original.blocks[0] });
+			expect(await h.request({ op: "read", args: { block: "b1" } })).toEqual({ ok: true, result: originalWire.blocks[0] });
 			expect(visible(h, template, "b1").lock).toEqual({ kind: "coordinator", request: "edit-lock" });
 			expect(persistedTemplate(h.store)).toEqual(original);
 		}
 		expect(await h.request({ op: "edit", args: { block: "b1", find: "unique", replace: "changed" } })).toEqual({ ok: true, result: null });
-		expect(visible(h, template, "b1").block.body).toBe("alpha changed repeated repeated aaa");
+		expect(visible(h, template, "b1").block.content).toEqual({ kind: "task", body: "alpha changed repeated repeated aaa" });
 		h.stop();
-		expect(persistedTemplate(h.store).blocks[0]!.body).toBe("alpha changed repeated repeated aaa");
+		expect(persistedTemplate(h.store).blocks[0]!.content).toEqual({ kind: "task", body: "alpha changed repeated repeated aaa" });
 	});
 
 	test("unknown blocks and runs return their domain errors without altering the template", async () => {
@@ -301,11 +318,13 @@ describe("K1 hello and lock ownership", () => {
 			{ op: "lock", args: { block: "b999" } },
 			{ op: "set", args: { block: "b999", field: "title", value: "missing" } },
 			{ op: "edit", args: { block: "b999", find: "x", replace: "y" } },
+			{ op: "write", args: { block: "b999", text: "missing" } },
+			{ op: "panel", args: { block: "b999", panel: "A", text: "## A Missing" } },
 			{ op: "delete", args: { block: "b999" } },
 		] satisfies Request[]) expectError(await h.request(request), "UnknownBlock");
 		expectError(await h.request({ op: "read", args: { run: "r999" } }), "UnknownRun");
 		expectError(await h.request({ op: "lock", args: { run: "r999", block: "b1" } }), "UnknownRun");
-		expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: original });
+		expect(await h.request({ op: "read", args: {} })).toEqual({ ok: true, result: originalWire });
 	});
 });
 
@@ -317,24 +336,24 @@ describe("K4 human drafts and coordinator interruption", () => {
 			const r = run(h);
 			const before = h.store.readRunLog(r.id).entries;
 			expect(h.api.pencil(r.ref, "b1", field)).toBeNull();
-			expect(visible(h, r.ref, "b1").lock).toEqual({ kind: "human", field, draft: original.blocks[0]![field] });
+			expect(visible(h, r.ref, "b1").lock).toEqual({ kind: "human", field, draft: fieldText(original.blocks[0]!, field)! });
 			expect(h.api.setDraft(r.ref, "b1", `uncommitted ${field}`)).toBeNull();
 			expect(visible(h, r.ref, "b1").block).toEqual(original.blocks[0]!);
-			expect(await h.request({ op: "read", args: { run: r.id, block: "b1" } })).toEqual({ ok: true, result: original.blocks[0] });
-			expect(await h.request({ op: "read", args: { run: r.id } })).toMatchObject({ ok: true, result: { title: original.title, blocks: [{ ...original.blocks[0]! }, { ...original.blocks[1]!, done: false }, original.blocks[2]], run: { id: r.id } } });
+			expect(await h.request({ op: "read", args: { run: r.id, block: "b1" } })).toEqual({ ok: true, result: originalWire.blocks[0] });
+			expect(await h.request({ op: "read", args: { run: r.id } })).toMatchObject({ ok: true, result: { title: original.title, blocks: [originalWire.blocks[0], { ...originalWire.blocks[1]!, done: false }, originalWire.blocks[2]], run: { id: r.id } } });
 			expectError(await h.request({ op: "lock", args: { run: r.id, block: "b1" } }, "draft-lock"), "Locked");
 			expectError(await h.request({ op: "set", args: { run: r.id, block: "b1", field: "title", value: "overwrite" } }), "NotLocked");
 			expect(visible(h, r.ref, "b1").lock).toEqual({ kind: "human", field, draft: `uncommitted ${field}` });
 			expect(h.store.readRunLog(r.id).entries).toEqual(before);
 			expect(h.store.readRuns().get(r.id)).toMatchObject({ ok: true, doc: { blocks: [original.blocks[0], { ...original.blocks[1]!, done: false }, original.blocks[2]] } });
 			expect(h.api.commit(r.ref, "b1")).toBeNull();
-			const committed = { ...original.blocks[0]!, [field]: `uncommitted ${field}` };
+			const committed = withField(original.blocks[0]!, field, `uncommitted ${field}`)!;
 			expect(visible(h, r.ref, "b1").block).toEqual(committed);
 			expect(visible(h, r.ref, "b1").lock).toEqual({ kind: "none" });
 			expect(h.store.readRunLog(r.id).entries.slice(before.length)).toEqual([
 				{ seq: before.length + 1, at: 123_000, origin: "human", data: { type: "block_edited", block: "b1", field, text: `uncommitted ${field}`, edit: 1 } },
 			]);
-			expect(await h.request({ op: "lock", args: { run: r.id, block: "b1" } }, "committed-lock")).toEqual({ ok: true, result: { block: committed } });
+			expect(await h.request({ op: "lock", args: { run: r.id, block: "b1" } }, "committed-lock")).toEqual({ ok: true, result: { block: wire(committed) } });
 			h.stop();
 			expect(h.store.readRuns().get(r.id)).toMatchObject({ ok: true, doc: { blocks: [committed, { ...original.blocks[1]!, done: false }, original.blocks[2]] } });
 			expect(persistedTemplate(h.store)).toEqual(original);
@@ -415,14 +434,14 @@ describe("K1 insert allocation and deletion lifetime", () => {
 	test("insert appends by default, inserts after an anchor, starts unlocked/undone, and never reuses a deleted ID even after restart", async () => {
 		const h = fixture();
 		await hello(h);
-		expect(await h.request({ op: "insert", args: { title: "Allocated", body: "allocated body" } })).toEqual({ ok: true, result: { block: "b4" } });
+		expect(await h.request({ op: "insert", args: { title: "Allocated", content: { kind: "task", body: "allocated body" } } })).toEqual({ ok: true, result: { block: "b4" } });
 		expect(h.api.view(template).blocks.map(item => item.block.id)).toEqual(["b1", "b2", "b3", "b4"]);
-		expect(visible(h, template, "b4")).toMatchObject({ block: { id: "b4", title: "Allocated", body: "allocated body", done: false }, lock: { kind: "none" } });
+		expect(visible(h, template, "b4")).toMatchObject({ block: { id: "b4", title: "Allocated", content: { kind: "task", body: "allocated body" }, done: false }, lock: { kind: "none" } });
 		await h.request({ op: "lock", args: { block: "b4" } }, "delete-lock");
 		expect(await h.request({ op: "delete", args: { block: "b4" } })).toEqual({ ok: true, result: null });
 		expect(h.api.view(template).blocks.some(item => item.block.id === "b4")).toBe(false);
 		expectError(await h.request({ op: "lock", args: { block: "b4" } }), "UnknownBlock");
-		expect(await h.request({ op: "insert", args: { after: "b1", title: "Next", body: "next body" } })).toEqual({ ok: true, result: { block: "b5" } });
+		expect(await h.request({ op: "insert", args: { after: "b1", title: "Next", content: { kind: "task", body: "next body" } } })).toEqual({ ok: true, result: { block: "b5" } });
 		expect(h.api.view(template).blocks.map(item => item.block.id)).toEqual(["b1", "b5", "b2", "b3"]);
 		await h.request({ op: "lock", args: { block: "b5" } }, "delete-next-lock");
 		expect(await h.request({ op: "delete", args: { block: "b5" } })).toEqual({ ok: true, result: null });
@@ -431,8 +450,238 @@ describe("K1 insert allocation and deletion lifetime", () => {
 		expect(h.store.readServiceRecords()).toEqual([{ kind: "block", id: "b4" }, { kind: "block", id: "b5" }]);
 		const restarted = startCore(h.store);
 		await hello(restarted);
-		expect(await restarted.request({ op: "insert", args: { title: "Restart allocated", body: "fresh body" } })).toEqual({ ok: true, result: { block: "b6" } });
+		expect(await restarted.request({ op: "insert", args: { title: "Restart allocated", content: { kind: "task", body: "fresh body" } } })).toEqual({ ok: true, result: { block: "b6" } });
 		restarted.stop();
-		expect(persistedTemplate(h.store).blocks.at(-1)).toEqual({ id: "b6", title: "Restart allocated", body: "fresh body", done: false });
+		expect(persistedTemplate(h.store).blocks.at(-1)).toEqual({ id: "b6", title: "Restart allocated", content: { kind: "task", body: "fresh body" }, done: false });
+	});
+});
+
+describe("Design ownership and coordinator edits", () => {
+	for (const inRun of [false, true]) {
+		test(`edit and write change only design, never the human requirement (${inRun ? "Run" : "template"})`, async () => {
+			const h = fixture(panes, designDoc);
+			await hello(h);
+			const r = inRun ? run(h) : null;
+			const ref = r?.ref ?? template;
+			const scope = r ? { run: r.id } : {};
+			expect(await h.request({ op: "lock", args: { ...scope, block: "b1" } }, "design-lock")).toEqual({ ok: true, result: { block: wire(designDoc.blocks[0]!) } });
+			expect(await h.request({ op: "edit", args: { ...scope, block: "b1", find: "shared unique", replace: "revised" } })).toEqual({ ok: true, result: null });
+			expect(visible(h, ref, "b1").block.content).toEqual({ kind: "design", requirement: "shared unique human requirement", design: designText.replace("shared unique", "revised") });
+			expectError(await h.request({ op: "edit", args: { ...scope, block: "b1", find: "human requirement", replace: "not allowed" } }), "NotFound");
+			expect(await h.request({ op: "write", args: { ...scope, block: "b1", text: "## A Replacement\nwhole new design" } })).toEqual({ ok: true, result: null });
+			const content: BlockContent = { kind: "design", requirement: "shared unique human requirement", design: "## A Replacement\nwhole new design" };
+			expect(visible(h, ref, "b1").block.content).toEqual(content);
+			expect(visible(h, ref, "b1").lock).toEqual({ kind: "coordinator", request: "design-lock" });
+			expect(await h.request({ op: "read", args: { ...scope, block: "b1" } })).toEqual({ ok: true, result: { id: "b1", title: "First design", done: false, ...content } });
+			h.stop();
+			const stored = r ? h.store.readRuns().get(r.id) : h.store.readTemplate();
+			expect(stored?.ok).toBe(true);
+			if (!stored?.ok) throw new Error("Edited document was not persisted");
+			expect(stored.doc.blocks.find(block => block.id === "b1")?.content).toEqual(content);
+			if (r) expect(persistedTemplate(h.store)).toEqual(designDoc);
+		});
+
+		test(`insert design initializes an empty human requirement (${inRun ? "Run" : "template"})`, async () => {
+			const h = fixture();
+			await hello(h);
+			const r = inRun ? run(h) : null;
+			const ref = r?.ref ?? template;
+			const scope = r ? { run: r.id } : {};
+			expect(await h.request({ op: "insert", args: { ...scope, after: "b1", title: "New design", content: { kind: "design", design: "## A Draft\ncoordinator design" } } })).toEqual({ ok: true, result: { block: "b4" } });
+			const block: Block = { id: "b4", title: "New design", done: false, content: { kind: "design", requirement: "", design: "## A Draft\ncoordinator design" } };
+			expect(visible(h, ref, "b4")).toMatchObject({ block, lock: { kind: "none" } });
+			expect(h.api.view(ref).blocks.map(item => item.block.id)).toEqual(["b1", "b4", "b2", "b3"]);
+			expect(await h.request({ op: "read", args: { ...scope, block: "b4" } })).toEqual({ ok: true, result: wire(block) });
+			h.stop();
+			const stored = r ? h.store.readRuns().get(r.id) : h.store.readTemplate();
+			expect(stored?.ok).toBe(true);
+			if (!stored?.ok) throw new Error("Inserted document was not persisted");
+			expect(stored.doc.blocks.find(item => item.id === "b4")).toEqual(block);
+		});
+	}
+
+	test("panel replaces exactly one written-ID panel and rejects unaddressable or invalid replacements atomically", async () => {
+		const h = fixture(panes, designDoc);
+		await hello(h);
+		await h.request({ op: "lock", args: { block: "b1" } }, "panel-lock");
+		for (const [panel, text, code] of [
+			["Z", "## Z Missing", "NotFound"],
+			["C", "## C Automatically assigned", "NotFound"],
+			["Unaddressed", "## Unaddressed", "NotFound"],
+			["A", "body without heading", "BadValue"],
+			["A", "## B Wrong ID\nreplacement", "BadValue"],
+			["A", "## A First\none\n\n## B Second\ntwo", "BadValue"],
+		] as const) {
+			expectError(await h.request({ op: "panel", args: { block: "b1", panel, text } }), code);
+			expect(visible(h, template, "b1").block).toEqual(designDoc.blocks[0]);
+			expect(visible(h, template, "b1").lock).toEqual({ kind: "coordinator", request: "panel-lock" });
+			expect(persistedTemplate(h.store)).toEqual(designDoc);
+		}
+		const replacement = "## A Revised first panel\nnew panel content";
+		expect(await h.request({ op: "panel", args: { block: "b1", panel: "A", text: replacement } })).toEqual({ ok: true, result: null });
+		const expected = designText.replace("## A First panel\nshared unique design text", replacement);
+		expect(visible(h, template, "b1").block.content).toEqual({ kind: "design", requirement: "shared unique human requirement", design: expected });
+		await h.request({ op: "lock", args: { block: "b3" } }, "task-panel-lock");
+		expectError(await h.request({ op: "panel", args: { block: "b3", panel: "A", text: replacement } }), "BadValue");
+		expect(visible(h, template, "b3").block).toEqual(designDoc.blocks[2]);
+		h.stop();
+		expect(persistedTemplate(h.store).blocks[0]!.content).toEqual({ kind: "design", requirement: "shared unique human requirement", design: expected });
+	});
+
+	test("human pencil rejects design-equivalent paths and task-only mismatches, but can commit requirements", () => {
+		const h = fixture(panes, designDoc);
+		for (const [block, field] of [["b1", "body"], ["b3", "requirement"], ["b3", "prompt"]] as const) {
+			expect(h.api.pencil(template, block, field)).toBeTypeOf("string");
+			expect(visible(h, template, block).lock).toEqual({ kind: "none" });
+		}
+		expect(h.api.pencil(template, "b1", "requirement")).toBeNull();
+		expect(visible(h, template, "b1").lock).toEqual({ kind: "human", field: "requirement", draft: "shared unique human requirement" });
+		expect(h.api.setDraft(template, "b1", "revised human requirement")).toBeNull();
+		expect(visible(h, template, "b1").block).toEqual(designDoc.blocks[0]);
+		expect(h.api.commit(template, "b1")).toBeNull();
+		expect(visible(h, template, "b1").block.content).toEqual({ kind: "design", requirement: "revised human requirement", design: designText });
+		expect(visible(h, template, "b1").lock).toEqual({ kind: "none" });
+		h.stop();
+		expect(persistedTemplate(h.store).blocks[0]!.content).toEqual({ kind: "design", requirement: "revised human requirement", design: designText });
+	});
+});
+
+describe("Design change request drafts and revision journals", () => {
+	for (const inRun of [false, true]) {
+		test(`prompt starts empty; a merely connected socket cannot submit and keeps the draft (${inRun ? "Run" : "template"})`, async () => {
+			const h = fixture(panes, designDoc);
+			const r = inRun ? run(h) : null;
+			const ref = r?.ref ?? template;
+			expect(h.api.pencil(ref, "b1", "prompt")).toBeNull();
+			expect(visible(h, ref, "b1").lock).toEqual({ kind: "human", field: "prompt", draft: "" });
+			expect(h.api.setDraft(ref, "b1", "Keep this requested change")).toBeNull();
+			expect(h.api.commit(ref, "b1")).toBeTypeOf("string");
+			expect(visible(h, ref, "b1").lock).toEqual({ kind: "human", field: "prompt", draft: "Keep this requested change" });
+			expect(visible(h, ref, "b1").block).toEqual(designDoc.blocks[0]);
+			expect(h.store.readRevisions(ref)).toEqual([]);
+			expect(h.api.revisions(ref, "b1")).toEqual([]);
+			expect(h.events).toEqual([]);
+			await h.request({ op: "hello", args: { session: "revision-coordinator" } });
+			expect(h.api.commit(ref, "b1")).toBeNull();
+			expect(h.store.readRevisions(ref)).toEqual([{ seq: 1, at: 123_000, block: "b1", prompt: "Keep this requested change" }]);
+			expect(h.events).toEqual([{ event: "revision_requested", data: { ...(r ? { run: r.id } : {}), block: "b1", revision: 1 } }]);
+			expect(visible(h, ref, "b1").lock).toEqual({ kind: "none" });
+		});
+	}
+
+	test("empty or whitespace-only prompt cannot create a revision, notify, or release its draft lock", async () => {
+		const h = fixture(panes, designDoc);
+		await hello(h);
+		expect(h.api.pencil(template, "b1", "prompt")).toBeNull();
+		for (const prompt of ["", " \n\t "]) {
+			expect(h.api.setDraft(template, "b1", prompt)).toBeNull();
+			expect(h.api.commit(template, "b1")).toBeTypeOf("string");
+			expect(visible(h, template, "b1").lock).toEqual({ kind: "human", field: "prompt", draft: prompt });
+			expect(visible(h, template, "b1").block).toEqual(designDoc.blocks[0]);
+			expect(h.store.readRevisions(template)).toEqual([]);
+			expect(h.api.revisions(template, "b1")).toEqual([]);
+			expect(h.events).toEqual([]);
+		}
+	});
+
+	test("submission appends before notifying, releases the lock, sequences per document, and filters revision queries", async () => {
+		const h = fixture(panes, designDoc);
+		await hello(h);
+		const appended: { ref: DocRef; revision: Revision }[] = [];
+		const appendRevision = h.store.appendRevision;
+		h.store.appendRevision = (ref, revision) => {
+			appendRevision(ref, revision);
+			appended.push({ ref, revision });
+		};
+		const send = h.conn.send;
+		h.conn.send = event => {
+			if (event.event === "revision_requested") {
+				const ref: DocRef = event.data.run ? { kind: "run", run: event.data.run } : template;
+				expect(appended.at(-1)).toEqual({ ref, revision: { seq: event.data.revision, at: 123_000, block: event.data.block, prompt: h.store.readRevisions(ref).at(-1)!.prompt } });
+				expect(h.api.revisions(ref, event.data.block).at(-1)?.seq).toBe(event.data.revision);
+				expect(visible(h, ref, event.data.block).lock).toEqual({ kind: "none" });
+			}
+			send(event);
+		};
+		const submit = (ref: DocRef, block: BlockId, prompt: string) => {
+			expect(h.api.pencil(ref, block, "prompt")).toBeNull();
+			expect(visible(h, ref, block).lock).toEqual({ kind: "human", field: "prompt", draft: "" });
+			expect(h.api.setDraft(ref, block, prompt)).toBeNull();
+			expect(h.api.commit(ref, block)).toBeNull();
+		};
+		submit(template, "b1", "template first");
+		const r = run(h);
+		expect(h.api.revisions(r.ref, "b1")).toEqual([]);
+		expect(h.store.readRevisions(r.ref)).toEqual([]);
+		submit(r.ref, "b1", "run first");
+		submit(template, "b2", "template second");
+		submit(r.ref, "b2", "run second");
+		submit(template, "b1", "template third");
+		const templateRevisions: [Revision, Revision, Revision] = [
+			{ seq: 1, at: 123_000, block: "b1", prompt: "template first" },
+			{ seq: 2, at: 123_000, block: "b2", prompt: "template second" },
+			{ seq: 3, at: 123_000, block: "b1", prompt: "template third" },
+		];
+		const runRevisions: [Revision, Revision] = [
+			{ seq: 1, at: 123_000, block: "b1", prompt: "run first" },
+			{ seq: 2, at: 123_000, block: "b2", prompt: "run second" },
+		];
+		expect(appended).toEqual([
+			{ ref: template, revision: templateRevisions[0] },
+			{ ref: r.ref, revision: runRevisions[0] },
+			{ ref: template, revision: templateRevisions[1] },
+			{ ref: r.ref, revision: runRevisions[1] },
+			{ ref: template, revision: templateRevisions[2] },
+		]);
+		expect(h.events.filter(event => event.event === "revision_requested")).toEqual(appended.map(({ ref, revision }) => ({ event: "revision_requested", data: { ...(ref.kind === "run" ? { run: ref.run } : {}), block: revision.block, revision: revision.seq } })));
+		expect(h.store.readRevisions(template)).toEqual(templateRevisions);
+		expect(h.store.readRevisions(r.ref)).toEqual(runRevisions);
+		expect(h.api.revisions(template, "b1")).toEqual([templateRevisions[0], templateRevisions[2]]);
+		expect(h.api.revisions(template, "b2")).toEqual([templateRevisions[1]]);
+		expect(h.api.revisions(r.ref, "b1")).toEqual([runRevisions[0]]);
+		expect(h.api.revisions(r.ref, "b3")).toEqual([]);
+		for (const [args, expected] of [
+			[{}, templateRevisions],
+			[{ block: "b1" }, [templateRevisions[0], templateRevisions[2]]],
+			[{ after: 1 }, templateRevisions.slice(1)],
+			[{ block: "b1", after: 1 }, [templateRevisions[2]]],
+			[{ after: 3 }, []],
+			[{ run: r.id }, runRevisions],
+			[{ run: r.id, block: "b2", after: 1 }, [runRevisions[1]]],
+			[{ run: r.id, block: "b1", after: 1 }, []],
+		] satisfies [Extract<Request, { op: "revisions" }>["args"], readonly Revision[]][]) {
+			expect(await h.request({ op: "revisions", args })).toEqual({ ok: true, result: { revisions: expected } });
+		}
+		expect(await h.request({ op: "read", args: { block: "b1" } })).toEqual({ ok: true, result: wire(designDoc.blocks[0]!) });
+		expect(visible(h, template, "b1").block).toEqual(designDoc.blocks[0]);
+		h.stop();
+		expect(persistedTemplate(h.store)).toEqual(designDoc);
+		const restarted = startCore(h.store);
+		await restarted.request({ op: "hello", args: { session: "after-restart" } });
+		expect(restarted.api.revisions(template, "b1")).toEqual([templateRevisions[0], templateRevisions[2]]);
+		expect(restarted.api.revisions(r.ref, "b2")).toEqual([runRevisions[1]]);
+		expect(restarted.api.pencil(template, "b1", "prompt")).toBeNull();
+		expect(restarted.api.setDraft(template, "b1", "after restart")).toBeNull();
+		expect(restarted.api.commit(template, "b1")).toBeNull();
+		expect(h.store.readRevisions(template).at(-1)).toEqual({ seq: 4, at: 123_000, block: "b1", prompt: "after restart" });
+	});
+
+	test("discard drops both content and prompt drafts without committing content or creating revisions", async () => {
+		const h = fixture(panes, designDoc);
+		await hello(h);
+		for (const [block, field] of [["b1", "prompt"], ["b1", "requirement"], ["b3", "body"]] as const) {
+			expect(h.api.pencil(template, block, field)).toBeNull();
+			expect(h.api.setDraft(template, block, "discard this private draft")).toBeNull();
+			expect(h.api.discard(template, block)).toBeNull();
+			expect(visible(h, template, block).lock).toEqual({ kind: "none" });
+			expect(h.api.setDraft(template, block, "no draft")).toBeTypeOf("string");
+			expect(h.api.commit(template, block)).toBeTypeOf("string");
+			expect(h.api.discard(template, block)).toBeTypeOf("string");
+			expect(h.api.view(template).blocks.map(item => item.block)).toEqual([...designDoc.blocks]);
+			expect(h.store.readRevisions(template)).toEqual([]);
+			expect(h.events).toEqual([]);
+		}
+		h.stop();
+		expect(persistedTemplate(h.store)).toEqual(designDoc);
 	});
 });

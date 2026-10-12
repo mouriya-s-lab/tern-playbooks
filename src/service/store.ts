@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readdirSy
 import { basename, dirname, join, resolve } from "node:path";
 import {
 	parseBlockId, parseLaunchId, parseRunId,
-	type Block, type BlockId, type BlockResult, type CompileError, type CompileResult,
+	type Block, type BlockContent, type BlockId, type BlockResult, type CompileError, type CompileResult, type Revision,
 	type DocRef, type EntryData, type EntryOrigin, type EventName, type FetchOutcome,
 	type JudgeReport, type Launch, type LaunchId, type PlaybookDoc, type RunId,
 	type RunMeta, type Source, type TimelineEntry,
@@ -66,7 +66,7 @@ function origin(value: unknown): EntryOrigin {
 	return choice(value, ["human", "coordinator", "disk", "service"]);
 }
 function eventName(value: unknown): EventName {
-	return choice(value, ["block_changed", "launch_requested", "check_requested", "run_started", "run_finished", "done_changed", "update_due", "interrupted"]);
+	return choice(value, ["block_changed", "launch_requested", "check_requested", "run_started", "run_finished", "done_changed", "update_due", "interrupted", "revision_requested"]);
 }
 function timestamp(value: unknown): number {
 	const text = string(value);
@@ -78,10 +78,36 @@ function timestamp(value: unknown): number {
 	if (new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date) throw new Error("Invalid calendar date");
 	return at;
 }
+/**
+ * Block content by field shape: `body` is a task block, `requirement` + `design` a design block.
+ * `others` are the other keys allowed beside the content keys; mixed or missing shapes are errors.
+ */
+function decodeContent(v: Fields, required: readonly string[], optional: readonly string[] = []): BlockContent {
+	if (Object.hasOwn(v, "body")) {
+		keys(v, [...required, "body"], optional);
+		return { kind: "task", body: string(v.body) };
+	}
+	if (Object.hasOwn(v, "requirement") || Object.hasOwn(v, "design")) {
+		keys(v, [...required, "requirement", "design"], optional);
+		return { kind: "design", requirement: string(v.requirement), design: string(v.design) };
+	}
+	throw new Error("A block needs body (task block) or requirement and design (design block)");
+}
+function contentFields(content: BlockContent): Record<string, string> {
+	switch (content.kind) {
+		case "task": return { body: content.body };
+		case "design": return { requirement: content.requirement, design: content.design };
+	}
+}
 function decodeBlock(value: unknown): Block {
 	const v = fields(value);
-	keys(v, ["id", "title", "body", "done"]);
-	return { id: blockId(v.id), title: string(v.title), body: string(v.body), done: boolean(v.done) };
+	const content = decodeContent(v, ["id", "title", "done"]);
+	return { id: blockId(v.id), title: string(v.title), done: boolean(v.done), content };
+}
+function decodeRevision(value: unknown): Revision {
+	const v = fields(value);
+	keys(v, ["seq", "at", "block", "prompt"]);
+	return { seq: positive(v.seq), at: number(v.at), block: blockId(v.block), prompt: string(v.prompt) };
 }
 function decodeRun(value: unknown): RunMeta {
 	const v = fields(value);
@@ -131,7 +157,9 @@ function bodyScalar(body: string): string {
 function serialize(doc: PlaybookDoc, run: RunMeta | null): string {
 	let text = `title: ${quoted(doc.title)}\nblocks:${doc.blocks.length === 0 ? " []" : ""}\n`;
 	for (const block of doc.blocks) {
-		text += `  - id: ${block.id}\n    title: ${quoted(block.title)}\n    body: ${bodyScalar(block.body)}    done: ${block.done}\n`;
+		text += `  - id: ${block.id}\n    title: ${quoted(block.title)}\n`;
+		for (const [key, value] of Object.entries(contentFields(block.content))) text += `    ${key}: ${bodyScalar(value)}`;
+		text += `    done: ${block.done}\n`;
 	}
 	if (run !== null) {
 		const iso = (value: number | null): string => value === null ? "null" : quoted(new Date(value).toISOString());
@@ -151,12 +179,13 @@ function decodeReport(value: unknown): JudgeReport {
 }
 function decodeEntryData(type: unknown, value: unknown): EntryData {
 	const v = fields(value);
-	const tag = choice(type, ["run_started", "run_finished", "block_edited", "block_added", "block_deleted", "blocks_reordered", "done_changed", "launch_created", "agent_bound", "launch_closed", "event_sent", "interrupted", "check_reported", "post", "update_due", "update_snoozed"]);
+	const tag = choice(type, ["run_started", "run_finished", "block_edited", "block_added", "block_deleted", "content_replaced", "blocks_reordered", "done_changed", "launch_created", "agent_bound", "launch_closed", "event_sent", "interrupted", "check_reported", "post", "update_due", "update_snoozed"]);
 	switch (tag) {
 		case "run_started": keys(v, ["name"]); return { type: tag, name: string(v.name) };
 		case "run_finished": keys(v, []); return { type: tag };
-		case "block_edited": keys(v, ["block", "field", "text", "edit"]); return { type: tag, block: blockId(v.block), field: choice(v.field, ["title", "body"]), text: string(v.text), edit: positive(v.edit) };
-		case "block_added": case "block_deleted": keys(v, ["block", "title", "body"]); return { type: tag, block: blockId(v.block), title: string(v.title), body: string(v.body) };
+		case "block_edited": keys(v, ["block", "field", "text", "edit"]); return { type: tag, block: blockId(v.block), field: choice(v.field, ["title", "body", "requirement", "design"]), text: string(v.text), edit: positive(v.edit) };
+		case "block_added": case "block_deleted": return { type: tag, content: decodeContent(v, ["block", "title"]), block: blockId(v.block), title: string(v.title) };
+		case "content_replaced": return { type: tag, content: decodeContent(v, ["block"]), block: blockId(v.block) };
 		case "blocks_reordered": keys(v, ["order"]); return { type: tag, order: list(v.order, blockId) };
 		case "done_changed": keys(v, ["block", "done"]); return { type: tag, block: blockId(v.block), done: boolean(v.done) };
 		case "launch_created": keys(v, ["launch", "kind", "blocks"]); return { type: tag, launch: launchId(v.launch), kind: choice(v.kind, ["prompt", "orchestration"]), blocks: list(v.blocks, blockId) };
@@ -276,9 +305,16 @@ function readLines<T>(path: string, decode: (value: unknown) => T): T[] {
 		catch (error) { throw new Error(`${path}:${index + 1}: ${error instanceof Error ? error.message : String(error)}`); }
 	});
 }
-function append(path: string, value: ServiceRecord | { readonly entry: { readonly seq: number; readonly at: number; readonly type: EntryData["type"]; readonly origin: EntryOrigin; readonly data: Omit<EntryData, "type"> } } | { readonly launch: Launch }): void {
+function append(path: string, value: unknown): void {
 	mkdirSync(dirname(path), { recursive: true });
 	appendFileSync(path, `${JSON.stringify(value)}\n`, "utf8");
+}
+/** Entry payload as stored: block content flattened into its fields (`body`, or `requirement` + `design`). */
+function encodeEntryData(data: EntryData): Record<string, unknown> {
+	const { type: _type, ...rest } = data;
+	if (!("content" in rest)) return rest;
+	const { content, ...others } = rest;
+	return { ...others, ...contentFields(content) };
 }
 
 export function createStore(templatePath: string): Store {
@@ -287,6 +323,7 @@ export function createStore(templatePath: string): Store {
 	const runsDir = join(baseDir, `${basename(path).replace(/\.yaml$/, "")}.runs`);
 	const filePath = (ref: DocRef): string => ref.kind === "template" ? path : join(runsDir, `${runId(ref.run)}.yaml`);
 	const logPath = (run: RunId): string => join(runsDir, `${runId(run)}.jsonl`);
+	const revisionsPath = (ref: DocRef): string => ref.kind === "template" ? `${path}.revisions.jsonl` : join(runsDir, `${runId(ref.run)}.revisions.jsonl`);
 	return {
 		templatePath: path, baseDir, serialize, parse,
 		readTemplate() {
@@ -350,9 +387,14 @@ export function createStore(templatePath: string): Store {
 			return { entries, launches };
 		},
 		appendEntry(run, entry) {
-			const { type, ...data } = entry.data;
-			append(logPath(run), { entry: { seq: entry.seq, at: entry.at, type, origin: entry.origin, data } });
+			append(logPath(run), { entry: { seq: entry.seq, at: entry.at, type: entry.data.type, origin: entry.origin, data: encodeEntryData(entry.data) } });
 		},
 		appendLaunch: (run, launch) => append(logPath(run), { launch }),
+		readRevisions(ref) {
+			const revisions = readLines(revisionsPath(ref), decodeRevision);
+			revisions.forEach((revision, index) => { if (index > 0 && revision.seq <= revisions[index - 1]!.seq) throw new Error(`${revisionsPath(ref)}: revision sequence must increase`); });
+			return revisions;
+		},
+		appendRevision: (ref, revision) => append(revisionsPath(ref), revision),
 	};
 }
