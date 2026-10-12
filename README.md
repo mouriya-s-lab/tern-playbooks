@@ -1,6 +1,6 @@
 # Tern Playbooks
 
-Tern Playbooks 是一个 omp 扩展。它在每个 omp 主会话中注册 `playbook_*` 工具，由模型自己决定何时使用。调用这些工具的主会话就是协调者：它和人在 Tern 中共同编辑一份 Playbook，块以表单卡片显示，块正文中的 `((target | slice))` 引用被编译成 subagent 的 prompt，协调者在 `eval` 中用 `agent()` 把工作交给 subagent；块被修改时，依赖它的运行中工作会通知协调者。设计见 [design/README.md](design/README.md)。
+Tern Playbooks 是一个 omp 扩展。它在每个 omp 主会话中注册 `playbook_*` 工具，由模型自己决定何时使用。调用这些工具的主会话就是协调者：它和人在 Tern 中共同编辑一份 Playbook，块以表单卡片显示，块正文中的 `((target | slice))` 引用被编译成 subagent 的 prompt，协调者在 `eval` 中用 `agent()` 把工作交给 subagent；块被修改时，依赖它的运行中工作会通知协调者。
 
 ## 需要
 
@@ -46,7 +46,7 @@ blocks:
     done: false
 ```
 
-引用的目标与截取表达式见 [design/references.md](design/references.md)。`file:` 路径相对于 Playbook 文件所在目录。
+`file:` 路径相对于 Playbook 文件所在目录。
 
 ## 使用
 
@@ -54,7 +54,7 @@ blocks:
 
 文档服务的 pane 在协调者会话结束后保留，头部显示"没有协调者连接"。之后任一 omp 会话对同一个文件调用 `playbook_open`，就会连接到这个服务，不会再开新的 pane。
 
-工具（规格见 [design/contracts.md §K2](design/contracts.md#k2-协调者扩展--协调者会话)；除 `playbook_open` 外，只打开了一份 Playbook 时可以省略 `doc`）：
+工具（除 `playbook_open` 外，只打开了一份 Playbook 时可以省略 `doc`）：
 
 | 工具 | 操作 |
 |---|---|
@@ -92,7 +92,7 @@ var review = await playbook.run({ blocks: ["b3"], agent: "task:mid", label: "Rev
 
 ## 检查
 
-文档服务对每个块做确定性检查，结果显示在块旁。jev 判定由协调者在 `eval` 中经 `judge` 模型角色完成，再用 `playbook_check` 的 `report` 写回；规则见 [design/checks.md](design/checks.md)。
+文档服务对每个块做确定性检查，结果显示在块旁。jev 判定由协调者在 `eval` 中经 `judge` 模型角色完成，再用 `playbook_check` 的 `report` 写回。
 
 ## 测试
 
