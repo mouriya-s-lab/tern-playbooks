@@ -47,7 +47,6 @@ import { fail, ok } from "../domain/protocol";
 
 export interface PaneControl {
 	ownPane(): string | null;
-	splitCoordinator(pane: string, cwd: string, command: readonly string[]): Promise<{ ok: true; pane: string } | { ok: false; error: string }>;
 	focusPane(pane: string): Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
@@ -57,8 +56,6 @@ export interface CoreDeps {
 	readonly fetcher: Fetcher;
 	readonly checks: ChecksModule;
 	readonly panes: PaneControl;
-	/** Absolute path of the coordinator extension entry file (contracts.md K5). */
-	readonly extensionEntry: string;
 	readonly now?: () => number;
 }
 
@@ -131,7 +128,6 @@ export class Core implements CoreApi, K1Handler {
 	readonly #fetcher: Fetcher;
 	readonly #checks: ChecksModule;
 	readonly #panes: PaneControl;
-	readonly #extensionEntry: string;
 	readonly #now: () => number;
 
 	readonly #docs = new Map<DocKey, DocState>();
@@ -158,7 +154,6 @@ export class Core implements CoreApi, K1Handler {
 		this.#fetcher = deps.fetcher;
 		this.#checks = deps.checks;
 		this.#panes = deps.panes;
-		this.#extensionEntry = deps.extensionEntry;
 		this.#now = deps.now ?? Date.now;
 	}
 
@@ -736,9 +731,8 @@ export class Core implements CoreApi, K1Handler {
 
 	// ============================================================ K1 handler
 
-	connected(conn: Connection): void {
-		if (this.#conn === null) this.#conn = { conn, session: null, pane: null };
-	}
+	/** K1: a transport alone does not occupy the coordinator slot; the first valid hello does. */
+	connected(_conn: Connection): void {}
 
 	disconnected(conn: Connection): void {
 		if (this.#conn?.conn !== conn) return;
@@ -755,9 +749,19 @@ export class Core implements CoreApi, K1Handler {
 	}
 
 	async handle(conn: Connection, requestId: string, request: Request): Promise<Outcome<unknown>> {
-		if (this.#conn === null) this.#conn = { conn, session: null, pane: null };
-		if (this.#conn.conn !== conn) return fail("Busy", "另一个协调者已连接");
-		if (request.op !== "hello" && this.#conn.session === null) return fail("NotHello", "第一条请求必须是 hello");
+		// K1 reveal: a viewer asks the document's sole service to show its pane; it never
+		// takes the coordinator slot, so it is answered before admission.
+		if (request.op === "reveal") {
+			const pane = this.#panes.ownPane();
+			if (pane === null) return fail("RevealFailed", "文档服务不在 session daemon 托管的 pane 中");
+			const shown = await this.#panes.focusPane(pane);
+			return shown.ok ? ok(null) : fail("RevealFailed", shown.error);
+		}
+		if (this.#conn?.conn !== conn) {
+			if (request.op !== "hello") return fail(this.#conn === null ? "NotHello" : "Busy", this.#conn === null ? "第一条请求必须是 hello" : "另一个协调者已连接");
+			if (this.#conn !== null) return fail("Busy", "另一个协调者已连接");
+			this.#conn = { conn, session: null, pane: null };
+		}
 		const session = this.#conn.session;
 		switch (request.op) {
 			case "hello": {
@@ -1229,22 +1233,6 @@ export class Core implements CoreApi, K1Handler {
 
 	coordinator(): CoordinatorStatus {
 		return { connected: this.#conn?.session != null, session: this.#conn?.session ?? null, pane: this.#conn?.pane ?? null };
-	}
-
-	coordinatorCommand(): string {
-		return ["env", `PLAYBOOK_DOC=${this.#store.templatePath}`, "omp", "-e", this.#extensionEntry].join(" ");
-	}
-
-	canStartCoordinator(): boolean {
-		return this.#panes.ownPane() !== null && !this.coordinator().connected;
-	}
-
-	async startCoordinator(): Promise<string | null> {
-		const pane = this.#panes.ownPane();
-		if (pane === null) return "文档服务不在 session daemon 托管的 pane 中";
-		const result = await this.#panes.splitCoordinator(pane, this.#store.baseDir, ["env", `PLAYBOOK_DOC=${this.#store.templatePath}`, "omp", "-e", this.#extensionEntry]);
-		if (!result.ok) return this.#k5Error(result.error);
-		return null;
 	}
 
 	async focusCoordinator(): Promise<string | null> {

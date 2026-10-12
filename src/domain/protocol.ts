@@ -38,7 +38,9 @@ export type Request =
 			};
 	  }
 	| { readonly op: "snooze"; readonly args: { readonly run: RunId; readonly after: number } }
-	| { readonly op: "ack"; readonly args: { readonly event: string } };
+	| { readonly op: "ack"; readonly args: { readonly event: string } }
+	/** Show the document service's own pane; any connection may send it without hello (contracts.md K1). */
+	| { readonly op: "reveal"; readonly args: Record<string, never> };
 
 export type Op = Request["op"];
 export type ArgsOf<O extends Op> = Extract<Request, { op: O }>["args"];
@@ -61,7 +63,8 @@ export type ErrorCode =
 	| "BadReport"
 	| "UnknownLaunch"
 	| "NotOwner"
-	| "UnknownEvent";
+	| "UnknownEvent"
+	| "RevealFailed";
 
 export interface ProtocolError {
 	readonly code: ErrorCode;

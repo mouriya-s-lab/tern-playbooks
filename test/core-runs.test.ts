@@ -42,12 +42,11 @@ function fixture(doc: PlaybookDoc = template) {
 	const fetched: FetchOutcome = { ok: true, at: BASE_TIME, value: { kind: "file", text: "External instruction" } };
 	const panes: PaneControl = {
 		ownPane: () => null,
-		splitCoordinator: async () => ({ ok: true, pane: "unused-pane" }),
 		focusPane: async () => ({ ok: true }),
 	};
 	function newCore(): Core {
 		const core = new Core({
-			store, references, checks, panes, extensionEntry: "/tmp/unused-extension.ts",
+			store, references, checks, panes,
 			now: () => clock,
 			fetcher: { fetch: async () => { fetchCalls++; return fetched; } },
 		});

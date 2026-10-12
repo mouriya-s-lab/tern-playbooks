@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import type { EventPayload, ProtocolError, Request, ServerFrame } from "../domain/protocol";
 
-export type ClientError = ProtocolError | { readonly code: "NoService" | "Disconnected"; readonly message: string };
+export type ClientError = ProtocolError | { readonly code: "NoService" | "Disconnected" | "StartFailed"; readonly message: string };
 export type Reply = { readonly id: string; readonly ok: true; readonly result: unknown } | { readonly id: string; readonly ok: false; readonly error: ClientError };
 type Pending = { readonly resolve: (reply: Reply) => void };
 type Link = { readonly socket: Socket; readonly pending: Map<string, Pending> };

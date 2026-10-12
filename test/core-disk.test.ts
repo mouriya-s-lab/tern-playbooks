@@ -47,10 +47,8 @@ function fixture(doc: PlaybookDoc = initial) {
 		fetcher: { async fetch() { fetchCalls++; return fetchOutcome; } },
 		panes: {
 			ownPane: () => null,
-			async splitCoordinator() { return { ok: true, pane: "fake-pane" }; },
 			async focusPane() { return { ok: true }; },
 		},
-		extensionEntry: join(directory, "unused-extension.ts"),
 	});
 	resources.push({ core, conn, directory });
 	expect(core.load()).toBeNull();

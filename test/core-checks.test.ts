@@ -15,7 +15,6 @@ const answers: JudgeReport = { kind: "answers", answers: { missing: 0.75 } };
 const fetched: FetchOutcome = { ok: true, at: 1_000, value: { kind: "file", text: "fixed external material" } };
 const panes: PaneControl = {
 	ownPane: () => null,
-	async splitCoordinator() { return { ok: false, error: "unused in checks integration" }; },
 	async focusPane() { return { ok: false, error: "unused in checks integration" }; },
 };
 const fixtures: { core: Core; connection: Connection; directory: string }[] = [];
@@ -43,7 +42,7 @@ function fixture(blocks: readonly Block[] = [block("b1", "Review ((b2))"), block
 	const fetcher: Fetcher = { async fetch() { fetchCalls++; return fetched; } };
 	const events: EventPayload[] = [];
 	const connection: Connection = { id: 1, send: event => { events.push(event); }, close() {} };
-	const core = new Core({ store, references, checks, fetcher, panes, extensionEntry: "/tmp/unused-checks-extension.ts", now: () => 10_000 });
+	const core = new Core({ store, references, checks, fetcher, panes, now: () => 10_000 });
 	const tracked = { core, connection, directory };
 	fixtures.push(tracked);
 	expect(core.load()).toBeNull();
@@ -60,7 +59,7 @@ function fixture(blocks: readonly Block[] = [block("b1", "Review ((b2))"), block
 		async restart() {
 			core.disconnected(connection);
 			core.stop();
-			const next = new Core({ store, references, checks, fetcher, panes, extensionEntry: "/tmp/unused-checks-extension.ts", now: () => 10_000 });
+			const next = new Core({ store, references, checks, fetcher, panes, now: () => 10_000 });
 			tracked.core = next;
 			expect(next.load()).toBeNull();
 			await settle(next);

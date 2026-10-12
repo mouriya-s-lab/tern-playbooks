@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { existsSync, watch } from "node:fs";
 import { once } from "node:events";
 import { chmod, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -17,11 +19,10 @@ type Frame = Request & { readonly id: string };
 type Cleanup = () => void | Promise<void>;
 const cleanup: Cleanup[] = [];
 beforeEach(() => {
-	const original = { PATH: process.env.PATH, TERN_PANE: process.env.TERN_PANE, PLAYBOOK_DOC: process.env.PLAYBOOK_DOC };
+	const original = { PATH: process.env.PATH, TERN_PANE: process.env.TERN_PANE };
 	delete process.env.TERN_PANE;
-	delete process.env.PLAYBOOK_DOC;
 	cleanup.push(() => {
-		for (const key of ["PATH", "TERN_PANE", "PLAYBOOK_DOC"] as const) {
+		for (const key of ["PATH", "TERN_PANE"] as const) {
 			const value = original[key];
 			if (value === undefined) delete process.env[key]; else process.env[key] = value;
 		}
@@ -36,10 +37,9 @@ async function temporaryDirectory(): Promise<string> {
 function respond(socket: Socket, frame: Frame, result?: unknown): void {
 	socket.write(JSON.stringify({ id: frame.id, ok: true, result }) + "\n");
 }
-async function service(pane: string | undefined = "document-pane") {
-	const dir = await temporaryDirectory();
-	const doc = dir + "/book.yaml";
-	await Bun.write(doc, "title: Book\nblocks: []\n");
+async function service(pane: string | undefined = "document-pane", existingDoc?: string) {
+	const doc = existingDoc ?? (await temporaryDirectory()) + "/book.yaml";
+	if (!existingDoc) await Bun.write(doc, "title: Book\nblocks: []\n");
 	await mkdir(tmpdir() + "/tern-playbooks", { recursive: true });
 	const path = socketPath(tmpdir(), await realpath(doc));
 	const frames: Frame[] = [];
@@ -151,13 +151,21 @@ function harness(kind: "main" | "sub" = "main") {
 		command: async (name: string, doc = "") => { await start(); return commands.get(name)!.handler(doc, ctx); },
 	};
 }
-async function fakeTern(exit = 0) {
+async function fakeTern(exit = 0, stdout = "") {
 	const dir = await temporaryDirectory();
 	const capture = dir + "/args";
-	await Bun.write(dir + "/tern", `#!/bin/sh\nprintf '%s\\n' "$@" >> '${capture}'\nprintf 'focus failed' >&2\nexit ${exit}\n`);
+	await Bun.write(dir + "/tern", `#!/bin/sh\nprintf '%s\\n' "$@" >> '${capture}'\nprintf '%s' '${stdout}'\nprintf 'focus failed' >&2\nexit ${exit}\n`);
 	await chmod(dir + "/tern", 0o755);
 	process.env.PATH = dir + ":" + process.env.PATH;
 	return { capture, args: async () => (await Bun.file(capture).text()).trim().split("\n") };
+}
+/** Resolves when the fake tern child has written its arguments: the split happened. */
+function fileAppears(path: string): Promise<void> {
+	const appeared = Promise.withResolvers<void>();
+	const watcher = watch(dirname(path), () => { if (existsSync(path)) { watcher.close(); appeared.resolve(); } });
+	cleanup.push(() => watcher.close());
+	if (existsSync(path)) { watcher.close(); appeared.resolve(); }
+	return appeared.promise;
 }
 function parseFrame(value: unknown): ServerFrame { return value as ServerFrame; }
 function client(path: string): K1Client {
@@ -227,22 +235,33 @@ test("show calls a real tern child with the hello pane unchanged; add offers lat
 	expect(h.menus[0]!.options.at(-1)).toBe("message-5: text-5"); expect(s.frames.some(frame => frame.op === "post")).toBe(false);
 });
 
-test("session loading immediately connects PLAYBOOK_DOC with hello without command or tool use", async () => {
-	const s = await service(); process.env.PLAYBOOK_DOC = s.doc; process.env.TERN_PANE = "coordinator-pane";
-	const h = harness(); await h.event("session_start");
-	expect(s.frames).toHaveLength(1); expect(s.frames[0]).toMatchObject({ op: "hello", args: { session: "session-test", pane: "coordinator-pane" } });
-	expect(h.notices).toEqual([]); await h.command("playbook-add");
-	expect(s.frames.filter(frame => frame.op === "hello")).toHaveLength(1);
+test("open starts the document service beside the coordinator pane and returns hello once it listens", async () => {
+	const doc = (await temporaryDirectory()) + "/book.yaml"; await Bun.write(doc, "title: Book\nblocks: []\n");
+	const tern = await fakeTern(0, '{"block": 42}'); process.env.TERN_PANE = "coordinator-pane"; const h = harness();
+	const split = fileAppears(tern.capture);
+	const opening = h.execute({ doc, op: "open", args: {} });
+	await split;
+	const s = await service("document-pane", doc);
+	const result = await opening;
+	expect(result.isError).toBe(false);
+	expect(JSON.parse(result.content[0]!.text!)).toMatchObject({ blocks: ["b1"], pane: "document-pane" });
+	const real = await realpath(doc);
+	expect(await tern.args()).toEqual(["split", "coordinator-pane", "right", "--cwd", dirname(real), "--json", "--", "bun", resolve(import.meta.dir, "../src/service/main.ts"), real]);
+	expect(s.frames.map(frame => frame.op)).toEqual(["hello"]);
 });
 
-test("session loading without PLAYBOOK_DOC is idle; unavailable startup doc notifies NoService", async () => {
-	const h = harness(); await h.event("session_start"); expect(h.notices).toEqual([]);
-	process.env.PLAYBOOK_DOC = "/tmp/no-playbook-" + randomUUID(); await h.event("session_start");
-	expect(h.notices.at(-1)).toMatchObject({ type: "error" }); expect(h.notices.at(-1)!.message).toContain("NoService");
+test("open reuses a running service without tern; with no service and no TERN_PANE it is StartFailed", async () => {
+	const s = await service(); const tern = await fakeTern(0, '{"block": 42}'); const h = harness();
+	const running = await h.execute({ doc: s.doc, op: "open", args: {} });
+	expect(running.isError).toBe(false); expect(await Bun.file(tern.capture).exists()).toBe(false);
+	const doc = (await temporaryDirectory()) + "/idle.yaml"; await Bun.write(doc, "title: Idle\nblocks: []\n");
+	const idle = await h.execute({ doc, op: "open", args: {} });
+	expect(idle.isError).toBe(true); expect(JSON.parse(idle.content[0]!.text!).error.code).toBe("StartFailed");
+	expect(await Bun.file(tern.capture).exists()).toBe(false);
 });
 
-test("a child session registers no tool or command and never connects, even with PLAYBOOK_DOC (R4)", async () => {
-	const s = await service(); process.env.PLAYBOOK_DOC = s.doc;
+test("a child session registers no tool or command and never connects (R4)", async () => {
+	const s = await service();
 	const h = harness("sub"); await h.event("session_start");
 	expect(h.registered).toEqual({ tool: false, commands: [] });
 	expect(s.frames).toHaveLength(0);
@@ -253,22 +272,16 @@ for (const command of ["playbook-add", "playbook-show"]) {
 		const h = harness(); await h.command(command);
 		expect(h.notices).toEqual([{ message: "请指定 Playbook 文件路径", type: "error" }]); expect(h.menus).toEqual([]);
 	});
-	test(`${command}: zero connections falls back to PLAYBOOK_DOC`, async () => {
-		const s = await service(); process.env.PLAYBOOK_DOC = s.doc; process.env.TERN_PANE = "coordinator-pane"; const tern = await fakeTern(); const h = harness();
-		await h.command(command); expect(s.frames[0]!.op).toBe("hello");
-		if (command === "playbook-show") expect(await tern.args()).toEqual(["focus", "document-pane", "--json"]);
-		else expect(s.frames.at(-1)!.op).toBe("post");
-	});
-	test(`${command}: unique live connection precedes environment; multiple connections prompt and allow cancellation`, async () => {
-		const a = await service("pane-a"); const b = await service("pane-b"); const env = await service("pane-env"); const tern = await fakeTern(); process.env.TERN_PANE = "coordinator-pane"; const h = harness();
-		await h.execute({ doc: a.doc, op: "runs", args: {} }); process.env.PLAYBOOK_DOC = env.doc;
-		await h.command(command); expect(env.frames).toEqual([]); expect(h.menus.some(menu => menu.title === "Choose Playbook")).toBe(false);
+	test(`${command}: unique live connection is used; multiple connections prompt and allow cancellation`, async () => {
+		const a = await service("pane-a"); const b = await service("pane-b"); const tern = await fakeTern(); process.env.TERN_PANE = "coordinator-pane"; const h = harness();
+		await h.execute({ doc: a.doc, op: "runs", args: {} });
+		await h.command(command); expect(h.menus.some(menu => menu.title === "Choose Playbook")).toBe(false);
 		await h.execute({ doc: b.doc, op: "runs", args: {} }); h.choices.push(await realpath(b.doc)); await h.command(command);
-		expect(h.menus.find(menu => menu.title === "Choose Playbook")!.options).toEqual([await realpath(a.doc), await realpath(b.doc)]); expect(env.frames).toEqual([]);
+		expect(h.menus.find(menu => menu.title === "Choose Playbook")!.options).toEqual([await realpath(a.doc), await realpath(b.doc)]);
 		if (command === "playbook-show") expect(await tern.args()).toEqual(["focus", "pane-a", "--json", "focus", "pane-b", "--json"]);
 		else expect(b.frames.at(-1)!.op).toBe("post");
-		const counts = [a.frames.length, b.frames.length, env.frames.length]; h.choices.push(null); await h.command(command);
-		expect([a.frames.length, b.frames.length, env.frames.length]).toEqual(counts);
+		const counts = [a.frames.length, b.frames.length]; h.choices.push(null); await h.command(command);
+		expect([a.frames.length, b.frames.length]).toEqual(counts);
 	});
 }
 

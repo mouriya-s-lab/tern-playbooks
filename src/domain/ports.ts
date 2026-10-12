@@ -204,11 +204,6 @@ export interface CoreApi extends HumanCommands {
 	view(ref: DocRef): DocView;
 	runs(): RunSummary[];
 	coordinator(): CoordinatorStatus;
-	/** Command shown in the header when no coordinator is connected (contracts.md K5). */
-	coordinatorCommand(): string;
-	/** "启动协调者": null when the button is unavailable (no TERN_PANE). */
-	canStartCoordinator(): boolean;
-	startCoordinator(): Promise<string | null>;
 	focusCoordinator(): Promise<string | null>;
 	/** Document-level messages (disk parse errors, unmapped TSP errors, K5 errors). */
 	errors(): readonly string[];

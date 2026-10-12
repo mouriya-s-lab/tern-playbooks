@@ -5,6 +5,9 @@
 	"bin": {
 		"tern-playbook": "./src/service/main.ts"
 	},
+	"omp": {
+		"extensions": ["./src/extension/index.ts"]
+	},
 	"scripts": {
 		"check": "tsc --noEmit -p tsconfig.json",
 		"test": "bun test"
