@@ -346,7 +346,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const answer = await clients.get(absolute)?.request({ op: "revisions", args: { ...scoped(event.data.run), block: event.data.block, after: event.data.revision - 1 } });
 				const found = answer?.ok ? revisionsResult.safeParse(answer.result) : undefined;
 				const prompt = found?.success ? found.data.revisions.find(item => item.seq === event.data.revision)?.prompt : undefined;
-				next = `人对${where}的设计块 ${event.data.block} 提交了修改 prompt #${event.data.revision}${prompt === undefined ? "（读取失败，用 playbook_read {op: \"revisions\"} 查询）" : `：\n<prompt>\n${prompt}\n</prompt>`}\n下一步：playbook_read {doc: ${docLiteral}, ${scope}block: "${event.data.block}"} 读需求与当前设计稿，按 prompt 修订设计：用 playbook_edit 的 write、replace 或 panel 改 design；不要改 requirement。需要以前的修改要求时用 playbook_read {op: "revisions"}。`;
+				const history = `playbook_read {doc: ${docLiteral}, ${scope}op: "revisions", block: "${event.data.block}"}`;
+				next = `人对${where}的设计块 ${event.data.block} 提交了修改 prompt #${event.data.revision}${prompt === undefined ? `（读取失败，用 ${history} 查询）` : `：\n<prompt>\n${prompt}\n</prompt>`}\n下一步：playbook_read {doc: ${docLiteral}, ${scope}block: "${event.data.block}"} 读需求与当前设计稿，按 prompt 修订设计：用 playbook_edit 的 write、replace 或 panel 改 design；不要改 requirement。需要以前的修改要求时用 ${history}。`;
 				break;
 			}
 			case "run_started": case "run_finished": case "done_changed":

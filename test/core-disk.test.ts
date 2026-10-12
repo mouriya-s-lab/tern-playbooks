@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { closeSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fieldText, withField, type BlockField, type BlockId, type DocRef, type FetchOutcome, type PlaybookDoc, type RunId } from "../src/domain/model";
+import { fieldText, withField, type BlockField, type BlockId, type BlockLock, type DocRef, type FetchOutcome, type PlaybookDoc, type RunId } from "../src/domain/model";
 import type { Connection } from "../src/domain/ports";
 import type { EventPayload, Request } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
@@ -377,6 +377,58 @@ describe("core disk persistence — README S2 / contracts K4", () => {
 			});
 			expect(f.block(template, "b2").lock.kind).toBe(pendingField === "design" ? "coordinator" : "none");
 			await eventually(() => readFileSync(f.path, "utf8") === f.store.serialize(f.document(template), null));
+		});
+	}
+
+	for (const [before, after] of [[initial, designInitial], [designInitial, initial]] as const) {
+		const direction = `${before.blocks[1]!.content.kind}-to-${after.blocks[1]!.content.kind}`;
+
+		test(`a disk ${direction} switch preserves an unwritten human title commit`, async () => {
+			const f = fixture(before);
+			const committedTitle = "Newly committed human title";
+			expect(f.core.pencil(template, "b2", "title")).toBeNull();
+			expect(f.core.setDraft(template, "b2", committedTitle)).toBeNull();
+			expect(f.core.commit(template, "b2")).toBeNull();
+			// Switch content immediately, while disk still has the last-written title.
+			expect(f.store.readTemplate()).toEqual({ ok: true, doc: before, run: null });
+			f.externalDoc(template, after);
+			await eventually(() => f.block(template, "b2").block.content.kind === after.blocks[1]!.content.kind);
+			expect(f.block(template, "b2").block).toEqual({ ...after.blocks[1]!, title: committedTitle });
+			const expected: PlaybookDoc = {
+				...after,
+				blocks: after.blocks.map(block => block.id === "b2" ? { ...block, title: committedTitle } : block),
+			};
+			await eventually(() => Bun.deepEquals(f.store.readTemplate(), { ok: true, doc: expected, run: null }));
+		});
+
+		test(`the first disk ${direction} notification already discards an invalid human draft`, async () => {
+			const f = fixture(before);
+			const field = before.blocks[1]!.content.kind === "task" ? "body" : "requirement";
+			const draft = `Discard this ${field} draft`;
+			expect(f.core.pencil(template, "b2", field)).toBeNull();
+			expect(f.core.setDraft(template, "b2", draft)).toBeNull();
+			expect(f.block(template, "b2").lock).toEqual({ kind: "human", field, draft });
+			const diskTitle = "Kind switch with a disk title edit";
+			const observed: { lock: BlockLock; notices: string[] }[] = [];
+			f.core.onChange(ref => {
+				if (ref !== null && ref.kind !== "template") return;
+				const block = f.block(template, "b2");
+				// Ignore unrelated asynchronous check notifications before the disk edit.
+				// The title edit notifies before content replacement, so capture it too.
+				if (block.block.title !== diskTitle) return;
+				observed.push({ lock: block.lock, notices: [...block.notices] });
+			});
+			f.externalDoc(template, {
+				...after,
+				blocks: after.blocks.map(block => block.id === "b2" ? { ...block, title: diskTitle } : block),
+			});
+			await eventually(() => f.block(template, "b2").block.content.kind === after.blocks[1]!.content.kind);
+			expect(observed.length).toBeGreaterThan(0);
+			expect(observed[0]).toEqual({
+				lock: { kind: "none" },
+				notices: ["磁盘文件改变了块的种类，未提交的编辑已丢弃"],
+			});
+			expect(f.core.commit(template, "b2")).not.toBeNull();
 		});
 	}
 

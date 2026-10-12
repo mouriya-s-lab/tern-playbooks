@@ -30,7 +30,12 @@ const SECRET_DIR: Readonly<Record<string, true | undefined>> = {
 	".git": true, ".ssh": true, ".aws": true, ".azure": true, ".gnupg": true,
 	".kube": true, ".docker": true, ".password-store": true,
 };
-const SECRET_TEXT = /sk-ant-|sk-[A-Za-z0-9]{32,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abeprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.|(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["'][^"'\s$<{]{12,}["']/i;
+const SECRET_TEXT = /sk-ant-|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abeprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.|(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["'][^"'\s$<{]{12,}["']|\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)["']?\s*[:=]\s*[^"'\s]\S{7,}/i;
+
+/** Return the first credential match, preserving its source offset for diagnostics. */
+export function findSecret(text: string): RegExpExecArray | null {
+	return SECRET_TEXT.exec(text);
+}
 
 function secretPath(path: string): boolean {
 	const parts = posix.normalize(path.replace(/\\/g, "/")).split("/");
@@ -182,7 +187,7 @@ export function renderCode(spec: CodeSpec, ctx: RenderContext): Rendered {
 			if (result.bytes.includes(0)) return fail("src= 是二进制文件；请改引文本源码文件。");
 			const text = new TextDecoder().decode(result.bytes);
 			// Inspect the whole file before taking a slice: excluded lines may still hold credentials.
-			if (SECRET_TEXT.test(text)) return fail("src= 文件包含疑似密钥或令牌，任何片段都不会显示；请改引不含凭据的源码，或写 title=sketch 的手写代码。");
+			if (findSecret(text)) return fail("src= 文件包含疑似密钥或令牌，任何片段都不会显示；请改引不含凭据的源码，或写 title=sketch 的手写代码。");
 			const all = text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n");
 			start = source.range?.from ?? 1;
 			const end = source.range?.to ?? all.length;
@@ -198,8 +203,8 @@ export function renderCode(spec: CodeSpec, ctx: RenderContext): Rendered {
 		}
 	}
 	const text = body.join("\n");
-	if (SECRET_TEXT.test(text)) {
-		const offset = body.findIndex(line => SECRET_TEXT.test(line));
+	if (findSecret(text)) {
+		const offset = body.findIndex(line => findSecret(line) !== null);
 		return fail("代码包含疑似密钥或令牌，内容不会显示；请改引不含凭据的代码，或写 title=sketch 的示意代码。", spec.bodyLine + Math.max(0, offset));
 	}
 	const highlight = highlightFinding(spec.highlights, start, body.length, spec.fenceLine);

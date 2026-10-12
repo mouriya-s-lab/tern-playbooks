@@ -1,3 +1,4 @@
+import { findSecret } from "./code";
 import { diagnostic, type DraftDiagnostic, type FenceInput, type Parsed, type RenderContext, type Rendered } from "./contract";
 
 export interface DiffSpec {
@@ -15,7 +16,6 @@ export interface DiffSpec {
 
 const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 const META = /^(?:index |new file mode |deleted file mode |old mode |new mode |similarity index |rename (?:from|to) )/;
-const SECRET = /sk-ant-|sk-[A-Za-z0-9]{32,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abeprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.|(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["'][^"'\s$<{]{12,}["']/i;
 
 interface HunkCount {
 	readonly line: number;
@@ -63,7 +63,7 @@ export function parseDiff(input: FenceInput): Parsed<DiffSpec> {
 	if (input.lines.length > 200) fail(input.line, "diff 超过 200 行；拆成每块最多 200 行。");
 	else if (input.lines.length > 40) diagnostics.push(diagnostic("diff", input.line, "diff 超过 40 行；选取最能说明修改的 10–40 行。", "warning"));
 	const body = input.lines.join("\n");
-	const secret = SECRET.exec(body);
+	const secret = findSecret(body);
 	if (secret) fail(input.line + body.slice(0, secret.index).split("\n").length - 1, "此行疑似含密钥或令牌；删除凭据，改用不含秘密的示意代码。");
 	if (diagnostics.some(item => item.severity === "error")) return { ok: false, diagnostics };
 

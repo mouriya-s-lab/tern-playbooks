@@ -160,6 +160,36 @@ describe("HTML escape hatch", () => {
 		expect(table?.c?.map(row => row.c?.map(cell => visible([cell])))).toEqual([["甲", "乙"], ["1", "2"]]);
 	});
 
+	test("duplicate HTML attributes are case insensitive and keep the first value", () => {
+		const { spec, diagnostics } = parse('<a href="/first" HREF="/second">链接</a>', 30);
+		const { ctx } = harness();
+		expect(visible(renderHtml(spec, ctx).nodes)).toBe("链接 (/first)");
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ component: "html", severity: "warning", line: 30 });
+		expect(diagnostics[0]?.message).toContain("HREF");
+	});
+
+	test("accepts 256 open HTML elements and renders without throwing", () => {
+		const { spec, diagnostics } = parse(`${"<div>".repeat(256)}正文${"</div>".repeat(256)}`);
+		const { ctx } = harness();
+		expect(visible(renderHtml(spec, ctx).nodes)).toBe("正文");
+		expect(diagnostics).toEqual([]);
+	});
+
+	test.each([257, 16384])("rejects %s nested HTML elements with an absolute-line error, not a RangeError", depth => {
+		const result = parseHtml({ args: "", lines: ["<div>".repeat(256), `${"<div>".repeat(depth - 256)}正文${"</div>".repeat(depth)}`], line: 30 });
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics).toHaveLength(1);
+		expect(result.diagnostics[0]).toMatchObject({ component: "html", severity: "error", line: 31 });
+		expect(result.diagnostics[0]?.message).toContain("256");
+	});
+
+	test("depth failure retains earlier scan warnings", () => {
+		const result = parseHtml({ args: "", lines: ['<div id="first" id="second">', "<div>".repeat(256)], line: 40 });
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.map(value => [value.severity, value.line])).toEqual([["warning", 40], ["error", 41]]);
+	});
+
 	test("empty HTML is drawable and fence args do not invent a grammar", () => {
 		expect(parseHtml({ args: "arbitrary", lines: [], line: 1 })).toEqual({ ok: true, value: { nodes: [] }, diagnostics: [] });
 	});
@@ -189,6 +219,90 @@ describe("inline SVG", () => {
 		expect(diagnostics.every(value => value.severity === "warning")).toBe(true);
 		expect(svgs[0]?.source).not.toMatch(/bad|script|foreignObject|onclick/);
 		expect(svgs[0]?.source).toContain("#local");
+	});
+
+	test.each(["s", "alias"])("drops forbidden SVG local names under the %s namespace prefix", prefix => {
+		const { spec, diagnostics } = parse(`<svg xmlns:${prefix}="http://www.w3.org/2000/svg">\n<${prefix}:script>bad</${prefix}:script>\n<${prefix}:foreignObject><p>bad</p></${prefix}:foreignObject>\n<rect fill="red"/></svg>`, 40);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics.map(value => [value.line, value.severity])).toEqual([[41, "warning"], [42, "warning"]]);
+		expect(svgs[0]?.source).not.toMatch(/script|foreignObject|bad/);
+		expect(svgs[0]?.source).toContain('fill="red"');
+	});
+
+	test.each(["alias", "link", "href", "onclick"])("strips external XLink references under %s while keeping local fragments", prefix => {
+		const { spec, diagnostics } = parse(`<svg xmlns:${prefix}="http://www.w3.org/1999/xlink">\n<use ${prefix}:href="https://bad"/>\n<use ${prefix}:href="#local"/></svg>`, 50);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ severity: "warning", line: 51 });
+		expect(diagnostics[0]?.message).toContain(`${prefix}:href`);
+		expect(svgs[0]?.source).not.toContain("https://bad");
+		expect(svgs[0]?.source).toContain(`${prefix}:href="#local"`);
+	});
+
+	test.each([
+		String.raw`fill:u\72l(https://bad)`,
+		String.raw`fill:\75\72\6c(\68ttps://bad)`,
+		String.raw`fill:URL( 'https://bad' )`,
+		String.raw`fill:url/**/(https://bad)`,
+		String.raw`fill:url("#local");stroke:u\72l(https://bad)`,
+		String.raw`@import "https://bad"`,
+		String.raw`@\69mport "https://bad"`,
+		String.raw`@IMPORT url(https://bad)`,
+		String.raw`fill:url("")`,
+		String.raw`fill:url(#)`,
+		String.raw`fill:url(https://bad`,
+		String.raw`fill:url("/*comment*/#local")`,
+	])("strips external or invalid CSS references in %s with a warning", style => {
+		const { spec, diagnostics } = parse(`<svg>\n<rect style='${style.replaceAll("'", "&apos;")}'/></svg>`, 60);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ component: "html", severity: "warning", line: 61 });
+		expect(diagnostics[0]?.message).toContain("style");
+		expect(svgs[0]?.source).not.toContain("style=");
+	});
+
+	test.each([
+		String.raw`fill:u\72l(#local)`,
+		String.raw`fill:url("\23 local")`,
+		String.raw`fill:url( '#local' )`,
+		String.raw`fill:green;/* @import "https://example.test" */`,
+		String.raw`font-family:"@import url(https://example.test)"`,
+	])("preserves safe CSS text and escaped local refs in %s", style => {
+		const { spec, diagnostics } = parse(`<svg><rect style='${style.replaceAll("'", "&apos;")}'/></svg>`);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics).toEqual([]);
+		expect(svgs[0]?.source).toContain(`style="${style.replaceAll('"', "&quot;").replaceAll("'", "&apos;")}"`);
+	});
+
+	test("duplicate SVG attributes keep the first value and warn on the opening line", () => {
+		const { spec, diagnostics } = parse('<svg>\n<rect fill="red" fill="blue" viewBox="0 0 1 1" viewbox="separate"/>\n<use href="https://bad" href="#local"/></svg>', 70);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics.map(value => [value.line, value.severity])).toEqual([[71, "warning"], [72, "warning"], [72, "warning"]]);
+		expect(diagnostics[0]?.message).toContain("fill");
+		expect(svgs[0]?.source).toContain('fill="red"');
+		expect(svgs[0]?.source).toContain('viewBox="0 0 1 1" viewbox="separate"');
+		expect(svgs[0]?.source).not.toMatch(/blue|https:\/\/bad|href=/);
+	});
+
+	test("accepts 256 open elements including the SVG root and serializes without throwing", () => {
+		const { spec, diagnostics } = parse(`<svg><title>图</title>${"<g>".repeat(254)}<rect/>${"</g>".repeat(254)}</svg>`);
+		const { ctx, svgs } = harness();
+		renderHtml(spec, ctx);
+		expect(diagnostics).toEqual([]);
+		expect(svgs[0]?.alt).toBe("图");
+		expect(svgs[0]?.source).toContain("<title>图</title>");
+	});
+
+	test.each([257, 16384])("rejects %s open SVG elements before recursive serialization", depth => {
+		const result = parseHtml({ args: "", lines: [`<svg>${"<g>".repeat(255)}`, `${"<g>".repeat(depth - 256)}${"</g>".repeat(depth - 1)}</svg>`], line: 80 });
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics).toHaveLength(1);
+		expect(result.diagnostics[0]).toMatchObject({ component: "html", severity: "error", line: 81 });
 	});
 
 	test.each([

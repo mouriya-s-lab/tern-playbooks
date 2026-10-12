@@ -194,19 +194,38 @@ function ranksFor(nodes: readonly FlowNode[], edges: readonly FlowEdge[]): Map<s
 	const visiting = new Set<string>();
 	const visited = new Set<string>();
 	const order: string[] = [];
-	const visit = (id: string): void => { if (visited.has(id) || visiting.has(id)) return; visiting.add(id); for (const to of outgoing.get(id)!) visit(to); visiting.delete(id); visited.add(id); order.push(id); };
-	for (const node of nodes) visit(node.id);
-	order.reverse();
-	const index = new Map(order.map((id, i) => [id, i]));
-	const rank = new Map(nodes.map(n => [n.id, 0]));
-	for (const id of order) {
-		for (const edge of edges) {
-			if (edge.from === edge.to) continue;
-			const from = index.get(edge.from)! < index.get(edge.to)! ? edge.from : edge.to;
-			const to = from === edge.from ? edge.to : edge.from;
-			if (from === id) rank.set(to, Math.max(rank.get(to)!, rank.get(from)! + 1));
+	// Iterative post-order DFS: a long chain must not exhaust the call stack.
+	for (const node of nodes) {
+		if (visited.has(node.id)) continue;
+		const stack: { id: string; next: number }[] = [{ id: node.id, next: 0 }];
+		visiting.add(node.id);
+		while (stack.length) {
+			const top = stack.at(-1)!;
+			const targets = outgoing.get(top.id)!;
+			if (top.next < targets.length) {
+				const to = targets[top.next++]!;
+				if (visited.has(to) || visiting.has(to)) continue;
+				visiting.add(to);
+				stack.push({ id: to, next: 0 });
+				continue;
+			}
+			stack.pop();
+			visiting.delete(top.id);
+			visited.add(top.id);
+			order.push(top.id);
 		}
 	}
+	order.reverse();
+	const index = new Map(order.map((id, i) => [id, i]));
+	// Each edge points forward in `order` (back edges reversed); ranks relax along that order.
+	const forward = new Map<string, string[]>(nodes.map(n => [n.id, []]));
+	for (const edge of edges) {
+		if (edge.from === edge.to) continue;
+		const reversed = index.get(edge.from)! > index.get(edge.to)!;
+		forward.get(reversed ? edge.to : edge.from)!.push(reversed ? edge.from : edge.to);
+	}
+	const rank = new Map(nodes.map(n => [n.id, 0]));
+	for (const id of order) for (const to of forward.get(id)!) rank.set(to, Math.max(rank.get(to)!, rank.get(id)! + 1));
 	return rank;
 }
 function overlap(a: Box, b: Box): boolean { return a.x < b.x + b.w + 4 && a.x + a.w + 4 > b.x && a.y < b.y + b.h + 4 && a.y + a.h + 4 > b.y; }

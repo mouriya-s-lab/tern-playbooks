@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { prepareSvg } from "@oh-my-pi/pi-tui/chat/svg-source";
 import { svgFigurePalette } from "@oh-my-pi/pi-tui/chat/svg-figure";
@@ -31,13 +31,19 @@ const row = (id: string, c: readonly TspNode[]): TspNode => ({ id, k: "row", p: 
 const time = (at: number | null): string => at === null ? "无" : new Date(at).toISOString();
 const compileText = (result: CompileResult): string => result.kind === "Ok" ? result.text : JSON.stringify(result.error, null, 2);
 
-/** Read a file a design draft names: relative to the Playbook directory, and only inside it. */
+/** Largest file a draft may embed (am's image limit; code blocks stop far earlier). */
+const MAX_DRAFT_FILE_BYTES = 5 * 1024 * 1024;
+
+/** Read a file a design draft names: relative to the Playbook directory, only inside it, only a regular file of bounded size. */
 function readDraftFile(baseDir: string, path: string): FileRead {
 	try {
 		const base = realpathSync(baseDir);
 		const target = realpathSync(resolve(base, path));
 		const inside = relative(base, target);
 		if (inside.startsWith("..") || isAbsolute(inside)) return { ok: false, error: `只能引用 Playbook 目录内的文件：${path}` };
+		const stat = statSync(target);
+		if (!stat.isFile()) return { ok: false, error: `不是普通文件：${path}` };
+		if (stat.size > MAX_DRAFT_FILE_BYTES) return { ok: false, error: `文件超过 5 MB：${path}` };
 		return { ok: true, bytes: new Uint8Array(readFileSync(target)), path: target };
 	} catch (error) {
 		return { ok: false, error: `无法读取 ${path}：${error instanceof Error ? error.message : String(error)}` };
@@ -114,6 +120,8 @@ export function startUi(core: CoreApi, tsp: TspSession, baseDir: string): void {
 	function submitPrompt(block: BlockId): void {
 		const error = core.commit(ref, block);
 		if (error) return showError(error);
+		// Input that arrives for the submitted editor is late and is shown, as for committed fields.
+		committed = `${block}.prompt`;
 		focus = null;
 		redraw();
 	}
@@ -188,9 +196,13 @@ export function startUi(core: CoreApi, tsp: TspSession, baseDir: string): void {
 			if (notice) c.push(text(`${prefix}.${name}.notice`, notice, "warning"));
 		}
 		let draftErrors = 0;
+		/** Checks read the design in the changes view, whatever view the person picked (issue #3 decision 8). */
+		let checkedDesign: readonly TspNode[] = [];
 		if (block.content.kind === "design") {
 			const drawn = renderDraft(block.content.design, draftHost(block.id));
 			draftErrors = drawn.diagnostics.filter(found => found.severity === "error").length;
+			const host = draftHost(block.id);
+			checkedDesign = renderDraft(block.content.design, { ...host, context: { ...host.context, svg: (id, _svg, _size, alt) => ({ id, k: "image", p: { alt } }), image: (id, _bytes, _mime, alt) => ({ id, k: "image", p: { alt } }) }, view: () => "changes" }).nodes;
 			c.push(section(`${prefix}.design`, "设计（由协调者按修改 prompt 修订）", block.content.design.trim() ? [...drawn.nodes] : [text(`${prefix}.design.empty`, "（协调者还没有写设计）", "muted")]));
 			if (drawn.diagnostics.length) c.push(section(`${prefix}.diagnostics`, `稿件问题 ${drawn.diagnostics.length}`, drawn.diagnostics.map((found, index) => text(`${prefix}.diagnostic.${index}`, `第 ${found.line} 行 · ${found.component} · ${found.message}`, found.severity === "error" ? "error" : "warning"))));
 			const writing = item.lock.kind === "human" && item.lock.field === "prompt";
@@ -222,8 +234,9 @@ export function startUi(core: CoreApi, tsp: TspSession, baseDir: string): void {
 		c.push(...item.notices.map((notice, index) => text(`${prefix}.notice.${index}`, notice, "warning")));
 		const md: string[] = [], images: string[] = [];
 		let chartNodes = 0;
-		function collect(node: TspNode): void { if (node.k === "md" && typeof node.p?.text === "string") md.push(node.p.text); if (node.k === "image") { chartNodes++; if (typeof node.p?.alt === "string") images.push(node.p.alt); } node.c?.forEach(collect); }
+		function collect(node: TspNode): void { if (node.id === `${prefix}.design`) return; if (node.k === "md" && typeof node.p?.text === "string") md.push(node.p.text); if (node.k === "image") { chartNodes++; if (typeof node.p?.alt === "string") images.push(node.p.alt); } node.c?.forEach(collect); }
 		c.forEach(collect);
+		checkedDesign.forEach(collect);
 		// Only task bodies hold chartable tables; a design's images are its own drawings.
 		if (block.content.kind === "design") chartNodes = 0;
 		if (item.lock.kind === "human" && item.lock.field === "body") chartNodes = summaries.get(block.id)?.chartNodes ?? 0;

@@ -9,6 +9,34 @@ export interface SvgSpec {
 
 const numberPattern = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
+/** Decode only XML's built-in references; declarations and custom entities are unsupported. */
+function xmlText(value: string): string {
+	return value.replace(/&(?:#(x[0-9a-f]+|\d+)|(amp|lt|gt|quot|apos));/gi, (reference: string, numeric: string | undefined, named: string | undefined) => {
+		if (numeric !== undefined) {
+			const code = numeric[0]?.toLowerCase() === "x" ? Number.parseInt(numeric.slice(1), 16) : Number(numeric);
+			return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : "\ufffd";
+		}
+		switch (named) {
+			case "amp": return "&";
+			case "lt": return "<";
+			case "gt": return ">";
+			case "quot": return '"';
+			case "apos": return "'";
+		}
+		return reference;
+	});
+}
+
+function cssText(value: string): string {
+	return value.replace(/\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\r\n\f])|([\s\S]))/gi, (_escape: string, hex: string | undefined, newline: string | undefined, character: string | undefined) => {
+		if (hex !== undefined) {
+			const code = Number.parseInt(hex, 16);
+			return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : "\ufffd";
+		}
+		return newline !== undefined ? "" : character!;
+	});
+}
+
 function dimension(value: string | undefined): number | undefined {
 	if (value === undefined) return undefined;
 	const text = value.trim().replace(/px$/, "");
@@ -37,7 +65,29 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 	const error = (offset: number, message: string): void => {
 		diagnostics.push(diagnostic("svg", lineAt(offset), message));
 	};
+	const checkCss = (value: string, at: number, style: boolean): void => {
+		if (style && value.includes("\\")) {
+			error(at, "SVG 的 <style> 不支持反斜杠转义；请使用未转义的静态 CSS。");
+			return;
+		}
+		const css = cssText(value);
+		if (/@import\b/i.test(css)) error(at, "SVG 禁止 CSS @import；请将静态样式直接写入 SVG。");
+		const urls = /\burl\s*\(/gi;
+		let match: RegExpExecArray | null;
+		while ((match = urls.exec(css)) !== null) {
+			const end = css.indexOf(")", urls.lastIndex);
+			let target = end < 0 ? "" : css.slice(urls.lastIndex, end).trim();
+			if ((target.startsWith('"') && target.endsWith('"')) || (target.startsWith("'") && target.endsWith("'"))) target = target.slice(1, -1);
+			if (!/^#[^\s"'()\\]+$/.test(target)) error(at, "SVG 的 CSS url() 仅允许 #fragment；请改为 url(#图形ID)。");
+			if (end < 0) break;
+			urls.lastIndex = end + 1;
+		}
+	};
 	const stack: string[] = [];
+	const styles: { readonly depth: number; readonly offset: number; text: string }[] = [];
+	const appendStyleText = (text: string): void => {
+		for (const style of styles) style.text += text;
+	};
 	let root = false;
 	let rootOffset = 0;
 	let widthAttribute: string | undefined;
@@ -54,6 +104,7 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 				error(offset, "SVG 根元素必须是 <svg>；请将内容放入 <svg>…</svg>。");
 				break;
 			}
+			if (styles.length > 0) appendStyleText(xmlText(source.slice(offset, next)));
 			offset = next;
 			continue;
 		}
@@ -67,6 +118,7 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 				error(offset, `SVG 标记未闭合；请补上 ${terminator}。`);
 				break;
 			}
+			if (terminator === "]]>") appendStyleText(source.slice(offset + 9, end));
 			offset = end + terminator.length;
 			continue;
 		}
@@ -96,6 +148,7 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 		let cursor = offset + opening[0].length;
 		let selfClosing = false;
 		let ended = false;
+		const attributes = new Set<string>();
 		while (cursor < source.length) {
 			const beforeWhitespace = cursor;
 			while (/\s/.test(source[cursor] ?? "") && cursor < source.length) cursor++;
@@ -110,14 +163,17 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 			if (!attribute) break;
 			const attributeName = attribute[1]!;
 			const value = attribute[2] ?? attribute[3]!;
+			if (attributes.has(attributeName)) error(cursor, `SVG 属性 ${attributeName} 重复；每个元素只能指定一次同名属性。`);
+			attributes.add(attributeName);
 			const lowerName = attributeName.toLowerCase();
 			const attributeLocalName = lowerName.slice(lowerName.lastIndexOf(":") + 1);
 			if (attributeLocalName.startsWith("on")) {
 				error(cursor, `SVG 禁止 ${attributeName} 事件处理器；请移除此属性。`);
 			}
-			if ((lowerName === "href" || lowerName === "xlink:href") && !/^#[^\s]+$/.test(value)) {
+			if (attributeLocalName === "href" && (!/^#[^\s]+$/.test(value) || !/^#[^\s]+$/.test(xmlText(value)))) {
 				error(cursor, `SVG 的 ${attributeName} 仅允许 #fragment；请改为 href="#图形ID"。`);
 			}
+			checkCss(xmlText(value), cursor, false);
 			if (isRoot) {
 				if (attributeName === "width") widthAttribute = value;
 				else if (attributeName === "height") heightAttribute = value;
@@ -131,7 +187,15 @@ export function parseSvg(input: FenceInput): Parsed<SvgSpec> {
 		}
 		if (closing) {
 			if (stack.pop() !== name) error(offset, `SVG 结束标签不匹配；请补上对应的 </${name}>。`);
-		} else if (!selfClosing) stack.push(name);
+			const style = styles.at(-1);
+			if (style !== undefined && style.depth > stack.length) {
+				checkCss(style.text, style.offset, true);
+				styles.pop();
+			}
+		} else if (!selfClosing) {
+			stack.push(name);
+			if (localName === "style") styles.push({ depth: stack.length, offset, text: "" });
+		}
 		offset = cursor;
 	}
 	if (!root && diagnostics.length === 0) error(0, "SVG 根元素必须是 <svg>；请使用 <svg>…</svg>。");

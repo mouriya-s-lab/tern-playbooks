@@ -287,11 +287,35 @@ for (const run of [undefined, "r1"] as const) {
 		const instruction = lines.slice(1, -1).join("\n");
 		expect(instruction).toContain("playbook_read");
 		expect(instruction).toContain('block: "b3"');
+		const history = `playbook_read {doc: ${JSON.stringify(await realpath(s.doc))}, ${run === undefined ? "" : `run: "${run}", `}op: "revisions", block: "b3"}`;
+		expect(instruction).toContain(`需要以前的修改要求时用 ${history}。`);
 		expect(instruction).toContain("修订设计");
 		expect(instruction).toContain("playbook_edit");
 		for (const op of ["write", "replace", "panel"]) expect(instruction).toContain(op);
 		expect(instruction).toMatch(/不要改\s+requirement/);
 		expect(instruction).not.toContain("playbook.run");
+		expect(JSON.parse(lines.at(-1)!)).toEqual({ doc: await realpath(s.doc), event: "revision_requested", data: { ...scope, block: "b3", revision: 5 } });
+	});
+
+	test(`revision_requested keeps the ${run === undefined ? "template" : "Run"} document and block scope in the lookup-failure hint and history advice`, async () => {
+		const s = await service(); const h = await harness();
+		await h.execute("playbook_open", { doc: s.doc });
+		s.handler = (frame, socket) => respond(socket, frame, { revisions: [] });
+		const scope = run === undefined ? {} : { run };
+		s.push({ event: "revision_requested", data: { ...scope, block: "b3", revision: 5 } } as EventPayload);
+		await h.messageSent;
+		expect(s.frames.map(item => item.op)).toEqual(["hello", "revisions"]);
+		expect(s.frames.at(-1)!.args).toEqual({ ...scope, block: "b3", after: 4 });
+		expect(h.messages).toHaveLength(1);
+		const { message, options } = h.messages[0]!;
+		expect(message.customType).toBe("playbook-event");
+		expect(options).toEqual({ deliverAs: "aside", triggerTurn: true });
+		const lines = message.content.split("\n");
+		const instruction = lines.slice(1, -1).join("\n");
+		const history = `playbook_read {doc: ${JSON.stringify(await realpath(s.doc))}, ${run === undefined ? "" : `run: "${run}", `}op: "revisions", block: "b3"}`;
+		expect(instruction).toContain(`（读取失败，用 ${history} 查询）`);
+		expect(instruction).toContain(`需要以前的修改要求时用 ${history}。`);
+		expect(instruction).not.toContain("<prompt>");
 		expect(JSON.parse(lines.at(-1)!)).toEqual({ doc: await realpath(s.doc), event: "revision_requested", data: { ...scope, block: "b3", revision: 5 } });
 	});
 }

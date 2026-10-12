@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { renderDraft } from "../src/service/draft/components";
 import type { ChangeView, Parsed, RenderContext } from "../src/service/draft/contract";
 import { parseSvg, renderSvg, type SvgSpec } from "../src/service/draft/svg";
 
@@ -16,6 +17,19 @@ function rejected(source: string, line: number, message: string): void {
 	const result = parse(source);
 	expect(result.ok).toBe(false);
 	expect(result.diagnostics).toContainEqual({ component: "svg", severity: "error", line, message: expect.stringContaining(message) });
+	let svgCalls = 0;
+	const rendered = renderDraft(`\`\`\`svg\n${source}\n\`\`\``, {
+		id: "draft.rejected",
+		context: {
+			svg(id) { svgCalls++; return { id, k: "image" }; },
+			image() { throw new Error("rejected SVG must not render an image"); },
+			readFile() { throw new Error("rejected SVG must not read a file"); },
+		},
+		view: () => "changes",
+		viewSwitch: id => ({ id, k: "row" }),
+	});
+	expect(rendered.diagnostics).toContainEqual(expect.objectContaining({ component: "svg", severity: "error", message: expect.stringContaining(message) }));
+	expect(svgCalls).toBe(0);
 }
 
 describe("raw SVG sizing and preservation", () => {
@@ -79,6 +93,86 @@ describe("SVG root and safety validation", () => {
 
 	test("permits internal href and xlink:href references without rewriting them", () => {
 		const source = '<svg width="240" height="80" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><path id="图形" d="M0 0h10"/></defs><use href="#图形"/><use xlink:href="#图形"/></svg>';
+		expect(parse(source)).toEqual({ ok: true, value: { source, width: 240, height: 80 }, diagnostics: [] });
+	});
+	for (const prefix of ["l", "link", "other"]) {
+		test(`rejects XLink href under the ${prefix} namespace alias`, () => {
+			rejected(`<svg width="240" height="80" xmlns:${prefix}="http://www.w3.org/1999/xlink">\n<image ${prefix}:href="https://example.org/image.svg"/>\n</svg>`, 11, "#fragment");
+		});
+	}
+
+	for (const name of ["script", "foreignObject"]) {
+		test(`rejects namespace-qualified ${name} by local name`, () => {
+			rejected(`<svg width="240" height="80" xmlns:other="http://www.w3.org/2000/svg">\n<other:${name}/>\n</svg>`, 11, `禁止 <other:${name}>`);
+		});
+	}
+
+	for (const attribute of [
+		'fill="url(https://example.org/paint.svg#color)"',
+		'filter="URL(//example.org/filter.svg#blur)"',
+		'clip-path="url(file.svg#clip)"',
+		'style="fill: url(&quot;https://example.org/paint.svg#color&quot;)"',
+		'style="fill: url(\'data:image/svg+xml,foo\')"',
+		'fill="u\\72l(https://example.org/paint.svg#color)"',
+		'fill="\\75\\72\\6c(https://example.org/paint.svg#color)"',
+		'fill="u\\r\\l(https://example.org/paint.svg#color)"',
+		'fill="u&#114;l&#40;https://example.org/paint.svg#color)"',
+		'fill="url(&#92;68 ttps://example.org/paint.svg#color)"',
+		'fill="url(/*external*/#color)"',
+		'fill="url(\\2f\\2a external\\2a\\2f#color)"',
+		'fill="url()"',
+		'fill="url(https://example.org/unclosed"',
+		'fill="url(#safe) url(https://example.org/paint.svg#color)"',
+	]) {
+		test(`rejects external or malformed CSS URLs in attributes: ${attribute}`, () => {
+			rejected(`<svg width="240" height="80">\n<rect ${attribute}/>\n</svg>`, 11, "#fragment");
+		});
+	}
+
+	for (const css of [
+		"rect { fill: url(https://example.org/paint.svg#color); }",
+		"rect { filter: url('//example.org/filter.svg#blur'); }",
+		"@import 'https://example.org/style.css';",
+		"@IMPORT url(https://example.org/style.css);",
+		"rect { fill: u\\72l(https://example.org/paint.svg#color); }",
+		"@\\69mport 'https://example.org/style.css';",
+		"rect { fill: url(#local); content: '\\41'; }",
+	]) {
+		for (const cdata of [false, true]) {
+			test(`rejects unsafe ${cdata ? "CDATA" : "ordinary"} style text: ${css}`, () => {
+				rejected(`<svg width="240" height="80">\n<style>${cdata ? `<![CDATA[${css}]]>` : css}</style>\n</svg>`, 11, css.includes("\\") ? "转义" : css.toLowerCase().includes("@import") ? "@import" : "#fragment");
+			});
+		}
+	}
+
+	test("checks style content joined across text, comments and CDATA", () => {
+		rejected('<svg width="240" height="80">\n<style>u<!-- split -->r<![CDATA[l(https://example.org/paint.svg#color)]]></style>\n</svg>', 11, "#fragment");
+		rejected('<svg width="240" height="80">\n<style>@im<![CDATA[port]]> "https://example.org/style.css";</style>\n</svg>', 11, "@import");
+	});
+
+	test("checks namespaced style and XML-encoded style text", () => {
+		rejected('<svg width="240" height="80" xmlns:s="http://www.w3.org/2000/svg">\n<s:style>rect { fill: u&#114;l(https://example.org/paint.svg); }</s:style>\n</svg>', 11, "#fragment");
+		rejected('<svg width="240" height="80">\n<style>rect { fill: u&#92;72l(https://example.org/paint.svg); }</style>\n</svg>', 11, "转义");
+	});
+
+	for (const element of [
+		'<svg width="100" width="200" height="80"/>',
+		'<svg width="240" height="80">\n<rect fill="red" fill="blue"/>\n</svg>',
+		'<svg width="240" height="80">\n<use href="#one" href="#two"/>\n</svg>',
+		'<svg width="240" height="80" xmlns:l="http://www.w3.org/1999/xlink">\n<use l:href="#one" l:href="#two"/>\n</svg>',
+	]) {
+		test(`rejects duplicate XML attributes: ${element}`, () => {
+			rejected(element, element.includes("\n") ? 11 : 10, "重复");
+		});
+	}
+
+	test("preserves internal fragment URLs, aliased href, and safe style text", () => {
+		const source = '<svg width="240" height="80" xmlns:l="http://www.w3.org/1999/xlink"><defs><linearGradient id="color"/></defs><style>rect { fill: url("#color"); }</style><style><![CDATA[rect { filter: url(#blur); }]]></style><rect fill="u\\72l(#color)" style="clip-path: url(\'#clip\')"/><use l:href="#shape"/></svg>';
+		expect(parse(source)).toEqual({ ok: true, value: { source, width: 240, height: 80 }, diagnostics: [] });
+	});
+
+	test("permits the same attribute on different elements and case-distinct XML names", () => {
+		const source = '<svg width="240" height="80" WIDTH="300"><rect fill="red"/><rect fill="blue"/></svg>';
 		expect(parse(source)).toEqual({ ok: true, value: { source, width: 240, height: 80 }, diagnostics: [] });
 	});
 

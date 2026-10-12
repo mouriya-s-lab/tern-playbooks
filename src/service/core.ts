@@ -529,12 +529,13 @@ export class Core implements CoreApi, K1Handler {
 			if (block.content.kind !== current.content.kind) {
 				// A kind switch replaces the content whole; a draft of a field the new kind lacks ends.
 				if (block.content.kind === previous.content.kind) return;
-				if (block.title !== current.title) this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field: "title", text: block.title });
-				this.#applyEdit(doc, "disk", { kind: "content", block: block.id, content: block.content });
+				// End a draft of a field the new kind lacks before the edits below notify, so no view shows it.
 				if (lock?.kind === "human" && !humanFieldValid(block.content, lock.field)) {
 					doc.locks.set(block.id, { kind: "none" });
 					this.#notice(doc, block.id, "磁盘文件改变了块的种类，未提交的编辑已丢弃");
 				}
+				if (block.title !== previous.title && block.title !== current.title) this.#applyEdit(doc, "disk", { kind: "field", block: block.id, field: "title", text: block.title });
+				this.#applyEdit(doc, "disk", { kind: "content", block: block.id, content: block.content });
 			} else {
 				for (const field of ["title", "body", "requirement", "design"] as const) {
 					const text = fieldText(block, field);
@@ -1057,13 +1058,21 @@ export class Core implements CoreApi, K1Handler {
 		if (docState.run.status === "finished") return fail("RunFinished", "Run 已结束");
 		if (blocks.length === 0) return fail("BadLaunch", "blocks 为空");
 		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
-		const designs = blocks.filter(id => this.#block(docState, id)!.content.kind === "design");
-		if (designs.length > 0) return fail("BadLaunch", `设计块 ${designs.join(", ")} 不能直接启动：在执行块中引用它`);
-		const orchestration = blocks.filter(id => isOrchestration(this.#block(docState, id)!.content));
-		if (orchestration.length > 0 && blocks.length > 1) return fail("BadLaunch", "编排块只能单独启动");
+		const kindError = (): Outcome<never> | null => {
+			const designs = blocks.filter(id => this.#block(docState, id)!.content.kind === "design");
+			if (designs.length > 0) return fail("BadLaunch", `设计块 ${designs.join(", ")} 不能直接启动：在执行块中引用它`);
+			if (blocks.some(id => isOrchestration(this.#block(docState, id)!.content)) && blocks.length > 1) return fail("BadLaunch", "编排块只能单独启动");
+			return null;
+		};
+		const before = kindError();
+		if (before) return before;
 		await this.#ensureFetched(docState, blocks);
 		if (this.#isFinished(docState)) return fail("RunFinished", "Run 已结束");
 		for (const id of blocks) if (!this.#block(docState, id)) return fail("UnknownBlock", `块 ${id} 不存在`);
+		// A disk edit may have switched a block's kind while fetching.
+		const after = kindError();
+		if (after) return after;
+		const orchestration = blocks.filter(id => isOrchestration(this.#block(docState, id)!.content));
 		const bodies = this.#contents(docState);
 		const results = this.#results(run);
 		const result = this.#refs.compile(blocks, this.#input(docState, this.#fetches, bodies, results));

@@ -226,6 +226,31 @@ describe("K4 form UI", () => {
 		expect(core.template.blocks[0]?.block.content).toEqual({ kind: "design", requirement: `${requirement} Also retain history.`, design });
 		expect(tsp.node("b1.requirement.view").p?.text).toBe(`${requirement} Also retain history.`);
 	});
+	test("design checks keep the changes view while a marked flow is drawn in the before view", async () => {
+		const core = new FakeCore();
+		const draft = "## A Flow\n\nFlow context.\n\n```flow\nHub\n- Removed\n+ Added\n```\n";
+		core.template = { ...core.template, blocks: [designItem("b1", draft)] };
+		const { tsp } = await fixture(core);
+		const imageId = "b1.design.view.p0.1.diagram";
+		const changesImage = tsp.node(imageId);
+		expect(changesImage.p?.alt).toBe("Hub、Removed、Added");
+		const changesStatus = core.statuses.at(-1)!;
+		expect(changesStatus).toMatchObject({ ref: template, block: "b1", status: { draftErrors: 0 } });
+		const checked = { md: [...changesStatus.status.view.md], images: [...changesStatus.status.view.images] };
+		expect(checked.md).toContain("\nFlow context.\n");
+		expect(checked.images).toEqual(["Hub、Removed、Added"]);
+		const statusCount = core.statuses.length;
+		expect(tsp.node("b1.design.view.p0.1.view.before.text").p?.text).toBe("之前");
+
+		tsp.event({ ev: "change", id: "b1.design.view.p0.1.view.before", checked: true }); await tick();
+
+		expect(tsp.node("b1.design.view.p0.1.view.before").p?.checked).toBe(true);
+		const beforeImage = tsp.node(imageId);
+		expect(beforeImage.p?.alt).toBe("Hub、Removed");
+		expect(beforeImage.p?.blob).not.toBe(changesImage.p?.blob);
+		expect(core.statuses.length).toBeGreaterThan(statusCount);
+		expect(core.statuses.at(-1)).toMatchObject({ ref: template, block: "b1", status: { view: checked } });
+	});
 	test("an unclosed design fence shows line diagnostics and reports draftErrors through render status", async () => {
 		const core = new FakeCore();
 		core.template = { ...core.template, blocks: [designItem("b1", "## A Broken\n\n```callout info Review\nKeep writes atomic.")] };
@@ -265,6 +290,31 @@ describe("K4 form UI", () => {
 		expect(core.template.blocks[0]?.lock).toEqual({ kind: "none" });
 		expect(() => tsp.node("b1.prompt")).toThrow();
 		expect(tsp.node("b1.prompt.pencil").p?.actions).toEqual({ click: "invoke" });
+	});
+	test("an edit arriving after a prompt was submitted shows the late-input notice without writing", async () => {
+		const core = new FakeCore();
+		core.connected = true;
+		core.template = { ...core.template, blocks: [designItem()] };
+		const { tsp } = await fixture(core);
+		const prompt = "Explain failure recovery.";
+		tsp.click("b1.prompt.pencil"); await tick();
+		tsp.keys(prompt);
+		tsp.click("b1.prompt.submit"); await tick();
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "none" });
+		expect(core.template.blocks[0]?.block.content).toEqual({ kind: "design", requirement, design });
+		expect(() => tsp.node("b1.prompt")).toThrow("Missing b1.prompt");
+		const writes = core.calls.filter(call => call.method === "setDraft");
+		const commits = core.calls.filter(call => call.method === "commit");
+		expect(writes).toEqual([{ method: "setDraft", args: [template, "b1", prompt] }]);
+		expect(commits).toEqual([{ method: "commit", args: [template, "b1"] }]);
+
+		tsp.event({ ev: "edit", id: "b1.prompt", from: prompt.length, to: prompt.length, text: " late", cursor: prompt.length + 5, len: prompt.length }); await tick();
+
+		expect(tsp.node("b1.prompt.notice").p?.text).toBe("一次输入因文本已变化未应用");
+		expect(core.calls.filter(call => call.method === "setDraft")).toEqual(writes);
+		expect(core.calls.filter(call => call.method === "commit")).toEqual(commits);
+		expect(core.template.blocks[0]?.lock).toEqual({ kind: "none" });
+		expect(() => tsp.node("b1.prompt")).toThrow("Missing b1.prompt");
 	});
 	test("Esc retains a prompt draft and does not submit or discard it", async () => {
 		const core = new FakeCore();

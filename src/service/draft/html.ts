@@ -55,7 +55,7 @@ function attribute(element: RawElement, name: string): string {
 }
 
 /** Small tolerant tag/text scanner: not a browser DOM, but preserves text and nesting. */
-function scan(source: string, firstLine: number): RawNode[] {
+function scan(source: string, firstLine: number, diagnostics: DraftDiagnostic[]): Parsed<readonly RawNode[]> {
 	const roots: RawNode[] = [];
 	const stack: RawElement[] = [];
 	let offset = 0;
@@ -130,9 +130,22 @@ function scan(source: string, firstLine: number): RawNode[] {
 			if (lower === "td" || lower === "th") closeOptional(["td", "th"], ["tr", "table"]);
 			if (["thead", "tbody", "tfoot"].includes(lower)) closeOptional(["thead", "tbody", "tfoot"], ["table"]);
 		}
+		// Bound every raw tree, including SVG, before any recursive normalization or rendering.
+		if (stack.length >= 256) {
+			diagnostics.push(diagnostic("html", line, "HTML 嵌套深度超过 256 层；请减少标签嵌套。"));
+			return { ok: false, diagnostics };
+		}
 		const attributes: Attribute[] = [];
+		const attributeNames = new Set<string>();
 		for (const attr of match[3]!.replace(/\/\s*$/, "").matchAll(/([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
-			attributes.push({ name: attr[1]!, value: decode(attr[2] ?? attr[3] ?? attr[4] ?? "") });
+			const attrName = attr[1]!;
+			const key = inSvg || lower === "svg" ? attrName : attrName.toLowerCase();
+			if (attributeNames.has(key)) {
+				diagnostics.push(diagnostic("html", line, `已移除重复属性 ${attrName}，保留首次出现的值。`, "warning"));
+				continue;
+			}
+			attributeNames.add(key);
+			attributes.push({ name: attrName, value: decode(attr[2] ?? attr[3] ?? attr[4] ?? "") });
 		}
 		const element: RawElement = { kind: "element", name, line, attributes, children: [] };
 		children().push(element);
@@ -148,25 +161,89 @@ function scan(source: string, firstLine: number): RawNode[] {
 		}
 		stack.push(element);
 	}
-	return roots;
+	return { ok: true, value: roots, diagnostics };
 }
 
 function rawText(nodes: readonly RawNode[]): string {
 	return nodes.map(node => node.kind === "text" ? node.text : rawText(node.children)).join("");
 }
 
+function decodeCss(value: string): string {
+	return value.replace(/\\(?:([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|\r\n|[\n\r\f]|([\s\S]))/gi, (_escape: string, hex: string | undefined, char: string | undefined) => {
+		if (hex === undefined) return char ?? "";
+		const code = Number.parseInt(hex, 16);
+		return String.fromCodePoint(!code || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ? 0xfffd : code);
+	});
+}
+
+/** Inspect CSS tokens without treating quoted text or comments as active references. */
+function externalCssReference(value: string): boolean {
+	const skipSpace = (start: number): number => {
+		let cursor = start;
+		while (cursor < value.length) {
+			if (/\s/.test(value[cursor]!)) { cursor++; continue; }
+			if (!value.startsWith("/*", cursor)) break;
+			const end = value.indexOf("*/", cursor + 2);
+			cursor = end < 0 ? value.length : end + 2;
+		}
+		return cursor;
+	};
+	const tokens = /\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|(?:[\w-]|\\(?:[\da-f]{1,6}(?:\r\n|[\t\n\f\r ])?|[^\n\r\f]))+|[^\s]/gi;
+	let atKeyword = false;
+	for (let token = tokens.exec(value); token; token = tokens.exec(value)) {
+		const text = token[0];
+		if (text.startsWith("/*")) continue;
+		const word = decodeCss(text).toLowerCase();
+		if (atKeyword && word === "import") return true;
+		atKeyword = text === "@";
+		if (word !== "url") continue;
+		let cursor = skipSpace(tokens.lastIndex);
+		if (value[cursor] !== "(") continue;
+		cursor = skipSpace(cursor + 1);
+		let target = "";
+		const quote = value[cursor] === '"' || value[cursor] === "'" ? value[cursor++] : undefined;
+		let closed = false;
+		for (; cursor < value.length; cursor++) {
+			const char = value[cursor]!;
+			if (char === "\\") {
+				const escape = /^\\(?:[\da-f]{1,6}(?:\r\n|[\t\n\f\r ])?|\r\n|[\s\S])/.exec(value.slice(cursor));
+				if (!escape) return true;
+				target += escape[0];
+				cursor += escape[0].length - 1;
+			} else if (char === (quote ?? ")")) {
+				closed = true;
+				break;
+			} else if (!quote && value.startsWith("/*", cursor)) {
+				const end = value.indexOf("*/", cursor + 2);
+				if (end < 0) return true;
+				// A comment is whitespace, not part of an unquoted URL.
+				target += " ";
+				cursor = end + 1;
+			} else target += char;
+		}
+		if (!closed || !/^#[^\s"'()\\]+$/.test(decodeCss(target).trim())) return true;
+		if (quote) {
+			cursor = skipSpace(cursor + 1);
+			if (value[cursor] !== ")") return true;
+		}
+		tokens.lastIndex = cursor + 1;
+	}
+	return false;
+}
+
 function svgNode(element: RawElement, warn: (line: number, message: string) => void): HtmlNode {
 	const serialize = (node: RawNode): string => {
 		if (node.kind === "text") return escapeXml(node.text);
-		const lower = node.name.toLowerCase();
+		const lower = node.name.slice(node.name.lastIndexOf(":") + 1).toLowerCase();
 		if (Object.hasOwn(forbidden, lower) || lower === "foreignobject") {
 			warn(node.line, `已移除 <${node.name}>，请改用安全的 SVG 图形。`);
 			return "";
 		}
 		const attributes = node.attributes.filter(attr => {
-			const name = attr.name.toLowerCase();
+			if (attr.name === "xmlns" || attr.name.startsWith("xmlns:")) return true;
+			const name = attr.name.slice(attr.name.lastIndexOf(":") + 1).toLowerCase();
 			if (name.startsWith("on")) { warn(node.line, `已移除 ${attr.name}，请删除 SVG 事件处理器。`); return false; }
-			if (((name === "href" || name === "xlink:href" || name === "src") && attr.value && !attr.value.trim().startsWith("#")) || /url\(\s*['"]?\s*(?!#)[^\s'"()]/i.test(attr.value)) {
+			if (((name === "href" || name === "src") && !/^#[^\s]+$/.test(attr.value.trim())) || externalCssReference(attr.value)) {
 				warn(node.line, `已移除 ${attr.name} 外部引用，请改用 #id 本地引用。`);
 				return false;
 			}
@@ -210,7 +287,9 @@ export function parseHtml(input: FenceInput): Parsed<HtmlSpec> {
 		warn(node.line, `不支持 <${name}>，已保留内容；请改用 <div>。`);
 		return [{ kind: "element", tag: "div", children }];
 	};
-	return { ok: true, value: { nodes: scan(input.lines.join("\n"), input.line).flatMap(normalize) }, diagnostics };
+	const scanned = scan(input.lines.join("\n"), input.line, diagnostics);
+	if (!scanned.ok) return scanned;
+	return { ok: true, value: { nodes: scanned.value.flatMap(normalize) }, diagnostics };
 }
 
 export function renderHtml(spec: HtmlSpec, ctx: RenderContext): Rendered {

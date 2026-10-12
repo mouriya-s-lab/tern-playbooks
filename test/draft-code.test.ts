@@ -189,6 +189,45 @@ describe("draft code credential protection", () => {
 		expect(JSON.stringify(rendered)).not.toContain(token);
 	});
 
+	test.each([
+		"sk-proj-" + "A".repeat(48),
+		"sk-" + "Ab_9-".repeat(4),
+		"sk-" + "A".repeat(20),
+	])("refuses separator-bearing and minimum-length sk keys %j", token => {
+		const { ctx } = context(file(`safe\n${token}\n`));
+		const sourced = renderCode(parsed("src=example.ts lines=1"), ctx);
+		expect(sourced.nodes).toEqual([]);
+		expect(sourced.diagnostics).toContainEqual(expect.objectContaining({ component: "code", severity: "error", line: 11, message: expect.stringContaining("密钥或令牌") }));
+		expect(JSON.stringify(sourced)).not.toContain(token);
+		const typed = renderCode(parsed("ts", ["safe", token]), ctx);
+		expect(typed.nodes).toEqual([]);
+		expect(typed.diagnostics).toContainEqual(expect.objectContaining({ component: "code", severity: "error", line: 13, message: expect.stringContaining("密钥或令牌") }));
+		expect(JSON.stringify(typed)).not.toContain(token);
+	});
+
+	test.each(["password", "passwd", "secret", "token", "API_KEY", "api-key", "apikey", "ACCESS_KEY", "access-key", "accesskey"])("refuses unquoted %s assignments for both separators at the eight-character boundary", key => {
+		for (const separator of [": ", "="]) {
+			const canary = `${key}${separator}aB_9-xY7`;
+			const { ctx } = context(file(`safe\n${canary}\n`));
+			const sourced = renderCode(parsed("src=example.ts lines=1"), ctx);
+			expect(sourced.nodes).toEqual([]);
+			expect(sourced.diagnostics).toContainEqual(expect.objectContaining({ component: "code", severity: "error", line: 11, message: expect.stringContaining("密钥或令牌") }));
+			expect(JSON.stringify(sourced)).not.toContain("aB_9-xY7");
+			const typed = renderCode(parsed("ts", ["safe", canary]), ctx);
+			expect(typed.nodes).toEqual([]);
+			expect(typed.diagnostics).toContainEqual(expect.objectContaining({ component: "code", severity: "error", line: 13, message: expect.stringContaining("密钥或令牌") }));
+			expect(JSON.stringify(typed)).not.toContain("aB_9-xY7");
+		}
+	});
+
+	test("short values, unrelated identifiers and quoted placeholders remain allowed", () => {
+		for (const text of ["sk-" + "A".repeat(19), "password: abcdefg", "API_KEY=abcdefg", "mytoken=abcdefgh", 'password = "$PASSWORD_FROM_ENV"', 'api_key = "<injected-secret>"', 'token = "${ACCESS_TOKEN}"']) {
+			const { ctx } = context(file(text));
+			expect(renderCode(parsed("src=example.ts"), ctx).nodes).toHaveLength(1);
+			expect(renderCode(parsed("ts", [text]), ctx).nodes).toHaveLength(1);
+		}
+	});
+
 	test("private keys, supported token formats and literal credentials are refused at render time", () => {
 		for (const text of ["-----BEGIN RSA PRIVATE KEY-----", "sk-ant-example", "sk-" + "A".repeat(32), "AKIA" + "A".repeat(16), "ghp_" + "a".repeat(30), "github_pat_" + "a".repeat(30), "xoxb-" + "a".repeat(10), "AIza" + "a".repeat(30), "eyJ" + "a".repeat(20) + "." + "b".repeat(10) + ".", 'password = "longliteralpassword"', 'api_key: "longliteralcredential"']) {
 			secretRefused("src=example.ts", file(text));

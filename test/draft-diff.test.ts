@@ -150,6 +150,38 @@ describe("parseDiff", () => {
 		errorAt(parse([" context", text], "", 22), 23, "密钥或令牌");
 	});
 
+	test.each([
+		"sk-proj-" + "A".repeat(48),
+		"sk-" + "Ab_9-".repeat(4),
+		"sk-" + "A".repeat(20),
+	])("refuses separator-bearing and minimum-length sk keys %j without a content value", token => {
+		for (const marker of ["+", "-", " "]) {
+			const result = parse([" context", `${marker}${token}`], "", 22);
+			errorAt(result, 23, "密钥或令牌");
+			expect(result).not.toHaveProperty("value");
+			expect(JSON.stringify(result)).not.toContain(token);
+		}
+	});
+
+	test.each(["password", "passwd", "secret", "token", "API_KEY", "api-key", "apikey", "ACCESS_KEY", "access-key", "accesskey"])("refuses unquoted %s assignments for both separators at the eight-character boundary", key => {
+		for (const separator of [": ", "="]) {
+			for (const marker of ["+", "-", " "]) {
+				const result = parse([" context", `${marker}${key}${separator}aB_9-xY7`], "", 22);
+				errorAt(result, 23, "密钥或令牌");
+				expect(result).not.toHaveProperty("value");
+				expect(JSON.stringify(result)).not.toContain("aB_9-xY7");
+			}
+		}
+	});
+
+	test("short values, unrelated identifiers and quoted placeholders remain allowed", () => {
+		for (const text of ["sk-" + "A".repeat(19), "password: abcdefg", "API_KEY=abcdefg", "mytoken=abcdefgh", 'password = "$PASSWORD_FROM_ENV"', 'api_key = "<injected-secret>"', 'token = "${ACCESS_TOKEN}"']) {
+			const result = parse([`+${text}`]);
+			expect(result.diagnostics).toEqual([]);
+			expect(renderDiff(value(result), ctx).nodes.some(node => node.k === "diff")).toBe(true);
+		}
+	});
+
 	test("does not read or refuse a file label, and accepts placeholder keys", () => {
 		expect(value(parse(['+api_key = "${API_KEY}"'], "file=.env.example"))).toMatchObject({ file: ".env.example" });
 	});

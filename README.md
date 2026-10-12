@@ -78,7 +78,8 @@ blocks:
 
 设计用 [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) 的稿件格式书写，由文档服务自己解析并以 Tern 原生节点绘制：
 
-- 稿头 `---`（`template: sheet|doc`、`title`、`subtitle`、`cols`，其余键显示在标题下）、导语、`## A 标题 {span=2 rows=2 bare meta="…"}` 面板。`sheet` 面板排成网格，`doc` 排成一列。
+- 稿头 `---`（`template: sheet|doc`、`title`、`subtitle`、`cols`，其余键显示在标题下）、导语、`## A 标题 {span=2 bare meta="…"}` 面板。`sheet` 面板按 `cols` 列排成网格，`span` 占几列；`doc` 排成一列。面板高度随内容，`rows` 与 am 页面在浏览器中的排版一样不起作用。
+- 一个组件超过 1000 行时不绘制，在稿件问题中提示拆分。
 - Markdown 正文、`$…$` 与 `$$` 公式、表格（单元格以 `ok`/`no`/`warn` 开头时显示为 ✓/✗/!）、单独一行的图片 `![说明](路径)`（只读 Playbook 目录内的文件）。
 - 组件：`flow`、`er`、`sequence`、`tree`、`timeline`、`limits`、`annot`、`kv`、`callout`、`ask`（只展示，不收集选择）、`diff`、`html`、`svg`，以及带 `src=`/`lines=`/`hl=`/`title=`/`start=` 的代码块。写法见 `am help <组件>`。
 - `flow`、`er`、`tree` 的行可用 `+ `、`- `、`~ ` 标出新增、删除、修改，卡片上可在"变更/之前/之后"间切换。

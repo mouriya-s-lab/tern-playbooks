@@ -5,7 +5,7 @@ import { parseAnnot, renderAnnot } from "./annot";
 import { parseAsk, renderAsk } from "./ask";
 import { parseCallout, renderCallout } from "./callout";
 import { parseCode, renderCode } from "./code";
-import type { ChangeView, DraftDiagnostic, FenceInput, Parsed, RenderContext, Rendered } from "./contract";
+import { diagnostic, type ChangeView, type DraftDiagnostic, type FenceInput, type Parsed, type RenderContext, type Rendered } from "./contract";
 import { parseDiff, renderDiff } from "./diff";
 import { parseDocument, type Panel, type Segment } from "./document";
 import { parseEr, renderEr } from "./er";
@@ -19,6 +19,9 @@ import { parseSvg, renderSvg } from "./svg";
 import { parseTable, renderTable } from "./table";
 import { parseTimeline, renderTimeline } from "./timeline";
 import { parseTree, renderTree } from "./tree";
+
+/** Largest component body drawn; longer ones are a diagnostic instead of a stalled pane. */
+const MAX_FENCE_LINES = 1000;
 
 /** One parsed segment, ready to draw. `marked` components offer the before/changes/after views. */
 interface Built {
@@ -61,7 +64,10 @@ function fence(name: string, input: FenceInput, line: number): Built {
 function build(segment: Segment): Built {
 	switch (segment.kind) {
 		case "markdown": return { diagnostics: [], marked: false, render: ctx => ({ nodes: [{ id: `${ctx.id}.md`, k: "md", p: { text: segment.text } }], diagnostics: [] }) };
-		case "fence": return fence(segment.name, segment.input, segment.line);
+		case "fence":
+			// A drawing beyond this size is unreadable and its layout would stall the pane.
+			if (segment.input.lines.length > MAX_FENCE_LINES) return { diagnostics: [diagnostic(segment.name || "code", segment.line, `组件超过 ${MAX_FENCE_LINES} 行：拆成几个较小的组件`)], marked: false, render: ctx => ({ nodes: [{ id: `${ctx.id}.failed`, k: "text", p: { text: `第 ${segment.line} 行的组件过大，未绘制`, tone: "error" } }], diagnostics: [] }) };
+			return fence(segment.name, segment.input, segment.line);
 		case "table": return built("table", segment.input.line, parseTable(segment.input), renderTable);
 		case "image": return built("image", segment.input.line, parseImage(segment.input), renderImage);
 	}
@@ -107,7 +113,14 @@ export function renderDraft(design: string, host: DraftHost): DraftRender {
 		// The view key follows the segment's line so it survives edits elsewhere in the draft.
 		const key = `${lineOf(segment)}`;
 		const view = item.marked ? host.view(key) : "changes";
-		const rendered = item.render({ ...host.context, id, view });
+		let rendered: Rendered;
+		try {
+			rendered = item.render({ ...host.context, id, view });
+		} catch (error) {
+			// A renderer bug stays inside its component: the rest of the draft still draws.
+			const message = error instanceof Error ? error.message : String(error);
+			rendered = { nodes: [{ id: `${id}.failed`, k: "text", p: { text: `第 ${lineOf(segment)} 行的组件绘制失败：${message}`, tone: "error" } }], diagnostics: [diagnostic("draft", lineOf(segment), `组件绘制失败：${message}`)] };
+		}
 		diagnostics.push(...rendered.diagnostics);
 		return item.marked ? [host.viewSwitch(`${id}.view`, key, view), ...rendered.nodes] : [...rendered.nodes];
 	});

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Block, BlockId, CompileResult, DocRef, FetchOutcome, LaunchId } from "../src/domain/model";
-import type { Connection } from "../src/domain/ports";
+import type { Connection, Fetcher } from "../src/domain/ports";
 import type { ErrorCode, EventPayload, Outcome, Request } from "../src/domain/protocol";
 import { checks } from "../src/service/checks";
 import { Core } from "../src/service/core";
@@ -23,7 +23,7 @@ function designBlock(id: BlockId, design: string, requirement = "Human requireme
 	return { id, title: id, content: { kind: "design", requirement, design }, done: false };
 }
 
-async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"), block("b2", "before")]) {
+async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"), block("b2", "before")], fetcher?: Fetcher) {
 	const directory = mkdtempSync("/tmp/tern-core-launch-");
 	cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
 	const store = createStore(join(directory, "playbook.yaml"));
@@ -35,7 +35,7 @@ async function fixture(blocks: readonly Block[] = [block("b1", "Task:\n((b2))"),
 		fetcher: { async fetch(target, baseDir) {
 			expect(baseDir).toBe(directory);
 			fetchCalls.push(references.targetKey(target));
-			return fetchOutcome;
+			return fetcher ? fetcher.fetch(target, baseDir) : fetchOutcome;
 		} },
 		panes: {
 			ownPane: () => null,
@@ -165,6 +165,44 @@ describe("Core Launch integration", () => {
 		]);
 		expect(await f.launch(["b1"])).toBe("l1");
 	});
+
+	test("launch rechecks task kind after a disk edit while an external fetch is pending", async () => {
+		const fetched = Promise.withResolvers<FetchOutcome>();
+		const started = Promise.withResolvers<void>();
+		const f = await fixture([block("b1", "Task:\n((file:context.txt))")], {
+			fetch() {
+				started.resolve();
+				return fetched.promise;
+			},
+		});
+		let settled = false;
+		const pending = f.send({ op: "launch", args: { run: f.run, blocks: ["b1"] } }).then(outcome => {
+			settled = true;
+			return outcome;
+		});
+		await started.promise;
+		expect(settled).toBe(false);
+		expect(f.fetchCalls).toEqual(["file:context.txt"]);
+
+		const replacement = designBlock("b1", "## A Overview\nDesign after disk edit", "Requirement after disk edit");
+		const before = f.core.view(f.ref);
+		expect(before.blocks[0]!.block.content.kind).toBe("task");
+		f.store.write(f.ref, f.store.serialize({ title: before.title, blocks: [replacement] }, before.run));
+		// Core owns real disk polling with no fake-clock seam; wait for the observed kind change, not a fixed delay.
+		const deadline = Date.now() + 3_000;
+		while (f.core.view(f.ref).blocks[0]!.block.content.kind !== "design" && Date.now() < deadline) await Bun.sleep(10);
+		expect(f.core.view(f.ref).blocks[0]!.block).toEqual(replacement);
+		expect(settled).toBe(false);
+
+		fetched.resolve({ ok: true, at: Date.parse("2026-01-01T00:00:00Z"), value: { kind: "file", text: "external before" } });
+		error(await pending, "BadLaunch");
+		expect(f.fetchCalls).toEqual(["file:context.txt"]);
+		expect(f.store.readRunLog(f.run).launches.size).toBe(0);
+		expect(f.store.readServiceRecords().filter(record => record.kind === "launch")).toEqual([]);
+		const after = f.core.view(f.ref);
+		expect(after.blocks[0]!.launches).toEqual([]);
+		expect(after.timeline.filter(entry => entry.data.type === "launch_created")).toEqual([]);
+	}, 8_000);
 
 	for (const operation of ["write", "panel"] as const) {
 		test(`coordinator ${operation} of a referenced design notifies the running Launch after the judge delay`, async () => {
