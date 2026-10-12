@@ -14,8 +14,10 @@ Tern Playbooks 是一个 omp 扩展。它在每个 omp 主会话中注册 `playb
 在 omp 中安装插件：
 
 ```sh
-omp plugin install git@github.com:mouriya-s-lab/tern-playbooks.git
+omp plugin install 'https://github.com/mouriya-s-lab/tern-playbooks.git#master'
 ```
+
+地址末尾的 `#master` 不能省：省略分支时 bun 请求 `…/tarball/`，GitHub 返回 404，安装失败。
 
 - 安装时 omp 会运行一次扩展。扩展先检查 `PATH` 中有没有 `tern`：没有时安装失败，omp 回滚，什么都不留下。
 - 有 Tern 时，扩展把插件包里的 `tern-plugin/` 用 `tern plugin link` 装到 Tern，Tern 的命令面板随即有"Playbook: 打开"。已经装好时不重复操作。
