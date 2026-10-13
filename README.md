@@ -1,148 +1,333 @@
 # Tern Playbooks
 
-Tern Playbooks 是一个 omp 扩展。它在每个 omp 主会话中注册 `playbook_*` 工具，由模型自己决定何时使用。调用这些工具的主会话就是协调者：它和人在 Tern 中共同编辑一份 Playbook，块以表单卡片显示。Playbook 把阶段设计和执行放在一起：设计块里人写需求，协调者按人的修改 prompt 修订以组件可视化的设计；执行块正文中的 `((target | slice))` 引用被编译成 subagent 的 prompt，协调者在 `eval` 中用 `agent()` 把工作交给 subagent；块被修改时，依赖它的运行中工作会通知协调者。
+Tern Playbooks 把**设计、执行 prompt 和编排代码**放在一份可共同编辑的 Playbook 里。它由 omp 扩展和 Tern 文档服务组成：主会话通过 `playbook_*` 工具连接文档服务，人在旁边的 pane 中看卡片、改内容、提交修改要求。
 
-## 需要
+设计和执行是分开的：设计块对应一个设计或业务单元，执行块通过引用组合所需的需求、设计面板、上下文和先前结果。一个执行块可以引用多个设计块，并不要求设计与 task 一一对应。
 
-- [Bun](https://bun.sh)
-- Tern，omp 运行在 session daemon 托管的 pane 中（pane 环境中有 `TERN_PANE`）。没有 `TERN_PANE` 时，`playbook_open` 不能在 omp 旁边打开文档服务。
-- omp（`omp` 在 `PATH` 中）。
-- `gh`，已登录；只在引用 GitHub issue 或 PR 时需要。
+| 对象 | 在这里负责什么 |
+|---|---|
+| 人 | 直接改需求、执行正文和标题；查看可视化设计；手动提交设计修改 prompt、请求启动或检查 |
+| omp 主会话（协调者） | 自己修订设计；调用工具建立 Run、编译 prompt；决定怎样启动和编排 subagent、处理变更通知及记录结果 |
+| 文档服务 | 保存文档、Run、Launch 和记录；解析引用；绘制卡片与设计组件；加锁、做确定性检查、向协调者发通知 |
+| subagent | 执行协调者交给它的编译后 prompt；不拥有这份 Playbook 的工具或 UI |
 
-## 安装
+**按钮是请求，不是自动执行器。** “提交修改”把修改 prompt 交给主会话；“启动”通知主会话去执行；“检查”请求主会话补做模型判定。扩展不会因收到通知就自行修订设计、启动 worker 或认可结果。
 
-在 omp 中安装插件：
+## 安装与打开
+
+需要 [Bun](https://bun.sh)、omp 和 Tern。加载扩展的进程必须能从 `PATH` 找到 `tern`；启动文档服务的环境必须能执行 `bun`。使用 GitHub issue/PR 引用时还需要已认证的 `gh`。
 
 ```sh
 omp plugin install 'https://github.com/mouriya-s-lab/tern-playbooks.git#master'
 ```
 
-地址末尾的 `#master` 不能省：省略分支时 bun 请求 `…/tarball/`，GitHub 返回 404，安装失败。
+扩展加载时检查 Tern，并把包内的 `tern-plugin/` 链接到 Tern；已链接到同一目录时跳过。
 
-- 安装时 omp 会运行一次扩展。扩展先检查 `PATH` 中有没有 `tern`：没有时安装失败，omp 回滚，什么都不留下。
-- 有 Tern 时，扩展把插件包里的 `tern-plugin/` 用 `tern plugin link` 装到 Tern，Tern 的命令面板随即有"Playbook: 打开"。已经装好时不重复操作。
-- 之后每个 omp 主会话都有 `playbook_*` 工具；已经在运行的 omp 会话要重启后才有。
-- omp 只对 git 或 npm 来源运行这次安装检查；从本地路径安装（`omp plugin install ./tern-playbooks`）只建立符号链接，Tern 侧在第一次启动 omp 会话时才装上。
-- `omp plugin uninstall tern-playbooks` 不会通知 Tern；卸载后用 `tern plugin unlink tern-playbooks` 移除 Tern 侧。
+**拉取仓库或重启会话不会更新已安装的插件副本。** 已安装过旧实现时先更新：
 
-## Playbook 文件
+```sh
+omp plugin upgrade tern-playbooks
+```
 
-一个 YAML 文件。块有两种，按字段区分；多行文本用块标量书写，保持原样：
+更新后启动新的 omp 会话；已运行的扩展和文档服务不会热替换。先妥善结束正在执行的工作，再关闭旧文档服务 pane，由新会话重新打开。`playbook_open` 会复用已有服务，不能借它强制换成新服务。包版本号可能不变，不能仅凭 `0.1.0` 判断代码是否最新。
 
-```yaml
-title: 修 issue
+卸载时分别移除两侧：
+
+```sh
+omp plugin uninstall tern-playbooks
+tern plugin unlink tern-playbooks
+```
+
+打开文件有三条路径：
+
+- **从主会话打开：** 先写好 YAML 文件，再调用 `playbook_open {doc: "/绝对路径/playbook.yaml"}`。没有服务时，扩展在当前 omp pane 右侧启动服务；这一步要求 omp 运行在 session daemon 托管的 Tern pane 中，环境带 `TERN_PANE`。已有服务时只连接，不另开 pane，也不自动切换焦点。
+- **从 Tern 打开：** 聚焦 `.yaml` 或 `.yml` 文件 pane，在命令面板选“Playbook: 打开”。已有服务时显示它，否则在旁边启动。此操作不启动 omp、不建立协调者连接。
+- **从源码启动服务：** 在仓库安装依赖后，在 Tern pane 中运行下面的命令。随后主会话仍需调用 `playbook_open` 才能接收请求。
+
+```sh
+bun install
+bun src/service/main.ts /绝对路径/playbook.yaml
+```
+
+同一文件只有一个在线服务和一个协调者连接。另一个主会话在原协调者仍连接时会得到 `Busy`。原会话结束后，文档 pane 保留并显示“没有协调者连接”；新会话可以接管。没有 `TERN_PANE` 的 omp 也可以连接**已经启动**的服务，但不能从那里在旁边创建 pane。
+
+主会话命令：
+
+- `/playbook-show [文件路径]`：转到已连接文档的 pane。
+- `/playbook-add [文件路径]`：选择最近会话消息、Run、记录类别及可选块，加入时间线。
+
+这些命令和 `playbook_*` 工具只注册在主会话，subagent 看不到它们。
+
+## 文件与两种块
+
+下面保存成 `playbook.yaml` 即可打开；不需要网络、外部文件或 `am` CLI：
+
+````yaml
+title: 缓存方案
 blocks:
   - id: b1
-    title: 缓存方案
+    title: 缓存设计
     requirement: |
-      重启后缓存不能丢；读延迟要低。
+      数据重启后不能丢。请求路径要简单。
     design: |
+      ---
+      template: sheet
+      title: 缓存设计
+      cols: 2
+      ---
+      先说明方案，再检查请求路径。
+
       ## A 结论
-      ```callout ok 用 Redis
-      重启后数据还在。
+      ```callout ok 使用持久化缓存
+      明确持久化策略，不把“用了 Redis”当成数据不会丢的保证。
       ```
+
       ## B 请求路径
       ```flow LR
-      Client -> Gateway -> [(Redis)]
+      Client -> Gateway -> [(Cache)]: read
       ```
     done: false
   - id: b2
-    title: 上下文
+    title: 检查方案
     body: |
-      ((https://github.com/cli/cli/issues/1000))
-      ((file:src/calc.ts | lines(1..40)))
+      根据下面的需求和请求路径，列出三个需要验证的边界。
+      不修改文件，只输出检查清单。
+      ((b1 | requirement, panel(B)))
     done: false
-  - id: b3
-    title: 实现
-    body: |
-      按下面的设计和上下文修复问题：
-      ((b1 | panel(B)))
-      ((b2))
-    done: false
+````
+
+| 块 | 文件字段 | 用途和编辑入口 |
+|---|---|---|
+| 设计块 | `requirement`、`design` | 人直接改需求；主会话改可视化设计稿。不能直接启动 |
+| 执行块 | `body` | 人或主会话直接改 Markdown/prompt；可以作为上下文被引用，也可以在 Run 中启动 |
+| 编排块 | 同样是 `body`，正文整体为一个 `js` 或 `py` 代码围栏 | 执行协调者的编排代码，不把它当成普通 worker prompt |
+
+每个块必须有 `id`、`title`、`done`，以及对应的内容字段。ID 为 `b1`、`b2` 等正整数编号，不能重复。YAML **不写 `kind`**；类型由字段决定。混写 `body` 和 `requirement`/`design`、缺字段、未知字段会被拒绝。多行内容建议用 `|`，空需求或空设计用空字符串或空块标量。
+
+`done` 是显式填写或勾选的标记，不是设计认可状态，也不从检查、subagent 返回值或 Launch 状态推导。现有只有 `body` 的文件仍可使用。
+
+### 人怎么编辑
+
+1. 标题、执行正文、需求：点“铅笔”，改文字，再点“完成”；`Esc` 也会提交这些字段，**不是撤销**。
+2. 设计：查看绘制结果，点“写修改 prompt”，精确写下哪里要改、改成什么，再手动点“提交修改”。主会话收到通知后读块并修订 `design`，不会改 `requirement`。
+3. 修改 prompt 的 `Esc` **不提交**。点“放弃”丢弃当前草稿。空 prompt 或没有协调者连接时提交被拒，草稿保留在编辑框里。
+4. 一个服务内，包括模板和各 Run，同时只能有一个人的字段草稿。编辑锁覆盖整个块；人正在编辑时，协调者不能写同一块。协调者持锁时可点“打断”收回块。
+
+提交成功的 prompt 进入只追加的修改记录，卡片中的“修改记录”默认折叠。记录的是**人的修改要求**，不是设计版本快照、设计 diff 或 AI 回复；普通读块不会自动附带它。
+
+```json
+{"op":"revisions","block":"b1","after":0}
 ```
 
-- **执行块**（`body`）是要运行的 prompt，正文是 Markdown，可以写引用。
-- **设计块**（`requirement` 与 `design`）对应一个设计或业务单元，不能直接启动，由执行块引用。
-- 只写 `body` 的旧文件照常打开；`body` 与 `requirement`/`design` 混写，或缺少这些字段，文件不能解析。
-- `file:` 路径相对于 Playbook 文件所在目录。
+上面是 `playbook_read` 的参数；查询 Run 的记录还要加 `run`。`after` 是记录序号，返回比它大的记录。新 Run 不继承模板的修改历史。
 
-## 设计块
+## 模板、Run、Launch
 
-| 部分 | 谁写 | 怎么改 |
+| 对象 | 开始与结束 | 不会自动发生的事 |
 |---|---|---|
-| 需求 `requirement` | 人 | 卡片上用铅笔直接改 |
-| 设计 `design` | 协调者 | 人不直接改；人点"写修改 prompt"写下要改哪里、改成什么，再点"提交修改" |
-| 修改记录 | 人提交的修改 prompt | 只追加，存在 `<文件>.revisions.jsonl`（Run 的在 `<名>.runs/<run>.revisions.jsonl`）；读块时不附带，用 `playbook_read {op: "revisions"}` 查询 |
+| 模板 | 原始 YAML，供各次 Run 复制 | 改模板不会同步改已有 Run |
+| Run | “开始 Run”或 `playbook_run start` 复制模板；所有 `done` 重置为 `false`。结束后不能通过卡片或工具编辑块 | 开始 Run 不启动 agent；结束 Run 不要求所有块已 done |
+| Launch | 对 Run 的执行块编译，冻结 prompt/编排代码并建立记录；显式关闭或结束 Run 时关闭 | `launch`/`bind` 不启动 worker；结果记录不关闭 Launch；关闭记录不取消 worker |
 
-提交修改时必须有协调者连接，否则提交被拒，修改 prompt 留在编辑框里。提交后协调者会话收到带这条 prompt 的通知，协调者用 `playbook_edit` 的 `write`、`replace` 或 `panel` 修订设计。在 Run 中协调者修改了设计，引用它的运行中 Launch 会收到 `block_changed`。新 Run 的修改记录从空开始，模板的记录仍可单独查询。
+Run 有独立的块内容、修改记录和时间线。**点“开始 Run”后，在顶部切换到该 Run 标签**再编辑或启动；工具调用也要传返回的 Run ID，例如 `r1`。不传 `run` 的读、改、编译、检查工具操作的是模板。
 
-设计用 [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) 的稿件格式书写，由文档服务自己解析并以 Tern 原生节点绘制：
+Run 中点执行块的“启动”，会向协调者发 `launch_requested`。勾选多个块时，按文档顺序组合启动目标；设计块不能启动，编排块只能单独启动。主会话再调用执行工具，worker 才会真正开始工作。
 
-- 稿头 `---`（`template: sheet|doc`、`title`、`subtitle`、`cols`，其余键显示在标题下）、导语、`## A 标题 {span=2 bare meta="…"}` 面板。`sheet` 面板按 `cols` 列排成网格，`span` 占几列；`doc` 排成一列。面板高度随内容，`rows` 与 am 页面在浏览器中的排版一样不起作用。
-- 一个组件超过 1000 行时不绘制，在稿件问题中提示拆分。
-- Markdown 正文、`$…$` 与 `$$` 公式、表格（单元格以 `ok`/`no`/`warn` 开头时显示为 ✓/✗/!）、单独一行的图片 `![说明](路径)`（只读 Playbook 目录内的文件）。
-- 组件：`flow`、`er`、`sequence`、`tree`、`timeline`、`limits`、`annot`、`kv`、`callout`、`ask`（只展示，不收集选择）、`diff`、`html`、`svg`，以及带 `src=`/`lines=`/`hl=`/`title=`/`start=` 的代码块。写法见 `am help <组件>`。
-- `flow`、`er`、`tree` 的行可用 `+ `、`- `、`~ ` 标出新增、删除、修改，卡片上可在"变更/之前/之后"间切换。
-- 稿件问题带行号显示在块旁，检查项 `draft` 不通过。
+一个执行块可以引用多个设计块，也可以把多个执行块一起编译成同一个 Launch。subagent 得到的是冻结后的文本，不是 UI、实时设计页面或隐式的 Playbook 上下文。
 
-执行块这样引用设计块：
+### 执行中的变更
 
-| 写法 | 得到 |
+文档服务会重新编译受影响的活跃 Launch，与基线比较；编译文本改变或编译失败时，经过约 2 秒合并通知协调者。人的内容修改、磁盘内容修改，以及协调者修订设计，都可能触发通知；标题、`done`、协调者自己修改执行正文不会触发同样的内容变更通知。活跃指未关闭且属于当前连接的协调者会话；新会话接管文档不会接管旧会话的 Launch。
+
+通知不会自动改正在运行的 worker prompt。协调者决定是否告知 worker、重新安排工作或调用 `playbook_launch rebase` 接受当前编译结果为新基线。`rebase` 不改变最初冻结的快照；之后 `playbook.spawn` 仍使用最初快照。
+
+### 记录与文件
+
+以 `playbook.yaml` 为例：
+
+| 文件 | 内容 |
 |---|---|
-| `((b1))` | 需求与设计，分别包在 `<requirement>`、`<design>` 中 |
-| `((b1 \| requirement))` | 只有需求 |
-| `((b1 \| design))` | 整份设计稿 |
-| `((b1 \| panel(B)))` | 标题写明 ID `B` 的那个面板；没写 ID 的面板不能引用 |
+| `playbook.yaml` | 模板 |
+| `playbook.yaml.revisions.jsonl` | 模板的修改 prompt 历史 |
+| `playbook.yaml.pb.jsonl` | 服务编号分配记录 |
+| `playbook.runs/r1.yaml` | Run 的块和运行元数据 |
+| `playbook.runs/r1.jsonl` | Run 时间线及 Launch 记录 |
+| `playbook.runs/r1.revisions.jsonl` | Run 的修改 prompt 历史 |
 
-设计稿里的 `((…))` 不会被展开。`lines`、`section` 不能用于设计块，`requirement`、`design`、`panel` 不能用于执行块。
+`.yml` 文件的 Run 目录保留后缀，例如 `example.yml.runs/`。结束 Run 会关闭它的 Launch 记录、解除锁、丢弃未提交草稿并保存结束时间；不会回写模板，也不会替代对仍运行 agent 的停止操作。
 
-## 使用
+时间线可写 `update`、`result`、`failure`、`retrospective`。复盘只在 Run 结束后写。`update_every` 和 `next` 是正整数秒；到期只是通知，不会自动生成更新。结果只有关联到 `block` 时才可通过该块的 `.result` 引用读取。
 
-在 Tern pane 中运行的 omp 会话里直接用自然语言提要求，例如"在这个目录建一个 playbook，第一块是缓存方案的设计，第二块让 agent 按设计的请求路径实现，打开给我看"。模型会自己调用工具：写出 YAML 文件，用 `playbook_open` 在当前 pane 右侧打开文档服务，然后读写块、编译、开始 Run，并在 `eval` 中启动 subagent。这个会话就是协调者，本扩展不会另外启动 agent。
+服务约每秒检查磁盘文件，已提交的编辑约一秒后写回 YAML。直接修改 YAML 的内容字段也会载入，包括设计稿；卡片中的编辑分工不是文件系统权限限制。无效 YAML 会显示解析错误并保留上次有效内容，恢复有效后才继续写回。磁盘改动不会替你提交人的草稿；同字段变化会提示，随后点“完成”仍会应用草稿。已结束 Run 的块只在 UI/工具路径禁止修改，不是磁盘文件不可变。
 
-文档服务的 pane 在协调者会话结束后保留，头部显示"没有协调者连接"。之后任一 omp 会话对同一个文件调用 `playbook_open`，就会连接到这个服务，不会再开新的 pane。
+## 引用与编译
 
-工具（除 `playbook_open` 外，只打开了一份 Playbook 时可以省略 `doc`）：
+执行正文使用 `((target))` 或 `((target | selector, selector))`。多个选择结果按书写顺序用空行连接。引用必须在一行内；行内代码和代码围栏中的引用不会展开。
 
-| 工具 | 操作 |
+| 目标 | 示例 | 编译得到什么 |
+|---|---|---|
+| 设计块 | `((b1))` | 原始需求与设计，分别包在 `<requirement>`、`<design>` 中 |
+| 设计字段/面板 | `((b1 \| requirement, panel(B)))` | 原始需求与显式 `## B …` 面板全文，包含面板标题 |
+| 执行块 | `((b2))` | 递归展开的正文；可用 `lines(1..3)`、`section("标题")` 先选原文再展开 |
+| Run 中的块结果 | `((b2.result))` | 最新关联到该块的 `result` 记录；也支持 `lines`、`section`，不递归展开 |
+| 本地文本文件 | `((file:notes.md \| section("背景")))` | 相对 Playbook 所在目录取回的文本；也支持 `lines`，不会递归展开 |
+| GitHub issue/PR | `((https://github.com/owner/repo/issues/1 \| title, body))` | issue/PR 标题、正文或讨论评论；需已有 `gh` 认证 |
+
+规则与边界：
+
+- 设计块支持 `requirement`、`design`、`panel(A)`；面板必须在标题里手写单个大写字母 ID，例如 `## A 结论`。自动显示编号不是可引用 ID。需求和设计里的 `((…))` 都保持原样，不取回、不递归展开。
+- `lines` 是从 1 开始的闭区间，写成 `lines(1..3)`；`section` 不包含选中标题，包含其下级章节。它们不能用于设计块。
+- GitHub 只支持标准 `https://github.com/<owner>/<repo>/issues/<n>` 或 `/pull/<n>` 地址。`comments`、`comments(1..2)`、`comments(-1)` 选择按时间排序的讨论评论；PR 不包含 diff、文件、review 或行内 review comments。任意网页 URL 不支持。
+- 外部文本使用 `<external source="…" fetched="…">` 包装，显示取回时间。取回是副本，不是持续同步；需要最新内容时手动“重新取回”或用 `refetch`。
+- `file:` 允许 `../`，**没有**设计稿图片/`src=` 的目录沙箱或秘密扫描；只引用愿意交给 subagent 的文件。
+- 不存在的块、面板、结果、章节，越界行号、取回失败、循环引用都会编译失败。块引用链最多 8 层，包含根块。
+
+“预览”与 `playbook_compile` 只展示编译结果，不启动工作。
+
+## 设计稿与组件
+
+组件格式参考 [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html)，**解析与渲染由本仓库实现，不调用它的 CLI，也不是嵌入浏览器页面**。正文与公式交给 Tern 的原生 Markdown 节点；图类组件生成静态 SVG，其余使用原生 TSP 节点。
+
+### 稿头与面板
+
+- 可选稿头必须在第一行，以 `---` 开始/结束；只支持逐行 `key: value`，不是完整 YAML。
+- `template: sheet` 为网格，`doc` 为单列。`cols` 范围 1–6，默认 3。支持 `title`、`subtitle`；未设置稿头 `title` 时，正文第一条非空行若为 `# 标题`，会提取为稿头标题并从正文移除；先写说明再写标题不会触发提取。
+- `## A 标题 {span=2 bare meta="说明"}` 开始面板。`span` 指定占列数，`bare` 去掉卡片外框，`meta` 显示补充文字；面板高度随内容。`rows` 被解析但不参与布局。
+- `lang` 忽略；`theme`、`mode`、`style` 忽略并提示警告；其余稿头键作为文字元数据显示。
+- 面板 ID 为单个大写字母，不能重复。部分组件的原生文本标签支持行内代码、粗体、斜体和删除线；flow 与 ER 标签按普通文字显示，sequence 标签移除这些标记后显示纯文本。不要把组件标签当成完整 Markdown 渲染器。
+
+### 当前支持的写法
+
+下面都是**设计稿内**的组件。执行正文不会用这套组件解析器绘图。
+
+| 组件 | 围栏首行与正文写法 |
 |---|---|
-| `playbook_open` | 连接 Playbook，没有文档服务时在旁边打开 |
-| `playbook_read` | 读全部块或一个块；`revisions` 查询设计块的修改记录 |
-| `playbook_edit` | `title`、`done`、`replace`、`write`、`panel`、`insert`（执行块）、`insert_design`（设计块，需求留空由人写）、`delete`；`replace`/`write` 作用于执行块正文或设计块的设计稿；修改已有块时在这一次调用内加锁、修改、解锁 |
-| `playbook_compile` | `compile`（得到块编译出的 prompt）、`refetch` |
-| `playbook_check` | `inspect`、`report` |
-| `playbook_run` | `start`、`finish`、`list` |
-| `playbook_timeline` | `read`、`post`、`snooze` |
-| `playbook_launch` | `launch`、`bind`、`info`、`rebase`、`close` |
+| `flow` | `flow LR`；`Client -> [API] -> [(Cache)]: read`；方向 `TB/LR/BT/RL`，默认 `TB`；`-->` 虚线，`{Choice}` 菱形、`(Reply)` 圆角 |
+| `er` | `er LR`；实体独占一行，缩进字段如 `id uuid PK`、`user_id uuid FK -> User`；关系如 `User 1--* Order: owns` |
+| `sequence` | `sequence num`；`participants: Client, API`，`Client -> API: request`，`API --> Client: reply`；支持 `note API: 说明` 与 `== 阶段 ==` |
+| `tree` | `tree list`；缩进表示父子，`名称 \| 说明`；省略 `list` 时自动选布局 |
+| `timeline` | `timeline h` 或 `timeline v`；`09:00 \| 开始 \| 说明`，时间前加 `*` 突出 |
+| `limits` | `limits`；`Latency \| 13 / 20 \| ms \| p95` 或 `Workers \| max 8 \| count` |
+| `annot` | `annot`；正文 `结果可能[过期]{!读取前刷新}`，`# 标题 \| 旁注`、`> 图注` |
+| `kv` | `kv cols=2`；`存储: Redis`，`*不变量: 一个源头` 为通栏项 |
+| `callout` | `callout warn 缓存失效`；正文为 Markdown；类型 `info/ok/warn/err` |
+| `ask` | `ask` 或 `ask multi`；首行问题，随后 2–6 个 `* 推荐项 \| 说明` 或 `- 其他项 \| 说明`；单选必须恰有一个推荐项；**只展示，不收集选择** |
+| `diff` | `diff file=src/value.ts title="变更"`；正文直接贴 unified diff，不从 `file` 加载；支持 `start`、`hl` |
+| `html` | `html`；结构化标签如 `<section><h3>方案</h3><p><strong>结论</strong></p></section>`，转换为 TSP，不运行网页 |
+| `svg` | `svg`；完整、静态、安全的 `<svg>`，建议明确 `viewBox` 或 `width`/`height` |
+| 代码 | 其他语言围栏如 `ts title="片段" start=18 hl=19`；正文直接写代码，或用 `ts src=sample.ts lines=1-2 hl=2` 读取文件 |
+| 表格 | Markdown 表格；数据单元格的独立小写状态词 `ok`、`no`、`warn`（可跟空格和说明）显示状态图标 |
+| 图片 | 单独一行 `![说明](image.png)`，读取本地图片文件 |
 
-在 `eval` 中可以直接使用 `playbook` 辅助，扩展会在执行前把它导入单元：`await playbook.run({ run: "r1", blocks: ["b2"] })` 创建 Launch、启动 subagent、绑定、等待并记录结果；`playbook.agent(...)` 启动并绑定后立即返回，用于并行启动多个，再对每个调用 `playbook.result(...)`。使用 `playbook.run` 或 `playbook.result` 且没有给出 `timeout` 的单元不限时。
+`flow`、`er`、`tree` 支持 `+ `、`- `、`~ ` 变更标记，并提供“变更/之前/之后”视图。`~` 标出已修改声明，不储存两份旧新内容；flow 的边、ER 的关系要用一删一增表达修改。新增/删除的 tree 父节点、ER 实体会把标记传给子项。
 
-另有两条给人用的命令：
+### 不要当成浏览器能力
 
-- `/playbook-add`：把会话中的一条消息加入某个 Run 的时间线。
-- `/playbook-show`：转到 Playbook 所在的 pane。
+- `html` 不保留普通 `class/style/id` 等属性；链接显示为文字与地址，按钮没有动作；脚本、样式和嵌入页面被移除。不是任意 HTML/CSS 页面、交互表单或 web app 渲染器。
+- `svg` 拒绝脚本、事件、`foreignObject`、外部链接和外部 CSS 资源。HTML 内嵌 SVG 会清理不安全内容并提示。具体 SVG 绘制能力仍由 Tern 决定。
+- Mermaid 围栏在这里按普通代码显示，不转成图。`flow/er/sequence` 有各自语法，不能直接粘 Mermaid DSL。
+- 图片仅从 Playbook 目录内加载，远程 URL 或 data URL 只展示说明/地址并警告。图片及 `src=` 都检查真实路径，不能通过 `../` 或符号链接越出目录。
+- 本地嵌入文件上限 5 MiB；代码 `src=` 还有 2 MiB 上限、二进制/凭据路径/秘密内容检查。`lines=1-2` 的写法与引用的 `lines(1..2)` 不同；`hl` 使用显示行号。`src=` 的整个文件先做秘密扫描，再截取行号。
+- 单个围栏正文超过 1000 行不绘制；代码与 diff 超过 200 行报错，超过 40 行警告。错误和警告都显示行号，只有错误使 `draft` 检查不通过。空设计不会因此自动判错。
 
-工具与命令只出现在 omp 的主会话中，subagent 看不到它们。
+## 协调者工具
 
-在 Tern 中也可以直接打开 Playbook：聚焦 Playbook 的 YAML 文件块，按 Ctrl+Shift+P 打开命令面板，选"Playbook: 打开"。只有聚焦的是 `.yaml` 或 `.yml` 文件块时，这个命令才会出现在面板里。该文件已有文档服务时，它的 pane 会被显示出来；没有时，会在旁边开一个文档服务 pane。这个命令不会启动 omp，协调者仍是之后对这个文件调用 `playbook_open` 的 omp 会话。
+下面是工具参数，不是 shell 命令。只有恰好连接了一份文档时才能省略 `doc`；所有输入严格校验，不接受额外字段。普通 `playbook_read` **不写 `op: "read"`**。
 
-## 编排块
+| 工具 | 调用参数 |
+|---|---|
+| `playbook_open` | `{doc}` |
+| `playbook_read` | `{doc?, run?, block?}`；历史 `{doc?, run?, op:"revisions", block?, after?}` |
+| `playbook_edit` | `{doc?, run?, op:"title"或"done", block, value}`；`replace` 用 `{block, find, replace}`；`write` 用 `{block, text}`；`panel` 用 `{block, panel, text}`；`insert` 用 `{after?, title, body}`；`insert_design` 用 `{after?, title, design}`；`delete` 用 `{block}`；每项还要传 `op` |
+| `playbook_compile` | `{doc?, run?, op:"compile", blocks:[…]}`；重新取回 `{doc?, run?, op:"refetch", targets:[…]}` |
+| `playbook_check` | `{doc?, run?, op:"inspect", blocks:[…]}`；报告 `{doc?, run?, op:"report", blocks:[…], version, result}` |
+| `playbook_run` | `{doc?, op:"start", name, update_every?}`、`{doc?, op:"finish", run}`、`{doc?, op:"list"}` |
+| `playbook_timeline` | `{doc?, op:"read", run, after?}`；`{doc?, op:"post", run, kind, text, block?, launch?, next?, quote?}`；`{doc?, op:"snooze", run, after}` |
+| `playbook_launch` | `{doc?, op:"launch", run, blocks:[…]}`；`{doc?, op:"bind", launch, agent}`；`{doc?, op:"info"或"rebase"或"close", launch}` |
 
-执行块正文整体是一个 `js` 或 `py` 围栏代码块时，它是编排块。启动它分两步：`playbook_launch {op: "launch", run, blocks: ["b4"]}` 得到 `l<n>`，再发一个全部代码为 `await playbook.exec("l<n>")` 的 `eval`；扩展把这个单元替换为该 Launch 冻结的编排代码，并且不限时。JS 编排代码中 `playbook` 的 Run 与文档默认取这个 Launch：
+`playbook_edit` 的 `write/replace` 只改执行正文或设计稿，不能改需求；`replace` 的 `find` 必须恰好出现一次。`panel` 的 `text` 必须是以 `## <ID> 标题` 开始的整个替换面板。`insert_design` 的需求固定从空开始，由人填写。修改已有块时，一个调用内完成加锁、修改、解锁。
+
+### 跑一次执行块
+
+以上面的文件为例，由主会话依次调用：
+
+1. `playbook_open {doc: "/绝对路径/playbook.yaml"}`。
+2. `playbook_compile {op: "compile", blocks: ["b2"]}`：查看展开的需求和 B 面板。
+3. `playbook_run {op: "start", name: "检查缓存方案"}`：取得返回的 Run ID。以下假设为 `r1`，实际以返回值为准。
+4. 在主会话的 **JS eval** 中执行：
 
 ```js
-var impl = await playbook.run({ blocks: ["b2"], agent: "task:mid", label: "Implementation" });
-var review = await playbook.run({ blocks: ["b3"], agent: "task:mid", label: "Review" });
+var worker = await playbook.agent({
+  run: "r1", blocks: ["b2"], agent: "task:mid", label: "检查缓存方案"
+});
+var checklist = await playbook.result(worker, { block: "b2" });
+await tool.playbook_launch({ op: "close", launch: worker.launch });
+return checklist;
 ```
 
-- 当 omp 的默认 subagent 被禁用时，需要用 `agent:` 指定一个可用的 agent。
-- `py` 编排块中没有 `playbook` 辅助；扩展设置 `PLAYBOOK_DOC`、`PLAYBOOK_RUN`、`PLAYBOOK_LAUNCH`，代码直接调用 `tool.playbook_*` 与 `agent()`。它需要 omp 的 Python 后端可用，用 `omp setup python --check` 确认。
+5. 检查输出；需要时显式 `playbook_edit {op:"done", run:"r1", block:"b2", value:true}`，或者由人勾选。最后 `playbook_run {op:"finish", run:"r1"}`，再写复盘。
 
-## 检查
+`task:mid` 必须是当前 omp 可用的 agent；扩展不提供或配置它。没有指定 `agent` 时使用 omp 的默认 agent，默认被禁用时必须显式指定。
 
-文档服务对每个块做确定性检查，结果显示在块旁：执行块检查编译、空展开与表格图表，设计块检查稿件（`draft`）。jev 判定由协调者在 `eval` 中经 `judge` 模型角色完成，再用 `playbook_check` 的 `report` 写回。
+JS eval 的 `playbook` 由扩展注入，不要自行加导入行。辅助方法：
 
-## 测试
+| 方法 | 行为 |
+|---|---|
+| `playbook.run({run, blocks, …})` | 创建 Launch、启动并绑定一个 worker、等待、记结果；单块时自动把结果关联到该块 |
+| `playbook.agent({run, blocks, …})` | 创建并绑定，返回 `{launch, id, handle, …}`，不等待 |
+| `playbook.result(worker, {block?})` | 等待并写 `result`；等待异常写 `failure` 并抛出 |
+| `playbook.spawn(launch, {…})` | 在已有 prompt Launch 上增加 worker，使用原始冻结快照 |
+| `playbook.read({run?, block?})` | 读块；没有历史查询辅助，历史仍用 `playbook_read` 工具 |
+| `playbook.post({run, kind, text, …})` | 写记录 |
+| `playbook.timeline({run, after?})` | 读时间线 |
+| `playbook.context` | 编排执行时的 `{doc, run, launch}`；普通 eval 中为空 |
+
+辅助方法不会自动设 `done`、关闭成功的 Launch 或结束 Run。并行时在**同一 eval 单元**中启动多个 worker，再分别 `result`；不要跨单元保留 worker handle。含 `playbook.run/result` 且未显式给 `timeout` 的单元会设置 `timeout: 0`。
+
+### 编排块
+
+可把下面的块加到示例文件的 `blocks` 下；使用恰好三个反引号的 `js`/`py` 围栏，正文不能另外夹说明文字：
+
+````yaml
+  - id: b3
+    title: 编排检查
+    body: |
+      ```js
+      var worker = await playbook.agent({ blocks: ["b2"], agent: "task:mid" });
+      var result = await playbook.result(worker, { block: "b2" });
+      await tool.playbook_launch({ doc: playbook.context.doc, op: "close", launch: worker.launch });
+      await tool.playbook_launch({ doc: playbook.context.doc, op: "close", launch: playbook.context.launch });
+      return result;
+      ```
+    done: false
+````
+
+修改模板不会把新块带入已有 Run。把编排块加入模板后，再调用 `playbook_run {op:"start", name:"编排检查"}`，使用这次返回的 Run ID；下面假设为 `r2`，实际以返回值为准。
+
+调用 `playbook_launch {op:"launch", run:"r2", blocks:["b3"]}` 取得返回的 Launch ID；下面假设为 `l2`，实际以返回值为准。然后发**一个完整代码只有下面这一句**的 eval：
+
+```js
+await playbook.exec("l2")
+```
+
+`exec` 是扩展拦截并替换整个单元的入口，不是普通辅助方法；不允许在这句前后追加代码。连接多份文档时可写 `await playbook.exec("l2", "/绝对路径/playbook.yaml")`。执行的是 Launch 冻结的编排代码，强制设置 `timeout: 0`；JS 辅助默认取该 Launch 的文档与 Run。原始 `tool.playbook_*` 调用不继承这些默认值：连接多份文档时需显式传 `doc`，操作 Run 时还需按工具参数要求显式传 `run`。
+
+Python 编排会设置 **Python 变量** `PLAYBOOK_DOC`、`PLAYBOOK_RUN`、`PLAYBOOK_LAUNCH`，不是环境变量，也不注入 JS 的 `playbook` 辅助；直接使用 Python eval 的 `tool`、`agent` 接口，需要 omp 的 Python 后端可用。
+
+## 检查不等于完成或认可
+
+卡片显示确定性检查：`compile`、`render_error`、`render_pending`；执行块另检查 `empty_expansion` 与表格图表，设计块检查 `draft`。检查不负责证明业务设计正确；除编译失败等 Launch 自身约束外，其他检查不通过不是启动门禁。
+
+`jev` 是另行报告的模型判定：
+
+- `playbook_check inspect` 返回 `{blocks, source, compiled, view, findings, version}`，**当前不返回问题定义**。
+- 当前固定问题 `missing`：完整编译 prompt 是否提到未包含其中的日志、讨论、文件或先前结果内容？主会话可以在 eval 中用可用的 `judge` 回答。
+- 报告形状为 `result: {kind:"answers", answers:{missing: P(yes)}}`，概率必须在 0–1；`P(yes) >= 0.5` 显示不通过。judge 不可用时报告 `{kind:"judge_unavailable"}`，显示未判定，不当作通过。
+- 报告须带同一文档、同一 Run、同一顺序块列表的最新 `version`。过期报告会被忽略；输入变化使旧判定失效。
+
+“检查”按钮会更新确定性检查并通知协调者；不会自己调用模型。没有设计认可状态，没有从检查到 `done` 的自动转换。
+
+## 开发检查
 
 ```sh
 bun x tsc --noEmit -p tsconfig.json
