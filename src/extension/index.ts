@@ -7,13 +7,23 @@ import { parseBlockId, parseLaunchId, parseRunId, type BlockId, type LaunchId, t
 import { socketPath, type EventPayload, type Request, type ServerFrame } from "../domain/protocol";
 import { K1Client, type Reply } from "./client";
 import { splitPane } from "../service/panes";
-import { ensureTernPlugin } from "./tern-setup";
+import { ensureTernPlugin, type TernPluginState } from "./tern-setup";
 
 /** A block body that is one fenced js/py code block is an orchestration block (launch-events.md §1). */
 const ORCHESTRATION = /^\s*```(js|py)\s*\n([\s\S]*)\n```\s*$/;
 
+/** The main session's notice for what Tern setup did; nothing when the daemon already ran this version. */
+function ternNotice(state: TernPluginState): { readonly text: string; readonly level: "info" | "warning" } | null {
+	switch (state.kind) {
+		case "current": return null;
+		case "reloaded": return { text: `Tern Playbooks: Tern 插件已从 ${state.from ?? "未加载"} 重新加载为 ${state.to}`, level: "info" };
+		case "stale": return { text: `Tern Playbooks: Tern 仍在运行插件 ${state.loaded ?? "未加载"}，磁盘上是 ${state.wanted}；手动执行 \`tern plugin reload\` 查看原因。\n${state.detail}`, level: "warning" };
+		default: { const unreachable: never = state; return unreachable; }
+	}
+}
+
 export default async function (pi: ExtensionAPI): Promise<void> {
-	await ensureTernPlugin();
+	const ternState = await ensureTernPlugin();
 	const z = pi.zod;
 	const block = z.string().regex(/^b[1-9][0-9]*$/).transform(value => {
 		const id = parseBlockId(value); if (id === null) throw new Error("Invalid block id"); return id;
@@ -400,6 +410,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (ctx.agent.kind !== "main") return;
 		registerTools();
 		registerCommands();
+		const notice = ternNotice(ternState);
+		if (notice) ctx.ui.notify(notice.text, notice.level);
 	});
 
 	pi.on("session_shutdown", () => {
