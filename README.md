@@ -1,66 +1,70 @@
 # Tern Playbooks
 
-Tern Playbooks 把**设计、执行 prompt 和编排代码**放在一份可共同编辑的 Playbook 里。它由 omp 扩展和 Tern 文档服务组成：主会话通过 `playbook_*` 工具连接文档服务，人在旁边的 pane 中看卡片、改内容、提交修改要求。
+English | [简体中文](README.zh-CN.md)
 
-设计和执行是分开的：设计块对应一个设计或业务单元，执行块通过引用组合所需的需求、设计面板、上下文和先前结果。一个执行块可以引用多个设计块，并不要求设计与 task 一一对应。
+Tern Playbooks keeps **design, execution prompts and orchestration code** in one Playbook that people and agents edit together. It consists of an omp extension and a Tern document service: the main session connects to the document service through the `playbook_*` tools, while a person reads the cards, edits content and submits change requests in the pane beside it.
 
-| 对象 | 在这里负责什么 |
+Design and execution are separate. A design block covers one design or business unit; an execution block composes the requirements, design panels, context and earlier results it needs through references. One execution block can reference several design blocks; designs and tasks do not have to map one to one.
+
+| Party | Responsible here for |
 |---|---|
-| 人 | 直接改需求、执行正文和标题；查看可视化设计；手动提交设计修改 prompt、请求启动或检查 |
-| omp 主会话（协调者） | 自己修订设计；调用工具建立 Run、编译 prompt；决定怎样启动和编排 subagent、处理变更通知及记录结果 |
-| 文档服务 | 保存文档、Run、Launch 和记录；解析引用；绘制卡片与设计组件；加锁、做确定性检查、向协调者发通知 |
-| subagent | 执行协调者交给它的编译后 prompt；不拥有这份 Playbook 的工具或 UI |
+| Person | Editing requirements, execution bodies and titles directly; viewing the rendered design; submitting design change prompts and requesting launches or checks by hand |
+| omp main session (coordinator) | Revising designs itself; calling tools to create Runs and compile prompts; deciding how to launch and orchestrate subagents, handle change notices and record results |
+| Document service | Storing documents, Runs, Launches and records; resolving references; drawing cards and design components; locking, running deterministic checks and notifying the coordinator |
+| Subagent | Executing the compiled prompt the coordinator hands it; it owns none of this Playbook's tools or UI |
 
-**按钮是请求，不是自动执行器。** “提交修改”把修改 prompt 交给主会话；“启动”通知主会话去执行；“检查”请求主会话补做模型判定。扩展不会因收到通知就自行修订设计、启动 worker 或认可结果。
+**Buttons are requests, not automatic executors.** "Submit change" hands the change prompt to the main session; "Launch" notifies the main session to execute; "Check" asks the main session to add the model judgment. The extension never revises a design, starts a worker or accepts a result on its own because a notice arrived.
 
-## 安装与打开
+## Install and open
 
-需要 [Bun](https://bun.sh)、omp 和 Tern。加载扩展的进程必须能从 `PATH` 找到 `tern`；启动文档服务的环境必须能执行 `bun`。使用 GitHub issue/PR 引用时还需要已认证的 `gh`。
+You need [Bun](https://bun.sh), omp and Tern. The process that loads the extension must find `tern` on `PATH`; the environment that starts the document service must be able to run `bun`. GitHub issue/PR references also need an authenticated `gh`.
+
+The repository is [oh-my-omp/omp-playbooks](https://github.com/oh-my-omp/omp-playbooks); the installed omp package name and the Tern plugin ID are still `tern-playbooks`, and the upgrade and uninstall commands below use that name.
 
 ```sh
-omp plugin install 'https://github.com/mouriya-s-lab/tern-playbooks.git#master'
+omp plugin install 'https://github.com/oh-my-omp/omp-playbooks.git#master'
 ```
 
-扩展加载时检查 Tern，并把包内的 `tern-plugin/` 链接到 Tern；已链接到同一目录时跳过。链接的就是 omp 安装目录本身。Tern 守护进程会自己重新加载原地修改的插件文件，但升级会整个替换安装目录，守护进程会停在“链接目标不存在”或旧版本上。所以扩展随后比较 `tern-plugin/plugin.toml` 的版本和守护进程已加载的版本，不同时执行 `tern plugin reload`，并在主会话提示结果。重新加载后版本仍不一致时只警告、不中断安装，下次加载扩展会再比较。
+When the extension loads it checks for Tern and links the package's `tern-plugin/` into Tern; it skips this when the same directory is already linked. The link points at the omp install directory itself. The Tern daemon reloads plugin files edited in place, but an upgrade replaces the whole install directory, which leaves the daemon on a missing link target or an old version. The extension therefore compares the version in `tern-plugin/plugin.toml` with the version the daemon loaded, runs `tern plugin reload` when they differ, and reports the outcome in the main session. If the versions still differ after the reload it only warns and does not abort the install; the next extension load compares again.
 
-**拉取仓库或重启会话不会更新已安装的插件副本。** 已安装过旧实现时先更新：
+**Pulling the repository or restarting a session does not update the installed plugin copy.** If an older version is installed, update it first:
 
 ```sh
 omp plugin upgrade tern-playbooks
 ```
 
-更新后启动新的 omp 会话；已运行的扩展和文档服务不会热替换。先妥善结束正在执行的工作，再关闭旧文档服务 pane，由新会话重新打开。`playbook_open` 会复用已有服务，不能借它强制换成新服务。每次推到 `master` 后，CI 把 `package.json` 和 `tern-plugin/plugin.toml` 的版本最后一位同时加一，所以版本号可以区分新旧代码。
+After updating, start a new omp session; running extensions and document services are not hot-swapped. Wind down any work in progress, then close the old document-service pane and let the new session open it again. `playbook_open` reuses an existing service, so it cannot be used to force a switch to the new one. After every push to `master`, CI increments the last version component in both `package.json` and `tern-plugin/plugin.toml`, so the version tells old and new code apart.
 
-卸载时分别移除两侧：
+To uninstall, remove both sides:
 
 ```sh
 omp plugin uninstall tern-playbooks
 tern plugin unlink tern-playbooks
 ```
 
-打开文件有三条路径：
+There are three ways to open a file:
 
-- **从主会话打开：** 先写好 YAML 文件，再调用 `playbook_open {doc: "/绝对路径/playbook.yaml"}`。没有服务时，扩展在当前 omp pane 右侧启动服务；这一步要求 omp 运行在 session daemon 托管的 Tern pane 中，环境带 `TERN_PANE`。已有服务时只连接，不另开 pane，也不自动切换焦点。
-- **从 Tern 打开：** 聚焦 `.yaml` 或 `.yml` 文件 pane，在命令面板选“Playbook: 打开”。已有服务时显示它，否则在旁边启动。此操作不启动 omp、不建立协调者连接。
-- **从源码启动服务：** 在仓库安装依赖后，在 Tern pane 中运行下面的命令。随后主会话仍需调用 `playbook_open` 才能接收请求。
+- **From the main session:** write the YAML file first, then call `playbook_open {doc: "/absolute/path/playbook.yaml"}`. With no service running, the extension starts one to the right of the current omp pane; this requires omp to run in a Tern pane managed by the session daemon, with `TERN_PANE` in its environment. With a service already running it only connects: it opens no extra pane and does not move focus.
+- **From Tern:** focus a `.yaml` or `.yml` file pane and choose "Playbook: 打开" in the command palette. It shows the existing service, or starts one beside the pane. This does not start omp or set up a coordinator connection.
+- **Starting the service from source:** install dependencies in the repository, then run the commands below in a Tern pane. The main session still has to call `playbook_open` to receive requests.
 
 ```sh
 bun install
-bun src/service/main.ts /绝对路径/playbook.yaml
+bun src/service/main.ts /absolute/path/playbook.yaml
 ```
 
-同一文件只有一个在线服务和一个协调者连接。另一个主会话在原协调者仍连接时会得到 `Busy`。原会话结束后，文档 pane 保留并显示“没有协调者连接”；新会话可以接管。没有 `TERN_PANE` 的 omp 也可以连接**已经启动**的服务，但不能从那里在旁边创建 pane。
+One file has one live service and one coordinator connection. Another main session gets `Busy` while the original coordinator is still connected. When the original session ends, the document pane stays and shows "没有协调者连接" (no coordinator connected); a new session can take over. An omp without `TERN_PANE` can still connect to a service that is **already running**, but cannot create a pane beside itself from there.
 
-主会话命令：
+Main-session commands:
 
-- `/playbook-show [文件路径]`：转到已连接文档的 pane。
-- `/playbook-add [文件路径]`：选择最近会话消息、Run、记录类别及可选块，加入时间线。
+- `/playbook-show [file path]`: jump to the pane of a connected document.
+- `/playbook-add [file path]`: pick recent session messages, a Run, a record kind and optionally a block, and add them to the timeline.
 
-这些命令和 `playbook_*` 工具只注册在主会话，subagent 看不到它们。
+These commands and the `playbook_*` tools are registered only in the main session; subagents do not see them.
 
-## 文件与两种块
+## The file and its two kinds of block
 
-下面保存成 `playbook.yaml` 即可打开；不需要网络、外部文件或 `am` CLI：
+Save the following as `playbook.yaml` and it can be opened; it needs no network, external files or `am` CLI:
 
 ````yaml
 title: 缓存方案
@@ -96,165 +100,165 @@ blocks:
     done: false
 ````
 
-| 块 | 文件字段 | 用途和编辑入口 |
+| Block | File fields | Purpose and where it is edited |
 |---|---|---|
-| 设计块 | `requirement`、`design` | 人直接改需求；主会话改可视化设计稿。不能直接启动 |
-| 执行块 | `body` | 人或主会话直接改 Markdown/prompt；可以作为上下文被引用，也可以在 Run 中启动 |
-| 编排块 | 同样是 `body`，正文整体为一个 `js` 或 `py` 代码围栏 | 执行协调者的编排代码，不把它当成普通 worker prompt |
+| Design block | `requirement`, `design` | A person edits the requirement directly; the main session edits the rendered design. Cannot be launched directly |
+| Execution block | `body` | A person or the main session edits the Markdown/prompt directly; it can be referenced as context or launched in a Run |
+| Orchestration block | Also `body`, whose whole content is one `js` or `py` code fence | Orchestration code run by the coordinator, not treated as an ordinary worker prompt |
 
-每个块必须有 `id`、`title`、`done`，以及对应的内容字段。ID 为 `b1`、`b2` 等正整数编号，不能重复。YAML **不写 `kind`**；类型由字段决定。混写 `body` 和 `requirement`/`design`、缺字段、未知字段会被拒绝。多行内容建议用 `|`，空需求或空设计用空字符串或空块标量。
+Every block needs `id`, `title`, `done` and the matching content fields. IDs are positive integers such as `b1`, `b2` and must be unique. The YAML **has no `kind`**; the type follows from the fields. Mixing `body` with `requirement`/`design`, missing fields and unknown fields are rejected. Use `|` for multi-line content; an empty requirement or design is an empty string or an empty block scalar.
 
-`done` 是显式填写或勾选的标记，不是设计认可状态，也不从检查、subagent 返回值或 Launch 状态推导。现有只有 `body` 的文件仍可使用。
+`done` is a flag that is set explicitly or ticked; it is not a design-approval state and is never derived from checks, subagent return values or Launch state. Existing files with only `body` blocks still work.
 
-### 人怎么编辑
+### How a person edits
 
-1. 标题、执行正文、需求：点“铅笔”，改文字，再点“完成”；`Esc` 也会提交这些字段，**不是撤销**。
-2. 设计：查看绘制结果，点“写修改 prompt”，精确写下哪里要改、改成什么，再手动点“提交修改”。主会话收到通知后读块并修订 `design`，不会改 `requirement`。
-3. 修改 prompt 的 `Esc` **不提交**。点“放弃”丢弃当前草稿。空 prompt 或没有协调者连接时提交被拒，草稿保留在编辑框里。
-4. 一个服务内，包括模板和各 Run，同时只能有一个人的字段草稿。编辑锁覆盖整个块；人正在编辑时，协调者不能写同一块。协调者持锁时可点“打断”收回块。
+1. Title, execution body, requirement: click the pencil, edit the text, then click "完成" (Done). `Esc` also commits these fields; it **does not undo**.
+2. Design: look at the rendered result, click "写修改 prompt" (write change prompt), state exactly what should change and how, then click "提交修改" (submit change) by hand. On the notice, the main session reads the block and revises `design`; it does not touch `requirement`.
+3. `Esc` in the change prompt **does not submit**. "放弃" (Discard) drops the current draft. An empty prompt, or submitting with no coordinator connected, is rejected and the draft stays in the editor.
+4. Within one service, templates and all Runs included, only one person's field draft can exist at a time. The edit lock covers the whole block; while a person is editing, the coordinator cannot write that block. While the coordinator holds the lock, "打断" (Interrupt) takes the block back.
 
-提交成功的 prompt 进入只追加的修改记录，卡片中的“修改记录”默认折叠。记录的是**人的修改要求**，不是设计版本快照、设计 diff 或 AI 回复；普通读块不会自动附带它。
+A submitted prompt goes into an append-only change log; "修改记录" (change log) on the card is collapsed by default. It records **the person's change requests**, not design snapshots, design diffs or AI replies; an ordinary block read does not include it.
 
 ```json
 {"op":"revisions","block":"b1","after":0}
 ```
 
-上面是 `playbook_read` 的参数；查询 Run 的记录还要加 `run`。`after` 是记录序号，返回比它大的记录。新 Run 不继承模板的修改历史。
+The above are `playbook_read` arguments; querying a Run's log also needs `run`. `after` is a record sequence number; records with a larger number are returned. A new Run does not inherit the template's change history.
 
-## 模板、Run、Launch
+## Template, Run, Launch
 
-| 对象 | 开始与结束 | 不会自动发生的事 |
+| Object | Start and end | What never happens automatically |
 |---|---|---|
-| 模板 | 原始 YAML，供各次 Run 复制 | 改模板不会同步改已有 Run |
-| Run | “开始 Run”或 `playbook_run start` 复制模板；所有 `done` 重置为 `false`。结束后不能通过卡片或工具编辑块 | 开始 Run 不启动 agent；结束 Run 不要求所有块已 done |
-| Launch | 对 Run 的执行块编译，冻结 prompt/编排代码并建立记录；显式关闭或结束 Run 时关闭 | `launch`/`bind` 不启动 worker；结果记录不关闭 Launch；关闭记录不取消 worker |
+| Template | The original YAML, copied by each Run | Changing the template does not update existing Runs |
+| Run | "开始 Run" (Start Run) or `playbook_run start` copies the template and resets every `done` to `false`. After it finishes, its blocks can no longer be edited through cards or tools | Starting a Run starts no agent; finishing a Run does not require every block to be done |
+| Launch | Compiles a Run's execution blocks, freezes the prompt/orchestration code and creates a record; closed explicitly or when the Run finishes | `launch`/`bind` start no worker; a result record does not close the Launch; a close record does not cancel the worker |
 
-Run 有独立的块内容、修改记录和时间线。**点“开始 Run”后，在顶部切换到该 Run 标签**再编辑或启动；工具调用也要传返回的 Run ID，例如 `r1`。不传 `run` 的读、改、编译、检查工具操作的是模板。
+A Run has its own block contents, change log and timeline. **After clicking "开始 Run", switch to that Run's tab at the top** before editing or launching; tool calls also pass the returned Run ID, for example `r1`. Read, edit, compile and check operations without `run` act on the template.
 
-Run 中点执行块的“启动”，会向协调者发 `launch_requested`。勾选多个块时，按文档顺序组合启动目标；设计块不能启动，编排块只能单独启动。主会话再调用执行工具，worker 才会真正开始工作。
+Clicking "启动" (Launch) on an execution block in a Run sends `launch_requested` to the coordinator. With several blocks ticked, the launch targets are combined in document order; design blocks cannot be launched, and an orchestration block can only be launched alone. The worker only starts working once the main session calls the execution tools.
 
-一个执行块可以引用多个设计块，也可以把多个执行块一起编译成同一个 Launch。subagent 得到的是冻结后的文本，不是 UI、实时设计页面或隐式的 Playbook 上下文。
+An execution block can reference several design blocks, and several execution blocks can be compiled into one Launch. A subagent receives the frozen text, not the UI, a live design page or any implicit Playbook context.
 
-### 执行中的变更
+### Changes during execution
 
-文档服务会重新编译受影响的活跃 Launch，与基线比较；编译文本改变或编译失败时，经过约 2 秒合并通知协调者。人的内容修改、磁盘内容修改，以及协调者修订设计，都可能触发通知；标题、`done`、协调者自己修改执行正文不会触发同样的内容变更通知。活跃指未关闭且属于当前连接的协调者会话；新会话接管文档不会接管旧会话的 Launch。
+The document service recompiles the affected active Launches and compares them with their baseline; when the compiled text changes or compilation fails, it notifies the coordinator after about two seconds of coalescing. A person's content edits, edits on disk and the coordinator's design revisions can all trigger the notice; titles, `done` and the coordinator's own edits to an execution body do not trigger the same content-change notice. Active means not closed and belonging to the currently connected coordinator session; a new session that takes over the document does not take over the old session's Launches.
 
-通知不会自动改正在运行的 worker prompt。协调者决定是否告知 worker、重新安排工作或调用 `playbook_launch rebase` 接受当前编译结果为新基线。`rebase` 不改变最初冻结的快照；之后 `playbook.spawn` 仍使用最初快照。
+The notice does not change a running worker's prompt. The coordinator decides whether to tell the worker, rearrange the work, or call `playbook_launch rebase` to accept the current compilation as the new baseline. `rebase` does not change the originally frozen snapshot; a later `playbook.spawn` still uses the original snapshot.
 
-### 记录与文件
+### Records and files
 
-以 `playbook.yaml` 为例：
+For `playbook.yaml`:
 
-| 文件 | 内容 |
+| File | Content |
 |---|---|
-| `playbook.yaml` | 模板 |
-| `playbook.yaml.revisions.jsonl` | 模板的修改 prompt 历史 |
-| `playbook.yaml.pb.jsonl` | 服务编号分配记录 |
-| `playbook.runs/r1.yaml` | Run 的块和运行元数据 |
-| `playbook.runs/r1.jsonl` | Run 时间线及 Launch 记录 |
-| `playbook.runs/r1.revisions.jsonl` | Run 的修改 prompt 历史 |
+| `playbook.yaml` | Template |
+| `playbook.yaml.revisions.jsonl` | Template change-prompt history |
+| `playbook.yaml.pb.jsonl` | Service ID allocation records |
+| `playbook.runs/r1.yaml` | The Run's blocks and run metadata |
+| `playbook.runs/r1.jsonl` | The Run's timeline and Launch records |
+| `playbook.runs/r1.revisions.jsonl` | The Run's change-prompt history |
 
-`.yml` 文件的 Run 目录保留后缀，例如 `example.yml.runs/`。结束 Run 会关闭它的 Launch 记录、解除锁、丢弃未提交草稿并保存结束时间；不会回写模板，也不会替代对仍运行 agent 的停止操作。
+For a `.yml` file the Run directory keeps the suffix, for example `example.yml.runs/`. Finishing a Run closes its Launch records, releases locks, discards uncommitted drafts and saves the finish time; it does not write back to the template and does not replace stopping agents that are still running.
 
-时间线可写 `update`、`result`、`failure`、`retrospective`。复盘只在 Run 结束后写。`update_every` 和 `next` 是正整数秒；到期只是通知，不会自动生成更新。结果只有关联到 `block` 时才可通过该块的 `.result` 引用读取。
+The timeline accepts `update`, `result`, `failure` and `retrospective`. A retrospective is written only after the Run finishes. `update_every` and `next` are positive integer seconds; when they come due it is only a notice, and no update is generated automatically. A result can be read through that block's `.result` reference only when it is associated with a `block`.
 
-服务约每秒检查磁盘文件，已提交的编辑约一秒后写回 YAML。直接修改 YAML 的内容字段也会载入，包括设计稿；卡片中的编辑分工不是文件系统权限限制。无效 YAML 会显示解析错误并保留上次有效内容，恢复有效后才继续写回。磁盘改动不会替你提交人的草稿；同字段变化会提示，随后点“完成”仍会应用草稿。已结束 Run 的块只在 UI/工具路径禁止修改，不是磁盘文件不可变。
+The service checks the files on disk about once a second, and committed edits are written back to the YAML about a second later. Direct edits to the YAML content fields are loaded too, designs included; the editing split on the cards is not a file-system permission. Invalid YAML shows the parse error and keeps the last valid content; write-back resumes once the file is valid again. Disk changes do not commit a person's draft for them; a change to the same field is flagged, and clicking "完成" afterwards still applies the draft. Blocks of a finished Run are protected only on the UI/tool paths; the files on disk are not immutable.
 
-## 引用与编译
+## References and compilation
 
-执行正文使用 `((target))` 或 `((target | selector, selector))`。多个选择结果按书写顺序用空行连接。引用必须在一行内；行内代码和代码围栏中的引用不会展开。
+Execution bodies use `((target))` or `((target | selector, selector))`. Several selected results are joined with blank lines in the order written. A reference must fit on one line; references inside inline code or code fences are not expanded.
 
-| 目标 | 示例 | 编译得到什么 |
+| Target | Example | What it compiles to |
 |---|---|---|
-| 设计块 | `((b1))` | 原始需求与设计，分别包在 `<requirement>`、`<design>` 中 |
-| 设计字段/面板 | `((b1 \| requirement, panel(B)))` | 原始需求与显式 `## B …` 面板全文，包含面板标题 |
-| 执行块 | `((b2))` | 递归展开的正文；可用 `lines(1..3)`、`section("标题")` 先选原文再展开 |
-| Run 中的块结果 | `((b2.result))` | 最新关联到该块的 `result` 记录；也支持 `lines`、`section`，不递归展开 |
-| 本地文本文件 | `((file:notes.md \| section("背景")))` | 相对 Playbook 所在目录取回的文本；也支持 `lines`，不会递归展开 |
-| GitHub issue/PR | `((https://github.com/owner/repo/issues/1 \| title, body))` | issue/PR 标题、正文或讨论评论；需已有 `gh` 认证 |
+| Design block | `((b1))` | The raw requirement and design, wrapped in `<requirement>` and `<design>` |
+| Design field/panel | `((b1 \| requirement, panel(B)))` | The raw requirement and the full explicit `## B …` panel, panel heading included |
+| Execution block | `((b2))` | The body, expanded recursively; `lines(1..3)` and `section("标题")` select from the source before expansion |
+| Block result in a Run | `((b2.result))` | The latest `result` record associated with that block; `lines` and `section` also work, with no recursive expansion |
+| Local text file | `((file:notes.md \| section("背景")))` | Text fetched relative to the Playbook's directory; `lines` also works, with no recursive expansion |
+| GitHub issue/PR | `((https://github.com/owner/repo/issues/1 \| title, body))` | The issue/PR title, body or discussion comments; needs an authenticated `gh` |
 
-规则与边界：
+Rules and limits:
 
-- 设计块支持 `requirement`、`design`、`panel(A)`；面板必须在标题里手写单个大写字母 ID，例如 `## A 结论`。自动显示编号不是可引用 ID。需求和设计里的 `((…))` 都保持原样，不取回、不递归展开。
-- `lines` 是从 1 开始的闭区间，写成 `lines(1..3)`；`section` 不包含选中标题，包含其下级章节。它们不能用于设计块。
-- GitHub 只支持标准 `https://github.com/<owner>/<repo>/issues/<n>` 或 `/pull/<n>` 地址。`comments`、`comments(1..2)`、`comments(-1)` 选择按时间排序的讨论评论；PR 不包含 diff、文件、review 或行内 review comments。任意网页 URL 不支持。
-- 外部文本使用 `<external source="…" fetched="…">` 包装，显示取回时间。取回是副本，不是持续同步；需要最新内容时手动“重新取回”或用 `refetch`。
-- `file:` 允许 `../`，**没有**设计稿图片/`src=` 的目录沙箱或秘密扫描；只引用愿意交给 subagent 的文件。
-- 不存在的块、面板、结果、章节，越界行号、取回失败、循环引用都会编译失败。块引用链最多 8 层，包含根块。
+- Design blocks support `requirement`, `design` and `panel(A)`; a panel needs a single uppercase-letter ID written in its heading, such as `## A 结论`. Automatically displayed numbers are not referenceable IDs. `((…))` inside requirements and designs stays as written: it is not fetched or expanded.
+- `lines` is a 1-based closed range written `lines(1..3)`; `section` excludes the selected heading and includes its subsections. Neither works on design blocks.
+- GitHub supports only standard `https://github.com/<owner>/<repo>/issues/<n>` or `/pull/<n>` URLs. `comments`, `comments(1..2)` and `comments(-1)` select discussion comments in time order; a PR does not include its diff, files, reviews or inline review comments. Arbitrary web URLs are not supported.
+- External text is wrapped in `<external source="…" fetched="…">`, showing when it was fetched. A fetch is a copy, not a live sync; for the latest content click "重新取回" (refetch) or use `refetch`.
+- `file:` allows `../` and has **no** directory sandbox or secret scanning like the design images/`src=` have; reference only files you are willing to hand to a subagent.
+- A missing block, panel, result or section, out-of-range lines, a failed fetch or a reference cycle fails compilation. A block reference chain is at most 8 levels deep, root included.
 
-“预览”与 `playbook_compile` 只展示编译结果，不启动工作。
+"预览" (Preview) and `playbook_compile` only show the compiled result; they start no work.
 
-## 设计稿与组件
+## Designs and components
 
-组件格式参考 [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html)，**解析与渲染由本仓库实现，不调用它的 CLI，也不是嵌入浏览器页面**。正文与公式交给 Tern 的原生 Markdown 节点；图类组件生成静态 SVG，其余使用原生 TSP 节点。
+The component format follows [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html), but **parsing and rendering are implemented in this repository; it does not call that project's CLI and is not an embedded browser page**. Prose and formulas go to Tern's native Markdown nodes; diagram components become static SVG, and the rest use native TSP nodes.
 
-### 稿头与面板
+### Header and panels
 
-- 可选稿头必须在第一行，以 `---` 开始/结束；只支持逐行 `key: value`，不是完整 YAML。
-- `template: sheet` 为网格，`doc` 为单列。`cols` 范围 1–6，默认 3。支持 `title`、`subtitle`；未设置稿头 `title` 时，正文第一条非空行若为 `# 标题`，会提取为稿头标题并从正文移除；先写说明再写标题不会触发提取。
-- `## A 标题 {span=2 bare meta="说明"}` 开始面板。`span` 指定占列数，`bare` 去掉卡片外框，`meta` 显示补充文字；面板高度随内容。`rows` 被解析但不参与布局。
-- `lang` 忽略；`theme`、`mode`、`style` 忽略并提示警告；其余稿头键作为文字元数据显示。
-- 面板 ID 为单个大写字母，不能重复。部分组件的原生文本标签支持行内代码、粗体、斜体和删除线；flow 与 ER 标签按普通文字显示，sequence 标签移除这些标记后显示纯文本。不要把组件标签当成完整 Markdown 渲染器。
+- The optional header must start on the first line, opened and closed with `---`; it supports only line-by-line `key: value`, not full YAML.
+- `template: sheet` is a grid and `doc` a single column. `cols` ranges 1–6, default 3. `title` and `subtitle` are supported; without a header `title`, if the first non-empty body line is `# Title`, it becomes the header title and is removed from the body; writing prose before the heading does not trigger this.
+- `## A Title {span=2 bare meta="note"}` starts a panel. `span` sets the column span, `bare` drops the card frame and `meta` shows extra text; panel height follows its content. `rows` is parsed but does not affect layout.
+- `lang` is ignored; `theme`, `mode` and `style` are ignored with a warning; other header keys are shown as text metadata.
+- A panel ID is a single uppercase letter and must be unique. The native text labels of some components support inline code, bold, italic and strikethrough; flow and ER labels show as plain text, and sequence labels have these marks removed and show as plain text. Do not treat component labels as a full Markdown renderer.
 
-### 当前支持的写法
+### Supported syntax
 
-下面都是**设计稿内**的组件。执行正文不会用这套组件解析器绘图。
+All of these are components **inside a design**. Execution bodies are not drawn with this component parser.
 
-| 组件 | 围栏首行与正文写法 |
+| Component | Fence opening line and body |
 |---|---|
-| `flow` | `flow LR`；`Client -> [API] -> [(Cache)]: read`；方向 `TB/LR/BT/RL`，默认 `TB`；`-->` 虚线，`{Choice}` 菱形、`(Reply)` 圆角 |
-| `er` | `er LR`；实体独占一行，缩进字段如 `id uuid PK`、`user_id uuid FK -> User`；关系如 `User 1--* Order: owns` |
-| `sequence` | `sequence num`；`participants: Client, API`，`Client -> API: request`，`API --> Client: reply`；支持 `note API: 说明` 与 `== 阶段 ==` |
-| `tree` | `tree list`；缩进表示父子，`名称 \| 说明`；省略 `list` 时自动选布局 |
-| `timeline` | `timeline h` 或 `timeline v`；`09:00 \| 开始 \| 说明`，时间前加 `*` 突出 |
-| `limits` | `limits`；`Latency \| 13 / 20 \| ms \| p95` 或 `Workers \| max 8 \| count` |
-| `annot` | `annot`；正文 `结果可能[过期]{!读取前刷新}`，`# 标题 \| 旁注`、`> 图注` |
-| `kv` | `kv cols=2`；`存储: Redis`，`*不变量: 一个源头` 为通栏项 |
-| `callout` | `callout warn 缓存失效`；正文为 Markdown；类型 `info/ok/warn/err` |
-| `ask` | `ask` 或 `ask multi`；首行问题，随后 2–6 个 `* 推荐项 \| 说明` 或 `- 其他项 \| 说明`；单选必须恰有一个推荐项；**只展示，不收集选择** |
-| `diff` | `diff file=src/value.ts title="变更"`；正文直接贴 unified diff，不从 `file` 加载；支持 `start`、`hl` |
-| `html` | `html`；结构化标签如 `<section><h3>方案</h3><p><strong>结论</strong></p></section>`，转换为 TSP，不运行网页 |
-| `svg` | `svg`；完整、静态、安全的 `<svg>`，建议明确 `viewBox` 或 `width`/`height` |
-| 代码 | 其他语言围栏如 `ts title="片段" start=18 hl=19`；正文直接写代码，或用 `ts src=sample.ts lines=1-2 hl=2` 读取文件 |
-| 表格 | Markdown 表格；数据单元格的独立小写状态词 `ok`、`no`、`warn`（可跟空格和说明）显示状态图标 |
-| 图片 | 单独一行 `![说明](image.png)`，读取本地图片文件 |
+| `flow` | `flow LR`; `Client -> [API] -> [(Cache)]: read`; direction `TB/LR/BT/RL`, default `TB`; `-->` dashed, `{Choice}` diamond, `(Reply)` rounded |
+| `er` | `er LR`; one entity per line, indented fields such as `id uuid PK`, `user_id uuid FK -> User`; relations such as `User 1--* Order: owns` |
+| `sequence` | `sequence num`; `participants: Client, API`, `Client -> API: request`, `API --> Client: reply`; supports `note API: text` and `== phase ==` |
+| `tree` | `tree list`; indentation means parent/child, `name \| note`; without `list` the layout is chosen automatically |
+| `timeline` | `timeline h` or `timeline v`; `09:00 \| start \| note`, `*` before the time highlights it |
+| `limits` | `limits`; `Latency \| 13 / 20 \| ms \| p95` or `Workers \| max 8 \| count` |
+| `annot` | `annot`; body `结果可能[过期]{!读取前刷新}`, `# Title \| side note`, `> caption` |
+| `kv` | `kv cols=2`; `存储: Redis`, `*不变量: 一个源头` is a full-width item |
+| `callout` | `callout warn 缓存失效`; the body is Markdown; types `info/ok/warn/err` |
+| `ask` | `ask` or `ask multi`; the first line is the question, followed by 2–6 `* recommended \| note` or `- other \| note`; single choice needs exactly one recommended option; **display only, no selection is collected** |
+| `diff` | `diff file=src/value.ts title="变更"`; paste a unified diff as the body, it is not loaded from `file`; supports `start`, `hl` |
+| `html` | `html`; structured tags such as `<section><h3>方案</h3><p><strong>结论</strong></p></section>`, converted to TSP; no web page runs |
+| `svg` | `svg`; a complete, static, safe `<svg>`, preferably with an explicit `viewBox` or `width`/`height` |
+| Code | Other language fences such as `ts title="片段" start=18 hl=19`; write the code in the body, or read a file with `ts src=sample.ts lines=1-2 hl=2` |
+| Table | Markdown tables; standalone lowercase status words `ok`, `no`, `warn` in data cells (optionally followed by a space and a note) show status icons |
+| Image | `![caption](image.png)` on its own line reads a local image file |
 
-`flow`、`er`、`tree` 支持 `+ `、`- `、`~ ` 变更标记，并提供“变更/之前/之后”视图。`~` 标出已修改声明，不储存两份旧新内容；flow 的边、ER 的关系要用一删一增表达修改。新增/删除的 tree 父节点、ER 实体会把标记传给子项。
+`flow`, `er` and `tree` support the change markers `+ `, `- ` and `~ ` and offer "变更/之前/之后" (changes/before/after) views. `~` marks a modified declaration without storing both versions; a changed flow edge or ER relation is written as one removal and one addition. A tree parent or ER entity marked as added or removed passes the marker to its children.
 
-### 不要当成浏览器能力
+### Not browser features
 
-- `html` 不保留普通 `class/style/id` 等属性；链接显示为文字与地址，按钮没有动作；脚本、样式和嵌入页面被移除。不是任意 HTML/CSS 页面、交互表单或 web app 渲染器。
-- `svg` 拒绝脚本、事件、`foreignObject`、外部链接和外部 CSS 资源。HTML 内嵌 SVG 会清理不安全内容并提示。具体 SVG 绘制能力仍由 Tern 决定。
-- Mermaid 围栏在这里按普通代码显示，不转成图。`flow/er/sequence` 有各自语法，不能直接粘 Mermaid DSL。
-- 图片仅从 Playbook 目录内加载，远程 URL 或 data URL 只展示说明/地址并警告。图片及 `src=` 都检查真实路径，不能通过 `../` 或符号链接越出目录。
-- 本地嵌入文件上限 5 MiB；代码 `src=` 还有 2 MiB 上限、二进制/凭据路径/秘密内容检查。`lines=1-2` 的写法与引用的 `lines(1..2)` 不同；`hl` 使用显示行号。`src=` 的整个文件先做秘密扫描，再截取行号。
-- 单个围栏正文超过 1000 行不绘制；代码与 diff 超过 200 行报错，超过 40 行警告。错误和警告都显示行号，只有错误使 `draft` 检查不通过。空设计不会因此自动判错。
+- `html` drops ordinary `class/style/id` and similar attributes; links show as text and address, buttons have no action; scripts, styles and embedded pages are removed. It is not a renderer for arbitrary HTML/CSS pages, interactive forms or web apps.
+- `svg` rejects scripts, events, `foreignObject`, external links and external CSS resources. SVG embedded in HTML is cleaned of unsafe content with a warning. What SVG can actually draw is still up to Tern.
+- Mermaid fences show as plain code here and are not turned into diagrams. `flow/er/sequence` have their own syntax; Mermaid DSL cannot be pasted in directly.
+- Images load only from inside the Playbook directory; remote URLs or data URLs show only their caption/address with a warning. Images and `src=` both check the real path, so `../` or symbolic links cannot escape the directory.
+- Embedded local files are capped at 5 MiB; code `src=` also has a 2 MiB cap and binary/credential-path/secret-content checks. `lines=1-2` is written differently from the reference form `lines(1..2)`; `hl` uses displayed line numbers. For `src=` the whole file is scanned for secrets before the lines are cut.
+- A single fence body over 1000 lines is not drawn; code and diffs over 200 lines are an error, over 40 lines a warning. Errors and warnings both show line numbers, and only errors fail the `draft` check. An empty design is not treated as an error by this.
 
-## 协调者工具
+## Coordinator tools
 
-下面是工具参数，不是 shell 命令。只有恰好连接了一份文档时才能省略 `doc`；所有输入严格校验，不接受额外字段。普通 `playbook_read` **不写 `op: "read"`**。
+These are tool arguments, not shell commands. `doc` can be omitted only when exactly one document is connected; all input is strictly validated and extra fields are rejected. A plain `playbook_read` **has no `op: "read"`**.
 
-| 工具 | 调用参数 |
+| Tool | Arguments |
 |---|---|
 | `playbook_open` | `{doc}` |
-| `playbook_read` | `{doc?, run?, block?}`；历史 `{doc?, run?, op:"revisions", block?, after?}` |
-| `playbook_edit` | `{doc?, run?, op:"title"或"done", block, value}`；`replace` 用 `{block, find, replace}`；`write` 用 `{block, text}`；`panel` 用 `{block, panel, text}`；`insert` 用 `{after?, title, body}`；`insert_design` 用 `{after?, title, design}`；`delete` 用 `{block}`；每项还要传 `op` |
-| `playbook_compile` | `{doc?, run?, op:"compile", blocks:[…]}`；重新取回 `{doc?, run?, op:"refetch", targets:[…]}` |
-| `playbook_check` | `{doc?, run?, op:"inspect", blocks:[…]}`；报告 `{doc?, run?, op:"report", blocks:[…], version, result}` |
-| `playbook_run` | `{doc?, op:"start", name, update_every?}`、`{doc?, op:"finish", run}`、`{doc?, op:"list"}` |
-| `playbook_timeline` | `{doc?, op:"read", run, after?}`；`{doc?, op:"post", run, kind, text, block?, launch?, next?, quote?}`；`{doc?, op:"snooze", run, after}` |
-| `playbook_launch` | `{doc?, op:"launch", run, blocks:[…]}`；`{doc?, op:"bind", launch, agent}`；`{doc?, op:"info"或"rebase"或"close", launch}` |
+| `playbook_read` | `{doc?, run?, block?}`; history `{doc?, run?, op:"revisions", block?, after?}` |
+| `playbook_edit` | `{doc?, run?, op:"title" or "done", block, value}`; `replace` takes `{block, find, replace}`; `write` takes `{block, text}`; `panel` takes `{block, panel, text}`; `insert` takes `{after?, title, body}`; `insert_design` takes `{after?, title, design}`; `delete` takes `{block}`; each also passes `op` |
+| `playbook_compile` | `{doc?, run?, op:"compile", blocks:[…]}`; refetch `{doc?, run?, op:"refetch", targets:[…]}` |
+| `playbook_check` | `{doc?, run?, op:"inspect", blocks:[…]}`; report `{doc?, run?, op:"report", blocks:[…], version, result}` |
+| `playbook_run` | `{doc?, op:"start", name, update_every?}`, `{doc?, op:"finish", run}`, `{doc?, op:"list"}` |
+| `playbook_timeline` | `{doc?, op:"read", run, after?}`; `{doc?, op:"post", run, kind, text, block?, launch?, next?, quote?}`; `{doc?, op:"snooze", run, after}` |
+| `playbook_launch` | `{doc?, op:"launch", run, blocks:[…]}`; `{doc?, op:"bind", launch, agent}`; `{doc?, op:"info" or "rebase" or "close", launch}` |
 
-`playbook_edit` 的 `write/replace` 只改执行正文或设计稿，不能改需求；`replace` 的 `find` 必须恰好出现一次。`panel` 的 `text` 必须是以 `## <ID> 标题` 开始的整个替换面板。`insert_design` 的需求固定从空开始，由人填写。修改已有块时，一个调用内完成加锁、修改、解锁。
+`write/replace` in `playbook_edit` change only an execution body or a design, never a requirement; the `find` of `replace` must occur exactly once. The `text` of `panel` must be the whole replacement panel, starting with `## <ID> Title`. `insert_design` always starts with an empty requirement for a person to fill in. When editing an existing block, one call takes the lock, edits and releases it.
 
-### 跑一次执行块
+### Running one execution block
 
-以上面的文件为例，由主会话依次调用：
+With the file above, the main session calls in order:
 
-1. `playbook_open {doc: "/绝对路径/playbook.yaml"}`。
-2. `playbook_compile {op: "compile", blocks: ["b2"]}`：查看展开的需求和 B 面板。
-3. `playbook_run {op: "start", name: "检查缓存方案"}`：取得返回的 Run ID。以下假设为 `r1`，实际以返回值为准。
-4. 在主会话的 **JS eval** 中执行：
+1. `playbook_open {doc: "/absolute/path/playbook.yaml"}`.
+2. `playbook_compile {op: "compile", blocks: ["b2"]}`: check the expanded requirement and panel B.
+3. `playbook_run {op: "start", name: "检查缓存方案"}`: take the returned Run ID. Below it is assumed to be `r1`; use the actual returned value.
+4. In the main session's **JS eval**, run:
 
 ```js
 var worker = await playbook.agent({
@@ -265,28 +269,28 @@ await tool.playbook_launch({ op: "close", launch: worker.launch });
 return checklist;
 ```
 
-5. 检查输出；需要时显式 `playbook_edit {op:"done", run:"r1", block:"b2", value:true}`，或者由人勾选。最后 `playbook_run {op:"finish", run:"r1"}`，再写复盘。
+5. Check the output; when appropriate, set `playbook_edit {op:"done", run:"r1", block:"b2", value:true}` explicitly, or let a person tick it. Finally call `playbook_run {op:"finish", run:"r1"}` and write the retrospective.
 
-`task:mid` 必须是当前 omp 可用的 agent；扩展不提供或配置它。没有指定 `agent` 时使用 omp 的默认 agent，默认被禁用时必须显式指定。
+`task:mid` must be an agent available in the current omp; the extension neither provides nor configures it. Without `agent`, omp's default agent is used; when the default is disabled, `agent` must be given.
 
-JS eval 的 `playbook` 由扩展注入，不要自行加导入行。辅助方法：
+The `playbook` object in JS eval is injected by the extension; do not add an import line yourself. Helpers:
 
-| 方法 | 行为 |
+| Method | Behavior |
 |---|---|
-| `playbook.run({run, blocks, …})` | 创建 Launch、启动并绑定一个 worker、等待、记结果；单块时自动把结果关联到该块 |
-| `playbook.agent({run, blocks, …})` | 创建并绑定，返回 `{launch, id, handle, …}`，不等待 |
-| `playbook.result(worker, {block?})` | 等待并写 `result`；等待异常写 `failure` 并抛出 |
-| `playbook.spawn(launch, {…})` | 在已有 prompt Launch 上增加 worker，使用原始冻结快照 |
-| `playbook.read({run?, block?})` | 读块；没有历史查询辅助，历史仍用 `playbook_read` 工具 |
-| `playbook.post({run, kind, text, …})` | 写记录 |
-| `playbook.timeline({run, after?})` | 读时间线 |
-| `playbook.context` | 编排执行时的 `{doc, run, launch}`；普通 eval 中为空 |
+| `playbook.run({run, blocks, …})` | Creates a Launch, starts and binds one worker, waits and records the result; with a single block the result is associated with that block automatically |
+| `playbook.agent({run, blocks, …})` | Creates and binds, returns `{launch, id, handle, …}` without waiting |
+| `playbook.result(worker, {block?})` | Waits and writes `result`; a wait error writes `failure` and throws |
+| `playbook.spawn(launch, {…})` | Adds a worker to an existing prompt Launch, using the original frozen snapshot |
+| `playbook.read({run?, block?})` | Reads blocks; there is no history helper, so history still uses the `playbook_read` tool |
+| `playbook.post({run, kind, text, …})` | Writes a record |
+| `playbook.timeline({run, after?})` | Reads the timeline |
+| `playbook.context` | `{doc, run, launch}` during orchestration; empty in an ordinary eval |
 
-辅助方法不会自动设 `done`、关闭成功的 Launch 或结束 Run。并行时在**同一 eval 单元**中启动多个 worker，再分别 `result`；不要跨单元保留 worker handle。含 `playbook.run/result` 且未显式给 `timeout` 的单元会设置 `timeout: 0`。
+The helpers never set `done`, close a successful Launch or finish a Run on their own. For parallel work, start several workers in **the same eval cell**, then `result` each one; do not keep worker handles across cells. A cell containing `playbook.run/result` with no explicit `timeout` gets `timeout: 0`.
 
-### 编排块
+### Orchestration blocks
 
-可把下面的块加到示例文件的 `blocks` 下；使用恰好三个反引号的 `js`/`py` 围栏，正文不能另外夹说明文字：
+The block below can be added under `blocks` in the example file; use a `js`/`py` fence of exactly three backticks, with no other prose in the body:
 
 ````yaml
   - id: b3
@@ -302,32 +306,32 @@ JS eval 的 `playbook` 由扩展注入，不要自行加导入行。辅助方法
     done: false
 ````
 
-修改模板不会把新块带入已有 Run。把编排块加入模板后，再调用 `playbook_run {op:"start", name:"编排检查"}`，使用这次返回的 Run ID；下面假设为 `r2`，实际以返回值为准。
+Changing the template does not bring new blocks into existing Runs. After adding the orchestration block to the template, call `playbook_run {op:"start", name:"编排检查"}` and use the Run ID it returns; below it is assumed to be `r2`, use the actual returned value.
 
-调用 `playbook_launch {op:"launch", run:"r2", blocks:["b3"]}` 取得返回的 Launch ID；下面假设为 `l2`，实际以返回值为准。然后发**一个完整代码只有下面这一句**的 eval：
+Call `playbook_launch {op:"launch", run:"r2", blocks:["b3"]}` to get the Launch ID; below it is assumed to be `l2`, use the actual returned value. Then send an eval whose **entire code is just this one line**:
 
 ```js
 await playbook.exec("l2")
 ```
 
-`exec` 是扩展拦截并替换整个单元的入口，不是普通辅助方法；不允许在这句前后追加代码。连接多份文档时可写 `await playbook.exec("l2", "/绝对路径/playbook.yaml")`。执行的是 Launch 冻结的编排代码，强制设置 `timeout: 0`；JS 辅助默认取该 Launch 的文档与 Run。原始 `tool.playbook_*` 调用不继承这些默认值：连接多份文档时需显式传 `doc`，操作 Run 时还需按工具参数要求显式传 `run`。
+`exec` is an entry point that the extension intercepts and replaces the whole cell with; it is not an ordinary helper, and no code may come before or after it. With several documents connected, write `await playbook.exec("l2", "/absolute/path/playbook.yaml")`. What runs is the Launch's frozen orchestration code, with `timeout: 0` forced; the JS helpers default to that Launch's document and Run. Raw `tool.playbook_*` calls do not inherit those defaults: with several documents connected pass `doc` explicitly, and for Run operations also pass `run` as the tool arguments require.
 
-Python 编排会设置 **Python 变量** `PLAYBOOK_DOC`、`PLAYBOOK_RUN`、`PLAYBOOK_LAUNCH`，不是环境变量，也不注入 JS 的 `playbook` 辅助；直接使用 Python eval 的 `tool`、`agent` 接口，需要 omp 的 Python 后端可用。
+Python orchestration sets the **Python variables** `PLAYBOOK_DOC`, `PLAYBOOK_RUN` and `PLAYBOOK_LAUNCH`, not environment variables, and does not inject the JS `playbook` helpers; use the `tool` and `agent` interfaces of Python eval directly, which needs omp's Python backend.
 
-## 检查不等于完成或认可
+## Checks are not completion or approval
 
-卡片显示确定性检查：`compile`、`render_error`、`render_pending`；执行块另检查 `empty_expansion` 与表格图表，设计块检查 `draft`。检查不负责证明业务设计正确；除编译失败等 Launch 自身约束外，其他检查不通过不是启动门禁。
+Cards show the deterministic checks `compile`, `render_error` and `render_pending`; execution blocks also check `empty_expansion` and table charts, design blocks check `draft`. Checks do not prove a business design correct; apart from Launch constraints such as compile failures, a failed check does not gate a launch.
 
-`jev` 是另行报告的模型判定：
+`jev` is a separately reported model judgment:
 
-- `playbook_check inspect` 返回 `{blocks, source, compiled, view, findings, version}`，**当前不返回问题定义**。
-- 当前固定问题 `missing`：完整编译 prompt 是否提到未包含其中的日志、讨论、文件或先前结果内容？主会话可以在 eval 中用可用的 `judge` 回答。
-- 报告形状为 `result: {kind:"answers", answers:{missing: P(yes)}}`，概率必须在 0–1；`P(yes) >= 0.5` 显示不通过。judge 不可用时报告 `{kind:"judge_unavailable"}`，显示未判定，不当作通过。
-- 报告须带同一文档、同一 Run、同一顺序块列表的最新 `version`。过期报告会被忽略；输入变化使旧判定失效。
+- `playbook_check inspect` returns `{blocks, source, compiled, view, findings, version}` and **currently returns no question definitions**.
+- The current fixed question is `missing`: does the full compiled prompt mention logs, discussions, files or earlier results whose content it does not include? The main session can answer it in eval with an available `judge`.
+- The report shape is `result: {kind:"answers", answers:{missing: P(yes)}}`, with the probability in 0–1; `P(yes) >= 0.5` shows as failed. With no judge available, report `{kind:"judge_unavailable"}`, which shows as not judged, not as passed.
+- The report must carry the latest `version` for the same document, the same Run and the same ordered block list. Stale reports are ignored; a change to the input invalidates the old judgment.
 
-“检查”按钮会更新确定性检查并通知协调者；不会自己调用模型。没有设计认可状态，没有从检查到 `done` 的自动转换。
+The "检查" (Check) button refreshes the deterministic checks and notifies the coordinator; it never calls a model itself. There is no design-approval state and no automatic transition from checks to `done`.
 
-## 开发检查
+## Development checks
 
 ```sh
 bun x tsc --noEmit -p tsconfig.json
