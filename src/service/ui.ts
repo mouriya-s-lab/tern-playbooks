@@ -3,8 +3,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { prepareSvg } from "@oh-my-pi/pi-tui/chat/svg-source";
 import { svgFigurePalette } from "@oh-my-pi/pi-tui/chat/svg-figure";
-import { describeTableChart, lookupTableChart, setTableCharts, splitTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
-import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
+import { lookupTableChart, setTableCharts, splitTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
 import { initThemeSync, setTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import type { BlockId, CompileResult, DocRef, EntryData, HumanField, RecordKind, TimelineEntry } from "../domain/model";
 import { fieldText, parseRunId } from "../domain/model";
@@ -156,13 +155,7 @@ export function startUi(core: CoreApi, tsp: TspSession, baseDir: string): void {
 			if (segment.kind === "markdown") return [{ id: nodeId, k: "md", p: { text: segment.text } }];
 			const chart = lookupTableChart(segment.table);
 			if (!chart || chart instanceof Promise) throw new Error("always-mode chart lookup did not return a chart");
-			const node = describeTableChart(chart, nodeId);
-			const blobId = node.p && "blob" in node.p ? node.p.blob : undefined;
-			if (typeof blobId !== "string") throw new Error("Chart has no native blob");
-			const blob = getNativeBlob(blobId);
-			if (!blob) throw new Error("Chart native blob is missing");
-			tsp.blob(blob.id, blob.mime, blob.bytes);
-			return [{ id: nodeId, k: "image", p: { ...node.p } }];
+			return [imageNode(nodeId, new TextEncoder().encode(prepareSvg(chart, svgFigurePalette())), "image/svg+xml", "表格图表")];
 		});
 	}
 	function selectedBlocks(view: DocView, fallback: BlockId): BlockId[] {
